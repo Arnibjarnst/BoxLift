@@ -219,6 +219,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
 
+    if agent_cfg.logger == "wandb":
+        runner.writer.stop() # type: ignore
+
     # close the simulator
     env.close()
 
