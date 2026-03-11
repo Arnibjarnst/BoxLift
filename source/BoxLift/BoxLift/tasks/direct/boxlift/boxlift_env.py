@@ -199,7 +199,7 @@ class BoxliftEnv(DirectRLEnv):
         self.ur5_r.write_joint_state_to_sim(initial_joint_pos_r, initial_joint_vel_r, env_ids=env_ids)
 
         # Reset Object
-        initial_object_pose = self.obj_poses[self.episode_length_buf[env_ids]]
+        initial_object_pose = self.obj_poses[self.episode_length_buf[env_ids]].clone()
         initial_object_pose[:, :3] += self.scene.env_origins[env_ids]
         initial_object_vel = self.obj_vel[self.episode_length_buf[env_ids]]
 
@@ -387,7 +387,7 @@ class BoxliftEnv(DirectRLEnv):
 
         if relative:
             desired_obj_pos = self.obj_poses[self.episode_length_buf, :3]
-            obj_pos -= desired_obj_pos
+            obj_pos = obj_pos - desired_obj_pos
 
         return obj_pos
     
