@@ -94,7 +94,7 @@ logger.info("Connection established", extra={"segment": -1, "step": -1})
 
 # Attempt to clear errors and reset robot state
 logger.info("Resetting robot state", extra={"segment": -1, "step": -1})
-rtde_c.re_initialize()
+rtde_c.reinit()
 rtde_c.unlockProtectiveStop()
 
 rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
