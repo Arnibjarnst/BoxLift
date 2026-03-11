@@ -13,6 +13,7 @@ from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import spawn_ground_plane, GroundPlaneCfg
 from isaaclab.sensors.contact_sensor import ContactSensor
+from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
 from BoxLift.tasks.direct.boxlift.boxlift_env_cfg import *
 
@@ -24,8 +25,7 @@ class BoxliftEnv(DirectRLEnv):
     def __init__(self, cfg: BoxliftEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
        
-        self.EE_link_idx = self.ur5_r.body_names.index("wrist_3_link")
-        self.EE_local_offset = torch.tensor([0.0, 0.0, 0.02], device=self.device).repeat(self.num_envs, 1)
+        self.EE_link_idx = self.ur5_r.body_names.index("Sphere")
 
 
     def _setup_scene(self):
@@ -34,10 +34,13 @@ class BoxliftEnv(DirectRLEnv):
 
         # Store initial positions and joint states
         self.obj_poses          = torch.from_numpy(traj["obj_poses"]).float().to(self.device)
+        self.obj_vel            = torch.from_numpy(traj["obj_vel"]).float().to(self.device)
         self.arm_l_pose         = torch.from_numpy(traj["arm_l_pose"]).float().to(self.device)
         self.arm_r_pose         = torch.from_numpy(traj["arm_r_pose"]).float().to(self.device)
         self.joints_l           = torch.from_numpy(traj["joints_l"]).float().to(self.device)
         self.joints_r           = torch.from_numpy(traj["joints_r"]).float().to(self.device)
+        self.joint_vel_l        = torch.from_numpy(traj["joint_vel_l"]).float().to(self.device)
+        self.joint_vel_r        = torch.from_numpy(traj["joint_vel_r"]).float().to(self.device)
         self.joints_target_l    = torch.from_numpy(traj["joints_target_l"]).float().to(self.device)
         self.joints_target_r    = torch.from_numpy(traj["joints_target_r"]).float().to(self.device)
         self.EE_poses_l         = torch.from_numpy(traj["EE_poses_l"]).float().to(self.device)
@@ -62,6 +65,8 @@ class BoxliftEnv(DirectRLEnv):
 
         self.illegal_contact_sensors = {name: ContactSensor(cfg) for name, cfg in self.cfg.illegal_contact_sensor_cfgs.items()}
 
+        self.ee_contact_sensors = [ContactSensor(cfg) for cfg in self.cfg.ee_contact_sensors]
+
         # Regularization stuff
         self.prev_actions = torch.zeros((self.num_envs, 12), device=self.device)
         self.prev_joint_vel = torch.zeros((self.num_envs, 12), device=self.device)
@@ -81,23 +86,75 @@ class BoxliftEnv(DirectRLEnv):
         # add sensors to the scene
         for name, sensor in self.illegal_contact_sensors.items():
             self.scene.sensors[f"illegal_contact_sensor_{name}"] = sensor
+        for i, sensor in enumerate(self.ee_contact_sensors):
+            self.scene.sensors[f"ee_contact_sensor_{i}"] = sensor
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
+        self.ee_markers = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/myMarkers",
+                markers={
+                    "ee_l": sim_utils.SphereCfg(
+                        radius=0.02,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
+                    ),
+                    "ee_r": sim_utils.SphereCfg(
+                        radius=0.02,
+                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
+                    ),
+                },
+            )
+        )
+
+        self.cube_marker = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/myMarkers",
+                markers={
+                    "cube": sim_utils.CuboidCfg(
+                        size=(0.4, 0.6, 0.06),
+                        visual_material=sim_utils.PreviewSurfaceCfg(
+                            diffuse_color=(0.7, 0.7, 0.7),
+                        ),                
+                    ),
+                },
+            )
+        )
+
+        self.cube_marker.set_visibility(False)
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
 
-    def _apply_action(self) -> None:
-        q_l = self.joints_target_l[self.episode_length_buf]
-        q_r = self.joints_target_r[self.episode_length_buf]
-        dq_l = self.cfg.action_scale * self.actions[:, :6]
-        dq_r = self.cfg.action_scale * self.actions[:, 6:]
+        EE_pos_l = self.EE_poses_l[self.episode_length_buf, :3] + self.scene.env_origins
+        EE_pos_r = self.EE_poses_r[self.episode_length_buf, :3] + self.scene.env_origins
+        EE_pos_lr = torch.vstack((EE_pos_l, EE_pos_r))
+        self.ee_markers.visualize(translations=EE_pos_lr)
 
-        self.ur5_l.set_joint_position_target(q_l + dq_l)
-        self.ur5_r.set_joint_position_target(q_r + dq_r)
+        obj_pos = self.obj_poses[self.episode_length_buf, :3] + self.scene.env_origins
+        obj_quat = self.obj_poses[self.episode_length_buf, 3:]
+
+        self.cube_marker.visualize(translations=obj_pos, orientations=obj_quat)
+
+    def get_joint_targets(self):
+        q_l = self.joints_target_l[self.episode_length_buf] + self.cfg.action_scale * self.actions[:, :6]
+        q_r = self.joints_target_r[self.episode_length_buf] + self.cfg.action_scale * self.actions[:, 6:]
+
+        return q_l, q_r
+
+
+    def _apply_action(self) -> None:
+        q_l, q_r = self.get_joint_targets()
+
+        # print("ACTION")
+        # print("Target:", q_l)
+
+        self.ur5_l.set_joint_position_target(q_l)
+        self.ur5_r.set_joint_position_target(q_r)
 
     def _get_observations(self) -> dict:
+        # print("OBSERVATION")
         obs = torch.cat(
             (
                 self._get_joint_pos(relative=True),
@@ -105,6 +162,7 @@ class BoxliftEnv(DirectRLEnv):
                 self._get_obj_pos(relative=True),
                 self._get_obj_quat(relative=True),
                 self._get_obj_vel(),
+                self.episode_length_buf[:, None] / self.max_episode_length,
             ),
             dim=-1,
         )
@@ -130,19 +188,20 @@ class BoxliftEnv(DirectRLEnv):
         # TODO: verify this is the correct range
         # self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length - 2, (len(env_ids),), device=self.device, dtype=torch.long)
         self.episode_length_buf[env_ids] = torch.zeros((len(env_ids),), device=self.device, dtype=torch.long)
+        # self.episode_length_buf[env_ids] = torch.randint(0, 40, (len(env_ids),), device=self.device, dtype=torch.long)
 
         initial_joint_pos_l = self.joints_l[self.episode_length_buf[env_ids]]
-        initial_joint_vel_l = torch.zeros_like(initial_joint_pos_l)
+        initial_joint_vel_l = self.joint_vel_l[self.episode_length_buf[env_ids]]
         self.ur5_l.write_joint_state_to_sim(initial_joint_pos_l, initial_joint_vel_l, env_ids=env_ids)
 
         initial_joint_pos_r = self.joints_r[self.episode_length_buf[env_ids]]
-        initial_joint_vel_r = torch.zeros_like(initial_joint_pos_r)
+        initial_joint_vel_r = self.joint_vel_r[self.episode_length_buf[env_ids]]
         self.ur5_r.write_joint_state_to_sim(initial_joint_pos_r, initial_joint_vel_r, env_ids=env_ids)
 
         # Reset Object
         initial_object_pose = self.obj_poses[self.episode_length_buf[env_ids]]
         initial_object_pose[:, :3] += self.scene.env_origins[env_ids]
-        initial_object_vel = torch.zeros((len(env_ids), 6), device=self.device)
+        initial_object_vel = self.obj_vel[self.episode_length_buf[env_ids]]
 
         self.object.write_root_pose_to_sim(initial_object_pose, env_ids)
         self.object.write_root_velocity_to_sim(initial_object_vel, env_ids)
@@ -179,6 +238,8 @@ class BoxliftEnv(DirectRLEnv):
         rew_EE_quat_r = self._reward_track(eef_quat_error_r ** 2, self.cfg.sigma_eef_quat, self.cfg.tol_eef_quat)
         rew_EE_quat = self.cfg.w_eef_quat * (rew_EE_quat_l + rew_EE_quat_r)
 
+        # print("REWARDS")
+
         joint_pos_lr2 = self._get_joint_pos(relative=True) ** 2
         joint_pos_l2, joint_pos_r2 = joint_pos_lr2[:,:6], joint_pos_lr2[:,6:]
         joint_pos_error_l = joint_pos_l2.sum(dim=-1)
@@ -191,30 +252,33 @@ class BoxliftEnv(DirectRLEnv):
 
         # Regularization Reward
         joint_acc = (self._get_joint_vel() - self.prev_joint_vel) / self.dt
-        joint_acc *= joint_acc > self.cfg.tol_joint_acc
+        joint_acc *= torch.abs(joint_acc) > self.cfg.tol_joint_acc
         joint_acc_penalty = joint_acc.square().sum(dim=-1)
         rew_joint_acc = self.cfg.w_joint_acc * joint_acc_penalty
 
-        torque = torch.cat((self.ur5_l.data.applied_torque, self.ur5_r.data.applied_torque), 1)
-        torque *= torque > self.cfg.tol_joint_torque
+        torque = torch.cat((self.ur5_l.data.applied_torque.clone(), self.ur5_r.data.applied_torque.clone()), 1)
+        torque *= torch.abs(torque) > self.cfg.tol_joint_torque
         torque_penalty = torque.square().sum(dim=-1)
-        rew_torque = self.cfg.w_joint_torque * torque_penalty
+        rew_torque = self.cfg.w_joint_torque * torque_penalty        
 
         action_rate_error = (self.actions - self.prev_actions)
-        action_rate_error *= action_rate_error > self.cfg.tol_action_rate
+        action_rate_error *= torch.abs(action_rate_error) > self.cfg.tol_action_rate
         action_rate_penalty = action_rate_error.square().sum(dim=-1)
         rew_action_rate = self.cfg.w_action_rate * action_rate_penalty
-
 
         total_illegal_force = torch.zeros((self.num_envs,), device=self.device)
         for sensor in self.illegal_contact_sensors.values():
             f_abs = sensor.data.force_matrix_w.norm(dim=-1)
             f_abs_clamped = f_abs.clamp(max=self.cfg.max_contact_force)
-            total_illegal_force += f_abs_clamped.flatten(1).sum(dim=-1)
+            total_illegal_force += f_abs_clamped.sum(dim=-1).flatten()
+
+        mean_ee_force = torch.zeros((self.num_envs,), device=self.device)
+        for sensor in self.ee_contact_sensors:
+            mean_ee_force += sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1).flatten() / len(self.ee_contact_sensors)
 
         rew_illegal_contact = self.cfg.w_illegal_contact * total_illegal_force
 
-        rew_reqularization = self.cfg.w_regularization * (rew_joint_acc + rew_torque + rew_action_rate + rew_illegal_contact)
+        rew_regularization = self.cfg.w_regularization * (rew_joint_acc + rew_torque + rew_action_rate + rew_illegal_contact)
 
         self.extras["log"] = {
             "Rewards_task/obj_pos": rew_obj_pos.mean(),
@@ -227,14 +291,15 @@ class BoxliftEnv(DirectRLEnv):
             "Error/obj_pos_error": obj_pos_error.mean(),
             "Error/obj_quat_error": obj_quat_error.mean(),
             "Error/EE_pos_error": (EE_pos_error_l + EE_pos_error_r).mean() / 2.0,
-            "Rewards_regularization/total": rew_reqularization.mean(),
+            "Rewards_regularization/total": rew_regularization.mean(),
             "Rewards_regularization/joint_acceleration": rew_joint_acc.mean(), 
             "Rewards_regularization/torque": rew_torque.mean(),
             "Rewards_regularization/action_rate": rew_action_rate.mean(),
             "Rewards_regularization/illegal_contact": rew_illegal_contact.mean(),
+            "Extra/mean_EE_force": mean_ee_force.mean(),
         }
         
-        total_reward = rew_task + rew_track - rew_reqularization
+        total_reward = rew_task + rew_track - rew_regularization
 
         # Can update prev_action/joint_vel now
         self.prev_actions[:] = self.actions[:]
@@ -244,8 +309,12 @@ class BoxliftEnv(DirectRLEnv):
 
     
     def _get_joint_pos(self, relative=True):
-        joint_pos_l = self.ur5_l.data.joint_pos
-        joint_pos_r = self.ur5_r.data.joint_pos
+        joint_pos_l = self.ur5_l.data.joint_pos.clone()
+        joint_pos_r = self.ur5_r.data.joint_pos.clone()
+
+        # print("Time:", self.episode_length_buf)
+        # print("Actual:" , joint_pos_l)
+        # print("Desired:", self.joints_l[self.episode_length_buf])
 
         if relative:
             joint_pos_l -= self.joints_l[self.episode_length_buf]
@@ -255,20 +324,15 @@ class BoxliftEnv(DirectRLEnv):
     
     
     def _get_joint_vel(self):
-        ur5_l_joint_vel = self.ur5_l.data.joint_vel
-        ur5_r_joint_vel = self.ur5_r.data.joint_vel
+        ur5_l_joint_vel = self.ur5_l.data.joint_vel.clone()
+        ur5_r_joint_vel = self.ur5_r.data.joint_vel.clone()
 
         return torch.cat((ur5_l_joint_vel, ur5_r_joint_vel), 1)
     
     
     def _get_EE_pos(self, relative=True) -> torch.Tensor:
-        EE_pos_l = self.ur5_l.data.body_pos_w[:, self.EE_link_idx] - self.scene.env_origins
-        EE_pos_r = self.ur5_r.data.body_pos_w[:, self.EE_link_idx] - self.scene.env_origins
-
-        # Find the position of the sphere EE instead of frame origin of link
-        EE_quat_lr = self._get_EE_quat(relative=False)
-        EE_pos_l += quat_apply(EE_quat_lr[:,:4], self.EE_local_offset)
-        EE_pos_r += quat_apply(EE_quat_lr[:,4:], self.EE_local_offset)
+        EE_pos_l = self.ur5_l.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
+        EE_pos_r = self.ur5_r.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
 
         if relative:
             EE_pos_l -= self.EE_poses_l[self.episode_length_buf, :3]
@@ -287,8 +351,9 @@ class BoxliftEnv(DirectRLEnv):
         return EE_pos_error_l, EE_pos_error_r
     
     def _get_EE_quat(self, relative=True) -> torch.Tensor:
-        EE_quat_l = self.ur5_l.data.body_quat_w[:, self.EE_link_idx]
-        EE_quat_r = self.ur5_r.data.body_quat_w[:, self.EE_link_idx]
+        # TODO: check orientation in usd file. might not match the one from the planner
+        EE_quat_l = self.ur5_l.data.body_quat_w[:, self.EE_link_idx].clone()
+        EE_quat_r = self.ur5_r.data.body_quat_w[:, self.EE_link_idx].clone()
 
         if relative:
             desired_quat_l = self.EE_poses_l[self.episode_length_buf, 3:]
@@ -299,8 +364,9 @@ class BoxliftEnv(DirectRLEnv):
         return torch.cat((EE_quat_l, EE_quat_r), 1)
     
     def _get_EE_quat_error(self):
-        EE_quat_l = self.ur5_l.data.body_quat_w[:, self.EE_link_idx]
-        EE_quat_r = self.ur5_r.data.body_quat_w[:, self.EE_link_idx]
+        # TODO: check orientation in usd file. might not match the one from the planner
+        EE_quat_l = self.ur5_l.data.body_quat_w[:, self.EE_link_idx].clone()
+        EE_quat_r = self.ur5_r.data.body_quat_w[:, self.EE_link_idx].clone()
 
         desired_quat_l = self.EE_poses_l[self.episode_length_buf, 3:]
         desired_quat_r = self.EE_poses_r[self.episode_length_buf, 3:]
@@ -311,13 +377,13 @@ class BoxliftEnv(DirectRLEnv):
         return error_l, error_r
     
     def _get_EE_vel(self) -> torch.Tensor:
-        EE_vel_l = self.ur5_l.data.body_vel_w[:, self.EE_link_idx]
-        EE_vel_r = self.ur5_r.data.body_vel_w[:, self.EE_link_idx]
+        EE_vel_l = self.ur5_l.data.body_vel_w[:, self.EE_link_idx].clone()
+        EE_vel_r = self.ur5_r.data.body_vel_w[:, self.EE_link_idx].clone()
 
         return torch.cat((EE_vel_l, EE_vel_r), 1)
     
     def _get_obj_pos(self, relative=True):
-        obj_pos = self.object.data.root_pos_w - self.scene.env_origins
+        obj_pos = self.object.data.root_pos_w.clone() - self.scene.env_origins
 
         if relative:
             desired_obj_pos = self.obj_poses[self.episode_length_buf, :3]
@@ -329,7 +395,7 @@ class BoxliftEnv(DirectRLEnv):
         return torch.norm(self._get_obj_pos(relative=True), dim=-1)
     
     def _get_obj_quat(self, relative=True):
-        obj_quat = self.object.data.root_quat_w
+        obj_quat = self.object.data.root_quat_w.clone()
 
         if relative:
             desired_obj_quat = self.obj_poses[self.episode_length_buf, 3:]
@@ -338,10 +404,10 @@ class BoxliftEnv(DirectRLEnv):
         return obj_quat
     
     def _get_obj_quat_error(self):
-        obj_quat = self.object.data.root_quat_w
+        obj_quat = self.object.data.root_quat_w.clone()
         desired_obj_quat = self.obj_poses[self.episode_length_buf, 3:]
         return torch.abs(quat_error_magnitude(obj_quat, desired_obj_quat))
 
     def _get_obj_vel(self):
-        return self.object.data.root_vel_w
+        return self.object.data.root_vel_w.clone()
 
