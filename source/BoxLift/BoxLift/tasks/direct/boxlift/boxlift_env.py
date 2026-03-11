@@ -387,7 +387,7 @@ class BoxliftEnv(DirectRLEnv):
 
         if relative:
             desired_obj_pos = self.obj_poses[self.episode_length_buf, :3]
-            obj_pos = obj_pos - desired_obj_pos
+            obj_pos -= desired_obj_pos
 
         return obj_pos
     
