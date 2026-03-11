@@ -223,7 +223,7 @@ class JointTargetEnv(DirectRLEnv):
         joint_acc_penalty = joint_acc.square().sum(dim=-1)
         rew_joint_acc = self.cfg.w_joint_acc * joint_acc_penalty
 
-        torque = torch.cat((self.ur5_l.data.applied_torque, self.ur5_r.data.applied_torque), 1)
+        torque = torch.cat((self.ur5_l.data.applied_torque.clone(), self.ur5_r.data.applied_torque.clone()), 1)
         torque *= torch.abs(torque) > self.cfg.tol_joint_torque
         torque_penalty = torque.square().sum(dim=-1)
         rew_torque = self.cfg.w_joint_torque * torque_penalty        
@@ -271,8 +271,8 @@ class JointTargetEnv(DirectRLEnv):
 
     
     def _get_joint_pos(self, relative=True):
-        joint_pos_l = self.ur5_l.data.joint_pos
-        joint_pos_r = self.ur5_r.data.joint_pos
+        joint_pos_l = self.ur5_l.data.joint_pos.clone()
+        joint_pos_r = self.ur5_r.data.joint_pos.clone()
 
         if relative:
             joint_pos_l -= self.joints_l[self.episode_length_buf]
@@ -282,15 +282,15 @@ class JointTargetEnv(DirectRLEnv):
     
     
     def _get_joint_vel(self):
-        ur5_l_joint_vel = self.ur5_l.data.joint_vel
-        ur5_r_joint_vel = self.ur5_r.data.joint_vel
+        ur5_l_joint_vel = self.ur5_l.data.joint_vel.clone()
+        ur5_r_joint_vel = self.ur5_r.data.joint_vel.clone()
 
         return torch.cat((ur5_l_joint_vel, ur5_r_joint_vel), 1)
     
     
     def _get_EE_pos(self, relative=True) -> torch.Tensor:
-        EE_pos_l = self.ur5_l.data.body_pos_w[:, self.EE_link_idx] - self.scene.env_origins
-        EE_pos_r = self.ur5_r.data.body_pos_w[:, self.EE_link_idx] - self.scene.env_origins
+        EE_pos_l = self.ur5_l.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
+        EE_pos_r = self.ur5_r.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
 
         if relative:
             EE_pos_l -= self.EE_poses_l[self.episode_length_buf, :3]
@@ -310,8 +310,8 @@ class JointTargetEnv(DirectRLEnv):
     
     def _get_EE_quat(self, relative=True) -> torch.Tensor:
         # TODO: check orientation in usd file. might not match the one from the planner
-        EE_quat_l = self.ur5_l.data.body_quat_w[:, self.EE_link_idx]
-        EE_quat_r = self.ur5_r.data.body_quat_w[:, self.EE_link_idx]
+        EE_quat_l = self.ur5_l.data.body_quat_w[:, self.EE_link_idx].clone()
+        EE_quat_r = self.ur5_r.data.body_quat_w[:, self.EE_link_idx].clone()
 
         if relative:
             desired_quat_l = self.EE_poses_l[self.episode_length_buf, 3:]
@@ -323,8 +323,8 @@ class JointTargetEnv(DirectRLEnv):
     
     def _get_EE_quat_error(self):
         # TODO: check orientation in usd file. might not match the one from the planner
-        EE_quat_l = self.ur5_l.data.body_quat_w[:, self.EE_link_idx]
-        EE_quat_r = self.ur5_r.data.body_quat_w[:, self.EE_link_idx]
+        EE_quat_l = self.ur5_l.data.body_quat_w[:, self.EE_link_idx].clone()
+        EE_quat_r = self.ur5_r.data.body_quat_w[:, self.EE_link_idx].clone()
 
         desired_quat_l = self.EE_poses_l[self.episode_length_buf, 3:]
         desired_quat_r = self.EE_poses_r[self.episode_length_buf, 3:]
@@ -335,8 +335,8 @@ class JointTargetEnv(DirectRLEnv):
         return error_l, error_r
     
     def _get_EE_vel(self) -> torch.Tensor:
-        EE_vel_l = self.ur5_l.data.body_vel_w[:, self.EE_link_idx]
-        EE_vel_r = self.ur5_r.data.body_vel_w[:, self.EE_link_idx]
+        EE_vel_l = self.ur5_l.data.body_vel_w[:, self.EE_link_idx].clone()
+        EE_vel_r = self.ur5_r.data.body_vel_w[:, self.EE_link_idx].clone()
 
         return torch.cat((EE_vel_l, EE_vel_r), 1)
     
