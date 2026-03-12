@@ -301,13 +301,17 @@ class BoxliftEnv(DirectRLEnv):
         flange_to_forearm_dist_l = self._get_flange_to_forearm_distance(self.ur5e_l)
         flange_to_forearm_dist_r = self._get_flange_to_forearm_distance(self.ur5e_r)
 
-        flange_to_forearm_dist_l *= flange_to_forearm_dist_l < self.cfg.max_flange_forearm_distance
-
-        print(self.episode_length_buf, flange_to_forearm_dist_l, flange_to_forearm_dist_r)
+        # Penalize if distance is less than the threshold
+        # Using a quadratic penalty for distances below the threshold
+        penalty_dist_l = torch.clamp(self.cfg.max_flange_forearm_distance - flange_to_forearm_dist_l, min=0.0).square()
+        penalty_dist_r = torch.clamp(self.cfg.max_flange_forearm_distance - flange_to_forearm_dist_r, min=0.0).square()
+        rew_flange_forearm_collision = self.cfg.w_flange_forearm_collision * (penalty_dist_l + penalty_dist_r)
 
         rew_illegal_contact = self.cfg.w_illegal_contact * total_illegal_force
 
-        rew_regularization = self.cfg.w_regularization * (rew_joint_acc + rew_torque + rew_action_rate + rew_illegal_contact)
+        rew_regularization = self.cfg.w_regularization * (
+            rew_joint_acc + rew_torque + rew_action_rate + rew_illegal_contact + rew_flange_forearm_collision
+        )
 
         self.extras["log"] = {
             "Rewards_task/obj_pos": rew_obj_pos.mean(),
@@ -325,6 +329,7 @@ class BoxliftEnv(DirectRLEnv):
             "Rewards_regularization/torque": rew_torque.mean(),
             "Rewards_regularization/action_rate": rew_action_rate.mean(),
             "Rewards_regularization/illegal_contact": rew_illegal_contact.mean(),
+            "Rewards_regularization/flange_forearm_collision": rew_flange_forearm_collision.mean(),
             "Extra/mean_EE_force": mean_ee_force.mean(),
         }
         
