@@ -309,14 +309,11 @@ class BoxliftEnv(DirectRLEnv):
         flange_to_forearm_dist_l = self._get_flange_to_forearm_distance(self.ur5e_l)
         flange_to_forearm_dist_r = self._get_flange_to_forearm_distance(self.ur5e_r)
 
-        # High-magnitude binary penalty for breaching the safety zone
+        # Boolean (binary) penalty for breaching the safety zone
         is_too_close_l = (flange_to_forearm_dist_l < self.cfg.max_flange_forearm_distance).float()
         is_too_close_r = (flange_to_forearm_dist_r < self.cfg.max_flange_forearm_distance).float()
         
-        # Heavy penalty + quadratic for smooth gradient near boundary
-        penalty_dist_l = is_too_close_l + 10.0 * torch.clamp(self.cfg.max_flange_forearm_distance - flange_to_forearm_dist_l, min=0.0).square()
-        penalty_dist_r = is_too_close_r + 10.0 * torch.clamp(self.cfg.max_flange_forearm_distance - flange_to_forearm_dist_r, min=0.0).square()
-        rew_flange_forearm_dist = self.cfg.w_flange_forearm_dist * (penalty_dist_l + penalty_dist_r)
+        rew_flange_forearm_dist = self.cfg.w_flange_forearm_dist * (is_too_close_l + is_too_close_r)
 
         rew_regularization = self.cfg.w_regularization * (rew_joint_acc + rew_torque + rew_action_rate + rew_illegal_contact + rew_flange_forearm_dist)
 
