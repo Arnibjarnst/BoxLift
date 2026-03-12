@@ -147,8 +147,6 @@ class BoxliftEnv(DirectRLEnv):
         # Test visualization for cylinder ends
         p1, p2 = self._get_forearm_endpoints(self.ur5_l)
 
-        # Stack markers for each environment: EE_l, EE_r, p1, p2
-        # Resulting shape: (num_envs, 4, 3) -> reshape to (num_envs * 4, 3)
         all_marker_pos = torch.stack([EE_pos_l, EE_pos_r, p1, p2], dim=1).view(-1, 3)
         self.ee_markers.visualize(translations=all_marker_pos)
 
