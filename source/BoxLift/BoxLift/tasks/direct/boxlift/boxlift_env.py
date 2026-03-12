@@ -202,6 +202,12 @@ class BoxliftEnv(DirectRLEnv):
         self.reset_terminated = obj_pos_error > self.cfg.max_obj_dist_from_traj
         self.reset_terminated |= obj_quat_error > self.cfg.max_obj_angle_from_traj
 
+        # Terminate if flange gets too close to forearm
+        dist_l = self._get_flange_to_forearm_distance(self.ur5e_l)
+        dist_r = self._get_flange_to_forearm_distance(self.ur5e_r)
+        self.reset_terminated |= (dist_l < self.cfg.max_flange_forearm_distance)
+        self.reset_terminated |= (dist_r < self.cfg.max_flange_forearm_distance)
+
         return self.reset_terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None): # type: ignore
@@ -303,11 +309,14 @@ class BoxliftEnv(DirectRLEnv):
         flange_to_forearm_dist_l = self._get_flange_to_forearm_distance(self.ur5e_l)
         flange_to_forearm_dist_r = self._get_flange_to_forearm_distance(self.ur5e_r)
 
-        penalty_dist_l = torch.clamp(self.cfg.max_flange_forearm_distance - flange_to_forearm_dist_l, min=0.0).square()
-        penalty_dist_r = torch.clamp(self.cfg.max_flange_forearm_distance - flange_to_forearm_dist_r, min=0.0).square()
+        # High-magnitude binary penalty for breaching the safety zone
+        is_too_close_l = (flange_to_forearm_dist_l < self.cfg.max_flange_forearm_distance).float()
+        is_too_close_r = (flange_to_forearm_dist_r < self.cfg.max_flange_forearm_distance).float()
+        
+        # Heavy penalty + quadratic for smooth gradient near boundary
+        penalty_dist_l = is_too_close_l + 10.0 * torch.clamp(self.cfg.max_flange_forearm_distance - flange_to_forearm_dist_l, min=0.0).square()
+        penalty_dist_r = is_too_close_r + 10.0 * torch.clamp(self.cfg.max_flange_forearm_distance - flange_to_forearm_dist_r, min=0.0).square()
         rew_flange_forearm_dist = self.cfg.w_flange_forearm_dist * (penalty_dist_l + penalty_dist_r)
-
-        print(rew_flange_forearm_dist)
 
         rew_regularization = self.cfg.w_regularization * (rew_joint_acc + rew_torque + rew_action_rate + rew_illegal_contact + rew_flange_forearm_dist)
 
