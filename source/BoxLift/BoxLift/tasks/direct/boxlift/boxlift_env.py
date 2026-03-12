@@ -14,6 +14,7 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import spawn_ground_plane, GroundPlaneCfg
 from isaaclab.sensors.contact_sensor import ContactSensor
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
+from omni.physx import get_physx_scene_query_interface
 
 from BoxLift.tasks.direct.boxlift.boxlift_env_cfg import *
 
@@ -26,6 +27,10 @@ class BoxliftEnv(DirectRLEnv):
         super().__init__(cfg, render_mode, **kwargs)
        
         self.EE_link_idx = self.ur5_r.body_names.index("Sphere")
+        self.flange_idx = self.ur5_r.body_names.index("wrist_3_link")
+        self.forearm_link_idx = self.ur5_r.body_names.index("forearm_link")
+
+        print(self.ur5_l.body_names)
 
 
     def _setup_scene(self):
@@ -147,14 +152,10 @@ class BoxliftEnv(DirectRLEnv):
     def _apply_action(self) -> None:
         q_l, q_r = self.get_joint_targets()
 
-        # print("ACTION")
-        # print("Target:", q_l)
-
         self.ur5_l.set_joint_position_target(q_l)
         self.ur5_r.set_joint_position_target(q_r)
 
     def _get_observations(self) -> dict:
-        # print("OBSERVATION")
         obs = torch.cat(
             (
                 self._get_joint_pos(relative=True),
@@ -238,8 +239,6 @@ class BoxliftEnv(DirectRLEnv):
         rew_EE_quat_r = self._reward_track(eef_quat_error_r ** 2, self.cfg.sigma_eef_quat, self.cfg.tol_eef_quat)
         rew_EE_quat = self.cfg.w_eef_quat * (rew_EE_quat_l + rew_EE_quat_r)
 
-        # print("REWARDS")
-
         joint_pos_lr2 = self._get_joint_pos(relative=True) ** 2
         joint_pos_l2, joint_pos_r2 = joint_pos_lr2[:,:6], joint_pos_lr2[:,6:]
         joint_pos_error_l = joint_pos_l2.sum(dim=-1)
@@ -312,10 +311,6 @@ class BoxliftEnv(DirectRLEnv):
         joint_pos_l = self.ur5_l.data.joint_pos.clone()
         joint_pos_r = self.ur5_r.data.joint_pos.clone()
 
-        # print("Time:", self.episode_length_buf)
-        # print("Actual:" , joint_pos_l)
-        # print("Desired:", self.joints_l[self.episode_length_buf])
-
         if relative:
             joint_pos_l -= self.joints_l[self.episode_length_buf]
             joint_pos_r -= self.joints_r[self.episode_length_buf]
@@ -329,6 +324,11 @@ class BoxliftEnv(DirectRLEnv):
 
         return torch.cat((ur5_l_joint_vel, ur5_r_joint_vel), 1)
     
+    def _get_flange_to_forearm_distance(self, robot: Articulation):
+        forearm_length = 0.425 # approx
+        flange_pos = robot.data.body_pos_w[:, self.flange_idx].clone() - self.scene.env_origins
+        forearm_pos = robot.data.body_pos_w[:, self.forearm_link_idx].clone() - self.scene.env_origins
+        forearm_quat = robot.data.body_quat_w[:, self.forearm_link_idx, :].clone()
     
     def _get_EE_pos(self, relative=True) -> torch.Tensor:
         EE_pos_l = self.ur5_l.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
