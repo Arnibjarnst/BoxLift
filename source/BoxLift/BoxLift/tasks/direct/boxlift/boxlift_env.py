@@ -100,7 +100,7 @@ class BoxliftEnv(DirectRLEnv):
 
         self.ee_markers = VisualizationMarkers(
             VisualizationMarkersCfg(
-                prim_path="/Visuals/myMarkers",
+                prim_path="/Visuals/eeMarkers",
                 markers={
                     "ee_l": sim_utils.SphereCfg(
                         radius=0.02,
@@ -110,6 +110,14 @@ class BoxliftEnv(DirectRLEnv):
                         radius=0.02,
                         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
                     ),
+                },
+            )
+        )
+
+        self.forearm_markers = VisualizationMarkers(
+            VisualizationMarkersCfg(
+                prim_path="/Visuals/forearmMarkers",
+                markers={
                     "cyl_p1": sim_utils.SphereCfg(
                         radius=0.03,
                         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(1.0, 0.0, 0.0)),
@@ -147,8 +155,13 @@ class BoxliftEnv(DirectRLEnv):
         # Test visualization for cylinder ends
         p1, p2 = self._get_forearm_endpoints(self.ur5_l)
 
-        all_marker_pos = torch.stack([EE_pos_l, EE_pos_r, p1, p2], dim=1).view(-1, 3)
-        self.ee_markers.visualize(translations=all_marker_pos)
+        # Visualize EE markers
+        ee_marker_pos = torch.stack([EE_pos_l, EE_pos_r], dim=1).view(-1, 3)
+        self.ee_markers.visualize(translations=ee_marker_pos)
+
+        # Visualize Forearm markers
+        forearm_marker_pos = torch.stack([p1, p2], dim=1).view(-1, 3)
+        self.forearm_markers.visualize(translations=forearm_marker_pos)
 
         obj_pos = self.obj_poses[self.episode_length_buf, :3] + self.scene.env_origins
         obj_quat = self.obj_poses[self.episode_length_buf, 3:]
