@@ -276,6 +276,8 @@ class BoxliftEnv(DirectRLEnv):
         for sensor in self.ee_contact_sensors:
             mean_ee_force += sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1).flatten() / len(self.ee_contact_sensors)
 
+        self._get_flange_to_forearm_distance(self.ur5_l)
+
         rew_illegal_contact = self.cfg.w_illegal_contact * total_illegal_force
 
         rew_regularization = self.cfg.w_regularization * (rew_joint_acc + rew_torque + rew_action_rate + rew_illegal_contact)
@@ -325,16 +327,25 @@ class BoxliftEnv(DirectRLEnv):
 
         return torch.cat((ur5_l_joint_vel, ur5_r_joint_vel), 1)
     
-    def _get_flange_to_forearm_distance(self, robot: Articulation, robot_prim_path: str):
+    def _get_flange_to_forearm_distance(self, robot: Articulation):
         # Path to the Cylinder prim inside the forearm link
-        cylinder_path = f"{robot_prim_path}/forearm_link/Cylinder"
+        cylinder_path = f"{robot.cfg.prim_path}/forearm_link/Cylinder"
         stage = omni.usd.get_context().get_stage()
         prim = stage.GetPrimAtPath(cylinder_path)
+
+        print(stage, cylinder_path)
+
+        return
+
+        if not prim.isValid():
+            return
+
 
         # Default values if attribute reading fails
         height = 0.4225
         if prim.IsValid() and prim.HasAttribute("height"):
             height = prim.GetAttribute("height").Get()
+            print(height)
         half_length = height / 2.0
 
         # Get world transform of the Cylinder prim
