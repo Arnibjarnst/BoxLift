@@ -328,39 +328,37 @@ class BoxliftEnv(DirectRLEnv):
         return torch.cat((ur5_l_joint_vel, ur5_r_joint_vel), 1)
     
     def _get_flange_to_forearm_distance(self, robot: Articulation):
-        # Path to the Cylinder prim inside the forearm link
-        # Use the first clone's path to retrieve USD attributes and relative transform
-        cylinder_path = f"{robot.cfg.prim_path}/forearm_link/Cylinder"
+        # Path to the Cylinder prim inside the forearm link on the base environment
+        # Isaac Lab clones might not have the children prims explicitly valid in USD at runtime for all envs
+        # We look up the source prim to get dimensions and local offsets
+        source_cylinder_path = f"/World/envs/env_0{robot.cfg.prim_path[11:]}/forearm_link/Cylinder"
         stage = omni.usd.get_context().get_stage()
-        prim = stage.GetPrimAtPath(cylinder_path)
-
-        if not prim.IsValid():
-            return torch.zeros(self.num_envs, device=self.device)
+        prim = stage.GetPrimAtPath(source_cylinder_path)
 
         # Default values if attribute reading fails
         height = 0.4225
-        if prim.HasAttribute("height"):
-            height = prim.GetAttribute("height").Get()
+        cyl_local_pos = torch.tensor([0.0, 0.0, 0.21125], device=self.device)
+        cyl_local_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+
+        if prim.IsValid():
+            if prim.HasAttribute("height"):
+                height = prim.GetAttribute("height").Get()
+            
+            source_link_path = f"/World/envs/env_0{robot.cfg.prim_path[11:]}/forearm_link"
+            local_transform = omni.usd.get_relative_transform_matrix(prim, stage.GetPrimAtPath(source_link_path))
+            
+            local_translation = local_transform.ExtractTranslation()
+            local_rotation = local_transform.ExtractRotationQuat()
+            cyl_local_pos = torch.tensor([local_translation[0], local_translation[1], local_translation[2]], device=self.device)
+            cyl_local_quat = torch.tensor([local_rotation.GetReal(), *local_rotation.GetImaginary()], device=self.device)
+
         half_length = height / 2.0
 
-        # Get the forearm link's world position and orientation from articulation data
+        # Get the forearm link's world position and orientation from articulation data (valid for all envs)
         forearm_pos = robot.data.body_pos_w[:, self.forearm_link_idx]
         forearm_quat = robot.data.body_quat_w[:, self.forearm_link_idx]
+        flange_pos = robot.data.body_pos_w[:, self.flange_idx]
 
-        # The Cylinder is a child of forearm_link. Get its local transform relative to the link.
-        # This assumes the local transform is the same across all clones.
-        local_transform = omni.usd.get_relative_transform_matrix(
-            prim, stage.GetPrimAtPath(f"{robot.cfg.prim_path}/forearm_link")
-        )
-        local_translation = local_transform.ExtractTranslation()
-        local_rotation = local_transform.ExtractRotationQuat()
-
-        cyl_local_pos = torch.tensor([local_translation[0], local_translation[1], local_translation[2]], device=self.device)
-        cyl_local_quat = torch.tensor([local_rotation.GetReal(), *local_rotation.GetImaginary()], device=self.device)
-
-        # Transform local cylinder points (relative to cylinder frame) to world frame via forearm link
-        # p_world = link_pos + link_quat * (cyl_local_pos + cyl_local_quat * p_cyl_local)
-        
         # Define cylinder end points in its local frame (along Z-axis)
         p1_cyl_local = torch.tensor([0.0, 0.0, -half_length], device=self.device)
         p2_cyl_local = torch.tensor([0.0, 0.0, half_length], device=self.device)
