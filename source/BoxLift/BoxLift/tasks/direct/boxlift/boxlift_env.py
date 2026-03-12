@@ -335,6 +335,8 @@ class BoxliftEnv(DirectRLEnv):
 
         if not prim.IsValid():
             return torch.zeros(self.num_envs, device=self.device)
+        
+        print("heiohio")
 
         # Default values if attribute reading fails
         height = 0.4225
