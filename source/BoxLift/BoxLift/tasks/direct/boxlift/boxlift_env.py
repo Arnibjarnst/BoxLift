@@ -6,6 +6,8 @@
 from __future__ import annotations
 
 import torch
+import numpy as np
+import omni.usd
 from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
@@ -323,30 +325,43 @@ class BoxliftEnv(DirectRLEnv):
 
         return torch.cat((ur5_l_joint_vel, ur5_r_joint_vel), 1)
     
-    def _get_flange_to_forearm_distance(self, robot: Articulation):
-        # The forearm link typically has the cylinder along its local Z axis
-        # Length of UR5 forearm is approximately 0.4225m
-        half_length = 0.4225 / 2
-        
-        flange_pos = robot.data.body_pos_w[:, self.flange_idx]
-        forearm_pos = robot.data.body_pos_w[:, self.forearm_link_idx]
-        forearm_quat = robot.data.body_quat_w[:, self.forearm_link_idx]
+    def _get_flange_to_forearm_distance(self, robot: Articulation, robot_prim_path: str):
+        # Path to the Cylinder prim inside the forearm link
+        cylinder_path = f"{robot_prim_path}/forearm_link/Cylinder"
+        stage = omni.usd.get_context().get_stage()
+        prim = stage.GetPrimAtPath(cylinder_path)
 
-        # Define cylinder end points in local forearm frame (along Z)
+        # Default values if attribute reading fails
+        height = 0.4225
+        if prim.IsValid() and prim.HasAttribute("height"):
+            height = prim.GetAttribute("height").Get()
+        half_length = height / 2.0
+
+        # Get world transform of the Cylinder prim
+        # We assume the env_origins are already accounted for in body_pos_w of the flange
+        world_transform = omni.usd.get_world_transform_matrix(prim)
+        translation = world_transform.ExtractTranslation()
+        rotation = world_transform.ExtractRotationQuat()
+        
+        cyl_pos = torch.tensor([translation[0], translation[1], translation[2]], device=self.device).repeat(self.num_envs, 1)
+        cyl_quat = torch.tensor([rotation.GetReal(), *rotation.GetImaginary()], device=self.device).repeat(self.num_envs, 1)
+
+        flange_pos = robot.data.body_pos_w[:, self.flange_idx]
+
+        # Define cylinder end points in its local frame (along Z-axis)
         p1_local = torch.tensor([0.0, 0.0, -half_length], device=self.device).repeat(self.num_envs, 1)
         p2_local = torch.tensor([0.0, 0.0, half_length], device=self.device).repeat(self.num_envs, 1)
 
         # Transform local cylinder points to world frame
-        p1 = forearm_pos + quat_apply(forearm_quat, p1_local)
-        p2 = forearm_pos + quat_apply(forearm_quat, p2_local)
+        p1 = cyl_pos + quat_apply(cyl_quat, p1_local)
+        p2 = cyl_pos + quat_apply(cyl_quat, p2_local)
 
         # Calculate distance from flange_pos to line segment [p1, p2]
         v = p2 - p1
         w = flange_pos - p1
         
         l2 = torch.sum(v**2, dim=-1)
-        t = torch.sum(w * v, dim=-1) / l2
-        t = torch.clamp(t, 0.0, 1.0)
+        t = (torch.sum(w * v, dim=-1) / l2).clamp(0.0, 1.0)
         
         projection = p1 + t.unsqueeze(-1) * v
         distance = torch.norm(flange_pos - projection, dim=-1)
