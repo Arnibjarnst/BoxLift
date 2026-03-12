@@ -333,19 +333,13 @@ class BoxliftEnv(DirectRLEnv):
         stage = omni.usd.get_context().get_stage()
         prim = stage.GetPrimAtPath(cylinder_path)
 
-        print(stage, cylinder_path)
-
-        return
-
-        if not prim.isValid():
-            return
-
+        if not prim.IsValid():
+            return torch.zeros(self.num_envs, device=self.device)
 
         # Default values if attribute reading fails
         height = 0.4225
-        if prim.IsValid() and prim.HasAttribute("height"):
+        if prim.HasAttribute("height"):
             height = prim.GetAttribute("height").Get()
-            print(height)
         half_length = height / 2.0
 
         # Get world transform of the Cylinder prim
