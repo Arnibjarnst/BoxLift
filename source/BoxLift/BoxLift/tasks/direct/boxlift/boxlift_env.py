@@ -328,27 +328,45 @@ class BoxliftEnv(DirectRLEnv):
         return torch.cat((ur5_l_joint_vel, ur5_r_joint_vel), 1)
     
     def _get_flange_to_forearm_distance(self, robot: Articulation):
-        import carb
-        from omni.physx import get_physx_scene_query_interface
+        # The Cylinder is a child of forearm_link.
+        # Since USD prims for clones are often invalid/unpopulated at runtime,
+        # we use hardcoded offsets from the forearm_link based on the URDF/USD structure.
+        # Height of the forearm cylinder is ~0.4225.
+        half_length = 0.4225 / 2.0
+        # Local offset of the Cylinder center relative to forearm_link
+        cyl_local_pos = torch.tensor([0.0, 0.0, 0.21125], device=self.device)
+        cyl_local_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
 
-        # Example: overlap against an axis-aligned box region
-        def report_hit(hit):
-            # hit is an omni.physx.bindings._physx.OverlapHit
-            print("Overlapping collider:", hit.collision)
-            # Return True to continue, False to stop after this hit
-            return True
-
-        query = get_physx_scene_query_interface()
-
+        # Get the forearm link's world position and orientation from articulation data (vectorized)
+        forearm_pos = robot.data.body_pos_w[:, self.forearm_link_idx]
+        forearm_quat = robot.data.body_quat_w[:, self.forearm_link_idx]
         flange_pos = robot.data.body_pos_w[:, self.flange_idx]
 
-        radius = 0.028 + 0.0375
-        origin = carb.Float3(flange_pos[0], flange_pos[1], flange_pos[2])
+        # Define cylinder end points in its local frame (along Z-axis)
+        p1_cyl_local = torch.tensor([0.0, 0.0, -half_length], device=self.device)
+        p2_cyl_local = torch.tensor([0.0, 0.0, half_length], device=self.device)
 
-        num_hits = query.overlap_sphere(radius, origin, report_hit, False)
-        print("Any overlap:", num_hits > 0)
+        # Map cylinder ends to forearm link frame
+        p1_link_local = cyl_local_pos + quat_apply(cyl_local_quat.repeat(self.num_envs, 1), p1_cyl_local.repeat(self.num_envs, 1))
+        p2_link_local = cyl_local_pos + quat_apply(cyl_local_quat.repeat(self.num_envs, 1), p2_cyl_local.repeat(self.num_envs, 1))
 
-        return num_hits
+        # Map link frame to world frame
+        p1 = forearm_pos + quat_apply(forearm_quat, p1_link_local)
+        p2 = forearm_pos + quat_apply(forearm_quat, p2_link_local)
+
+        # Calculate distance from flange_pos to line segment [p1, p2]
+        line_vec = p2 - p1
+        p1_to_flange = flange_pos - p1
+        
+        line_len_sq = torch.sum(line_vec**2, dim=-1)
+        # Project flange_pos onto the line segment, clamped between 0 and 1
+        t = torch.sum(p1_to_flange * line_vec, dim=-1) / line_len_sq
+        t = torch.clamp(t, 0.0, 1.0)
+        
+        closest_point = p1 + t.unsqueeze(-1) * line_vec
+        distance = torch.norm(flange_pos - closest_point, dim=-1)
+        
+        return distance
     
     def _get_EE_pos(self, relative=True) -> torch.Tensor:
         EE_pos_l = self.ur5_l.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
