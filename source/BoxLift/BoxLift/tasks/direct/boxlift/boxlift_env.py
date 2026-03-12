@@ -325,10 +325,34 @@ class BoxliftEnv(DirectRLEnv):
         return torch.cat((ur5_l_joint_vel, ur5_r_joint_vel), 1)
     
     def _get_flange_to_forearm_distance(self, robot: Articulation):
-        forearm_length = 0.425 # approx
-        flange_pos = robot.data.body_pos_w[:, self.flange_idx].clone() - self.scene.env_origins
-        forearm_pos = robot.data.body_pos_w[:, self.forearm_link_idx].clone() - self.scene.env_origins
-        forearm_quat = robot.data.body_quat_w[:, self.forearm_link_idx, :].clone()
+        # The forearm link typically has the cylinder along its local Z axis
+        # Length of UR5 forearm is approximately 0.4225m
+        half_length = 0.4225 / 2
+        
+        flange_pos = robot.data.body_pos_w[:, self.flange_idx]
+        forearm_pos = robot.data.body_pos_w[:, self.forearm_link_idx]
+        forearm_quat = robot.data.body_quat_w[:, self.forearm_link_idx]
+
+        # Define cylinder end points in local forearm frame (along Z)
+        p1_local = torch.tensor([0.0, 0.0, -half_length], device=self.device).repeat(self.num_envs, 1)
+        p2_local = torch.tensor([0.0, 0.0, half_length], device=self.device).repeat(self.num_envs, 1)
+
+        # Transform local cylinder points to world frame
+        p1 = forearm_pos + quat_apply(forearm_quat, p1_local)
+        p2 = forearm_pos + quat_apply(forearm_quat, p2_local)
+
+        # Calculate distance from flange_pos to line segment [p1, p2]
+        v = p2 - p1
+        w = flange_pos - p1
+        
+        l2 = torch.sum(v**2, dim=-1)
+        t = torch.sum(w * v, dim=-1) / l2
+        t = torch.clamp(t, 0.0, 1.0)
+        
+        projection = p1 + t.unsqueeze(-1) * v
+        distance = torch.norm(flange_pos - projection, dim=-1)
+        
+        return distance
     
     def _get_EE_pos(self, relative=True) -> torch.Tensor:
         EE_pos_l = self.ur5_l.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
