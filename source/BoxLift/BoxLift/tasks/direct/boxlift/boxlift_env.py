@@ -145,11 +145,11 @@ class BoxliftEnv(DirectRLEnv):
         EE_pos_r = self.EE_poses_r[self.episode_length_buf, :3] + self.scene.env_origins
 
         # Test visualization for cylinder ends
-        p1, p2 = self._get_cylinder_endpoints(self.ur5_l)
+        p1, p2 = self._get_forearm_endpoints(self.ur5_l)
         
         # Stack all points for visualization
         # Order: ee_l, ee_r, cyl_p1, cyl_p2
-        all_marker_pos = torch.stack([EE_pos_l[0], EE_pos_r[0], p1[0], p2[0]], dim=0)
+        all_marker_pos = torch.vstack([EE_pos_l, EE_pos_r, p1, p2])
         self.ee_markers.visualize(translations=all_marker_pos)
 
         obj_pos = self.obj_poses[self.episode_length_buf, :3] + self.scene.env_origins
@@ -341,32 +341,22 @@ class BoxliftEnv(DirectRLEnv):
 
         return torch.cat((ur5_l_joint_vel, ur5_r_joint_vel), 1)
     
-    def _get_cylinder_endpoints(self, robot: Articulation):
+    def _get_forearm_endpoints(self, robot: Articulation):
         # Height of the forearm cylinder is ~0.4225.
-        half_length = 0.4225 / 2.0
+        forearm_length = 0.4225
         # Local offset of the Cylinder center relative to forearm_link
-        cyl_local_pos = torch.tensor([0.0, 0.0, 0.21125], device=self.device)
-        cyl_local_quat = torch.tensor([1.0, 0.0, 0.0, 0.0], device=self.device)
+        p2_local = torch.tensor([-forearm_length, 0.0, 0.0], device=self.device)
 
         forearm_pos = robot.data.body_pos_w[:, self.forearm_link_idx]
         forearm_quat = robot.data.body_quat_w[:, self.forearm_link_idx]
 
-        # Define cylinder end points in its local frame (along Z-axis)
-        p1_cyl_local = torch.tensor([0.0, 0.0, -half_length], device=self.device)
-        p2_cyl_local = torch.tensor([0.0, 0.0, half_length], device=self.device)
-
-        # Map cylinder ends to forearm link frame
-        p1_link_local = cyl_local_pos + quat_apply(cyl_local_quat.repeat(self.num_envs, 1), p1_cyl_local.repeat(self.num_envs, 1))
-        p2_link_local = cyl_local_pos + quat_apply(cyl_local_quat.repeat(self.num_envs, 1), p2_cyl_local.repeat(self.num_envs, 1))
-
         # Map link frame to world frame
-        p1 = forearm_pos + quat_apply(forearm_quat, p1_link_local)
-        p2 = forearm_pos + quat_apply(forearm_quat, p2_link_local)
-        return p1, p2
+        p2 = forearm_pos + quat_apply(forearm_quat, p2_local.repeat(self.num_envs, 1))
+        return forearm_pos, p2
 
     def _get_flange_to_forearm_distance(self, robot: Articulation):
         flange_pos = robot.data.body_pos_w[:, self.flange_idx]
-        p1, p2 = self._get_cylinder_endpoints(robot)
+        p1, p2 = self._get_forearm_endpoints(robot)
 
         # Calculate distance from flange_pos to line segment [p1, p2]
         line_vec = p2 - p1
