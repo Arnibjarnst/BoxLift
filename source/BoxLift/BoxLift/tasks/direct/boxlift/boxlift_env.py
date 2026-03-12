@@ -14,7 +14,6 @@ from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import spawn_ground_plane, GroundPlaneCfg
 from isaaclab.sensors.contact_sensor import ContactSensor
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
-from omni.physx import get_physx_scene_query_interface
 
 from BoxLift.tasks.direct.boxlift.boxlift_env_cfg import *
 
