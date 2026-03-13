@@ -227,6 +227,8 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     w_action_rate = 1e-1
     tol_action_rate = 0.0
 
+    w_joint_limit = 0.01
+
     w_illegal_contact = 0.1
     min_contact_force = 0
     max_contact_force = 20

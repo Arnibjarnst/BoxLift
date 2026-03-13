@@ -291,6 +291,16 @@ class BoxliftEnv(DirectRLEnv):
         action_rate_penalty = action_rate_error.square().sum(dim=-1)
         rew_action_rate = self.cfg.w_action_rate * action_rate_penalty
 
+        # Joint limit penalty
+        q_l, q_r = self.get_joint_targets()
+        q_limits_l = self.ur5e_l.data.joint_pos_limits
+        q_limits_r = self.ur5e_r.data.joint_pos_limits
+        
+        limit_violation_l = torch.clamp(q_limits_l[..., 0] - q_l, min=0.0) + torch.clamp(q_l - q_limits_l[..., 1], min=0.0)
+        limit_violation_r = torch.clamp(q_limits_r[..., 0] - q_r, min=0.0) + torch.clamp(q_r - q_limits_r[..., 1], min=0.0)
+        
+        rew_joint_limit = self.cfg.w_joint_limit * (limit_violation_l.square().sum(dim=-1) + limit_violation_r.square().sum(dim=-1))
+
         total_illegal_force = torch.zeros((self.num_envs,), device=self.device)
         for sensor in self.illegal_contact_sensors.values():
             f_abs = sensor.data.force_matrix_w.norm(dim=-1)
@@ -312,7 +322,9 @@ class BoxliftEnv(DirectRLEnv):
         
         rew_flange_forearm_dist = self.cfg.w_flange_forearm_dist * (is_too_close_l + is_too_close_r)
 
-        rew_regularization = self.cfg.w_regularization * (rew_joint_acc + rew_torque + rew_action_rate + rew_illegal_contact + rew_flange_forearm_dist)
+        rew_regularization = self.cfg.w_regularization * (
+            rew_joint_acc + rew_torque + rew_action_rate + rew_joint_limit + rew_illegal_contact + rew_flange_forearm_dist
+        )
 
         self.extras["log"] = {
             "Rewards_task/obj_pos": rew_obj_pos.mean(),
@@ -329,6 +341,7 @@ class BoxliftEnv(DirectRLEnv):
             "Rewards_regularization/joint_acceleration": rew_joint_acc.mean(), 
             "Rewards_regularization/torque": rew_torque.mean(),
             "Rewards_regularization/action_rate": rew_action_rate.mean(),
+            "Rewards_regularization/joint_limit": rew_joint_limit.mean(),
             "Rewards_regularization/illegal_contact": rew_illegal_contact.mean(),
             "Rewards_regularization/flange_forearm_distance": rew_flange_forearm_dist.mean(),  
             "Extra/mean_EE_force": mean_ee_force.mean(),
