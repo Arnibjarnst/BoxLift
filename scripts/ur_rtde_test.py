@@ -297,6 +297,18 @@ try:
                     raise
         
         # Plot here
+        plt.figure(figsize=(10, 6))
+        plt.plot(tracking_errors, label='Tracking Error (Actual vs Expected)', alpha=0.7)
+        plt.plot(target_errors, label='Target Error (Actual vs Target)', alpha=0.7)
+        plt.xlabel('Step')
+        plt.ylabel('Error (L2 Norm)')
+        plt.title(f'Trajectory Errors - Arm {arm_idx}')
+        plt.legend()
+        plt.grid(True)
+        plot_path = os.path.join(log_dir, f"error_plot_arm_{arm_idx}_{date_t}.png")
+        plt.savefig(plot_path)
+        logger.info(f"Plot saved to {plot_path}", extra={"segment": -1, "step": -1})
+        plt.show()
 
 
 except KeyboardInterrupt:
