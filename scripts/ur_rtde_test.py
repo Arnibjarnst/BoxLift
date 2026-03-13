@@ -1,13 +1,24 @@
 import argparse
+import os
+from datetime import datetime
 import json
 import logging
 import csv
 import time
 import numpy as np
+import matplotlib.pyplot as plt
 
 import rtde_control
 import rtde_receive
 
+# ---------------------------
+# Argument parsing
+# ---------------------------
+
+parser = argparse.ArgumentParser()
+parser.add_argument("joint_target_file", type=str)
+args = parser.parse_args()
+log_dir = os.path.dirname(args.joint_target_file)
 
 # ---------------------------
 # Logging Setup
@@ -20,7 +31,9 @@ formatter = logging.Formatter(
     "%(asctime)s | %(levelname)s | segment=%(segment)s step=%(step)s | %(message)s"
 )
 
-file_handler = logging.FileHandler("trajectory_debug.log")
+date_t = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+log_path = os.path.join(log_dir, f"trajectory_debug_{date_t}.log")
+file_handler = logging.FileHandler(log_path)
 file_handler.setFormatter(formatter)
 file_handler.setLevel(logging.DEBUG)
 
@@ -30,16 +43,6 @@ console_handler.setLevel(logging.INFO)
 
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
-
-
-# ---------------------------
-# Argument parsing
-# ---------------------------
-
-parser = argparse.ArgumentParser()
-parser.add_argument("joint_target_file", type=str)
-args = parser.parse_args()
-
 
 # ---------------------------
 # Load trajectory data
@@ -53,16 +56,9 @@ with open(args.joint_target_file) as f:
 joint_targets = np.array(data["joint_targets_log"])
 joint_pos = np.array(data["joint_positions_log"])
 
-def clamp_to_2pi(q):
-    two_pi = 2 * np.pi
-    while np.any(q > two_pi):
-        q[q > two_pi] -= two_pi
-    while np.any(q < -two_pi):
-        q[q < -two_pi] += two_pi
-    return q
 
-joint_pos = clamp_to_2pi(joint_pos)
-joint_targets = clamp_to_2pi(joint_targets)
+joint_pos = np.clip(joint_pos, -2*np.pi, 2*np.pi)
+joint_targets = np.clip(joint_targets, -2*np.pi, 2*np.pi)
 
 joint_pos_l = joint_pos[:, :6]
 joint_pos_r = joint_pos[:, 6:]
@@ -105,8 +101,8 @@ rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
 velocity = 0.5
 acceleration = 0.5
 dt = 1.0 / 500
-lookahead_time = 0.1
-gain = 300
+lookahead_time = 0.15
+gain = 100
 
 logger.info(
     f"Control parameters: dt={dt}, velocity={velocity}, accel={acceleration}, "
@@ -119,11 +115,13 @@ logger.info(
 # CSV logging
 # ---------------------------
 
-csv_file = open("trajectory_debug.csv", "w", newline="")
+csv_path = os.path.join(log_dir, f"trajectory_debug_{date_t}.csv")
+csv_file = open(csv_path, "w", newline="")
 csv_writer = csv.writer(csv_file)
 
 csv_writer.writerow(
     [
+        "arm_idx",
         "segment",
         "interp_step",
         "interp_t",
@@ -136,14 +134,16 @@ csv_writer.writerow(
     ]
 )
 
+np.set_printoptions(suppress=True, precision=3)
+
 
 # ---------------------------
 # Trajectory execution
 # ---------------------------
-
+upsample_factor = 1
+sub_steps = int(10 * upsample_factor)
 try:
-
-    for arm_idx in [0, 1]:
+    for arm_idx in [0]:
         joint_qs = joint_pos[arm_idx]
         target_qs = joint_targets[arm_idx]
         
@@ -155,11 +155,17 @@ try:
 
         # Move to start
         logger.info(
-            f"moveJ to initial position {joint_qs[0].tolist()}",
+            f"moveJ to initial position {joint_qs[0]}",
             extra={"segment": -1, "step": -1},
         )
 
         success = rtde_c.moveJ(joint_qs[0])
+        start_time = time.perf_counter()
+        while not success:
+            curr_time = time.perf_counter()
+            if curr_time - start_time > 3:
+                raise TimeoutError()
+            success = rtde_c.moveJ(joint_qs[0])
 
         if success:
             # Move to start
@@ -172,6 +178,10 @@ try:
                 f"Failed to reach initial position",
                 extra={"segment": -1, "step": -1},
             )
+            raise RuntimeError()
+        
+        tracking_errors = []
+        target_errors = []
 
         for i in range(len(target_qs)-1):
             joint_q_prev = joint_qs[i]
@@ -180,10 +190,10 @@ try:
             target_q_prev = target_qs[i]
             target_q_next = target_qs[i + 1]
 
-            for j in range(10):
+            for j in range(sub_steps):
 
-                interp_t = j / 10.0
-                next_interp_t = (j + 1) / 10.0
+                interp_t = j / sub_steps
+                next_interp_t = (j + 1) / sub_steps
                 target_q = target_q_prev * (1 - interp_t) + target_q_next * interp_t
                 # expected joint configuration after step
                 joint_q = joint_q_prev * (1 - next_interp_t) + joint_q_next * next_interp_t
@@ -210,8 +220,6 @@ try:
                     # read robot state
                     actual_q = np.array(rtde_r.getActualQ())
 
-                    tracking_error = np.linalg.norm(actual_q - joint_q)
-
                     robot_mode = rtde_r.getRobotMode()
                     safety_mode = rtde_r.getSafetyMode()
 
@@ -222,17 +230,26 @@ try:
                             extra={"segment": i, "step": j},
                         )
 
-                    # tracking error warning
-                    if tracking_error > 0.05:
-                        logger.warning(
-                            f"Large tracking error {tracking_error:.6f}. Actual: {actual_q}. Expected: {joint_q}",
-                            extra={"segment": i, "step": j},
-                        )
+                    tracking_error = np.linalg.norm(actual_q - joint_q)
+                    target_error = np.linalg.norm(target_q - actual_q)
+
+                    tracking_errors.append(tracking_error)
+                    target_errors.append(target_error)
+
+                    logger.info(
+                        f"Target error   {target_error:.6f}. Actual: {actual_q}. Target:   {target_q}",
+                        extra={"segment": i, "step": j},
+                    )
+
+                    logger.info(
+                        f"Tracking error {tracking_error:.6f}. Actual: {actual_q}. Expected: {joint_q}",
+                        extra={"segment": i, "step": j},
+                    )
 
                     logger.debug(
                         f"interp={interp_t:.3f} "
-                        f"cmd_q={joint_q.tolist()} "
-                        f"actual_q={actual_q.tolist()} "
+                        f"cmd_q={joint_q} "
+                        f"actual_q={actual_q} "
                         f"err={tracking_error:.6f}",
                         extra={"segment": i, "step": j},
                     )
@@ -257,6 +274,7 @@ try:
                     # CSV logging
                     csv_writer.writerow(
                         [
+                            arm_idx,
                             i,
                             j,
                             interp_t,
@@ -277,6 +295,8 @@ try:
                     )
 
                     raise
+        
+        # Plot here
 
 
 except KeyboardInterrupt:
@@ -290,7 +310,6 @@ except KeyboardInterrupt:
 finally:
 
     logger.info("Stopping servo", extra={"segment": -1, "step": -1})
-
     rtde_c.servoStop()
     rtde_c.stopScript()
 
