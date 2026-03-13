@@ -175,6 +175,9 @@ class BoxliftEnv(DirectRLEnv):
     def _apply_action(self) -> None:
         q_l, q_r = self.get_joint_targets()
 
+        q_l = q_l.clamp(self.ur5e_l.data.joint_pos_limits[...,0], self.ur5e_l.data.joint_pos_limits[..., 1])
+        q_r = q_r.clamp(self.ur5e_r.data.joint_pos_limits[...,0], self.ur5e_r.data.joint_pos_limits[..., 1])
+
         self.ur5e_l.set_joint_position_target(q_l)
         self.ur5e_r.set_joint_position_target(q_r)
 
@@ -202,12 +205,6 @@ class BoxliftEnv(DirectRLEnv):
         self.reset_terminated = obj_pos_error > self.cfg.max_obj_dist_from_traj
         self.reset_terminated |= obj_quat_error > self.cfg.max_obj_angle_from_traj
 
-        # Terminate if flange gets too close to forearm
-        dist_l = self._get_flange_to_forearm_distance(self.ur5e_l)
-        dist_r = self._get_flange_to_forearm_distance(self.ur5e_r)
-        self.reset_terminated |= (dist_l < self.cfg.max_flange_forearm_distance)
-        self.reset_terminated |= (dist_r < self.cfg.max_flange_forearm_distance)
-
         return self.reset_terminated, time_out
 
     def _reset_idx(self, env_ids: Sequence[int] | None): # type: ignore
@@ -216,8 +213,8 @@ class BoxliftEnv(DirectRLEnv):
         super()._reset_idx(env_ids)
 
         # TODO: verify this is the correct range
-        # self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length - 2, (len(env_ids),), device=self.device, dtype=torch.long)
-        self.episode_length_buf[env_ids] = torch.zeros((len(env_ids),), device=self.device, dtype=torch.long)
+        self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length - 2, (len(env_ids),), device=self.device, dtype=torch.long)
+        # self.episode_length_buf[env_ids] = torch.zeros((len(env_ids),), device=self.device, dtype=torch.long)
         # self.episode_length_buf[env_ids] = torch.randint(0, 40, (len(env_ids),), device=self.device, dtype=torch.long)
 
         initial_joint_pos_l = self.joints_l[self.episode_length_buf[env_ids]]
