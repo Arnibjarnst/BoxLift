@@ -2,6 +2,8 @@ import os
 import sys
 import inspect
 
+sys.path.append("/home/arni/miniconda3/envs/env_isaaclab/lib/python3.11/site-packages")
+
 print("Python path:")
 for p in sys.path:
     print(f" - {p}")

@@ -58,20 +58,20 @@ normal_friction = PhysicsMaterial(
 
 prim_path_box = "/World/envs/env_0/box"
 
-# box = DynamicCuboid(
-#     prim_path=prim_path_box,
-#     name="box",
-#     scale=np.array([0.4, 0.6, 0.06]),
-#     mass=1.0,
-#     physics_material=normal_friction,
-# ) if args.simulate else VisualCuboid(
-#     prim_path=prim_path_box,
-#     name="box",
-#     scale=np.array([0.4, 0.6, 0.06]),
-# )
+box = DynamicCuboid(
+    prim_path=prim_path_box,
+    name="box",
+    scale=np.array([0.4, 0.6, 0.06]),
+    mass=1.0,
+    physics_material=normal_friction,
+) if args.simulate else VisualCuboid(
+    prim_path=prim_path_box,
+    name="box",
+    scale=np.array([0.4, 0.6, 0.06]),
+)
 
 
-usd_path = "./robots/ur5_sphere_1.0.usd"
+usd_path = "./robots/ur5e_sphere.usd"
 
 prim_path_l = "/World/envs/env_0/ur5_left"
 prim_path_r = "/World/envs/env_0/ur5_right"
@@ -98,8 +98,8 @@ arm_r = SingleArticulation(prim_path=prim_path_r, name="ur5_right")
 # ghost_arm_r_prim = RigidPrim(ghost_arm_r.prim_path)
 # ghost_arm_r_prim.disable_rigid_body_physics()
 
-kps = np.ones(6, dtype=np.float32) * 50.0
-kds = np.ones(6, dtype=np.float32) * 10.0
+kps = np.ones(6, dtype=np.float32) * 100.0
+kds = np.ones(6, dtype=np.float32) * 5.0
 
 def initialize():
     # initialize the world
@@ -126,7 +126,7 @@ def initialize():
     # ghost_arm_r.set_joint_positions(joints_r[0])
     # ghost_arm_r.set_world_pose(position=arm_r_pose[:3], orientation=arm_r_pose[3:])
 
-    # box.set_world_pose(orientation=obj_poses[0,3:], position=obj_poses[0, :3])
+    box.set_world_pose(orientation=obj_poses[0,3:], position=obj_poses[0, :3])
 
 initialize()
 
@@ -143,8 +143,8 @@ def on_keyboard_event(event):
 input_iface.subscribe_to_keyboard_events(None, on_keyboard_event)
 
 from isaacsim.core.prims import XFormPrim
-ee_l = XFormPrim(f"{prim_path_l}/ur5/wrist_3_link/Sphere")
-ee_r = XFormPrim(f"{prim_path_r}/ur5/wrist_3_link/Sphere")
+ee_l = XFormPrim(f"{prim_path_l}/Sphere")
+ee_r = XFormPrim(f"{prim_path_r}/Sphere")
 
 import torch
 def quat_apply(quat: torch.Tensor, vec: torch.Tensor) -> torch.Tensor:
@@ -187,8 +187,7 @@ def print_state(i):
     print(f"Joint Position Error: {joints_l[i] - arm_l.get_joint_positions()}")
 
 
-
-
+# last_pause_i = -1
 while simulation_app.is_running():
     world.step(render=True)
 
@@ -196,16 +195,20 @@ while simulation_app.is_running():
 
     if args.simulate:
         # Create and apply articulation action
-        # action_l = ArticulationAction(joint_positions=joints_target_l[i])
-        # action_r = ArticulationAction(joint_positions=joints_target_r[i])
-        action_l = ArticulationAction(joint_positions=joints_l[i])
-        action_r = ArticulationAction(joint_positions=joints_r[i])
+        action_l = ArticulationAction(joint_positions=joints_target_l[i])
+        action_r = ArticulationAction(joint_positions=joints_target_r[i])
+        # action_l = ArticulationAction(joint_positions=joints_l[i])
+        # action_r = ArticulationAction(joint_positions=joints_r[i])
         arm_l.apply_action(action_l)
         arm_r.apply_action(action_r)
     else:
         arm_l.set_joint_positions(joints_l[i])
         arm_r.set_joint_positions(joints_r[i])
-        # box.set_world_pose(orientation=obj_poses[i,3:], position=obj_poses[i, :3])
+        box.set_world_pose(orientation=obj_poses[i,3:], position=obj_poses[i, :3])
+
+    # if i > last_pause_i:
+    #     last_pause_i = i
+    #     world.pause()
 
     # ghost_arm_l.set_joint_positions(joints_l[i])
     # ghost_arm_r.set_joint_positions(joints_r[i])

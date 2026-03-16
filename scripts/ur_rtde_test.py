@@ -98,10 +98,10 @@ rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
 # Control parameters
 # ---------------------------
 
-velocity = 0.5
-acceleration = 0.5
+velocity = 0.1
+acceleration = 0.1
 dt = 1.0 / 500
-lookahead_time = 0.15
+lookahead_time = 0.2
 gain = 100
 
 logger.info(
@@ -140,7 +140,7 @@ np.set_printoptions(suppress=True, precision=3)
 # ---------------------------
 # Trajectory execution
 # ---------------------------
-upsample_factor = 1
+upsample_factor = 4
 sub_steps = int(10 * upsample_factor)
 try:
     for arm_idx in [0]:
@@ -166,6 +166,24 @@ try:
             if curr_time - start_time > 3:
                 raise TimeoutError()
             success = rtde_c.moveJ(joint_qs[0])
+
+        actual_q = np.array(rtde_r.getActualQ())
+
+        # CSV logging
+        csv_writer.writerow(
+            [
+                arm_idx,
+                -1,
+                -1,
+                0,
+                joint_qs[0].tolist(),
+                actual_q.tolist(),
+                0,
+                0,
+                None,
+                None,
+            ]
+        )
 
         if success:
             # Move to start

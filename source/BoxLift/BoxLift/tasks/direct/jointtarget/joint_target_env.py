@@ -15,7 +15,7 @@ from isaaclab.sim.spawners.from_files import spawn_ground_plane, GroundPlaneCfg
 from isaaclab.sensors.contact_sensor import ContactSensor
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
-from BoxLift.tasks.direct.boxlift.joint_target_env_cfg import *
+from BoxLift.tasks.direct.jointtarget.joint_target_env_cfg import *
 
 from isaaclab.utils.math import quat_apply, quat_mul, quat_inv, quat_error_magnitude
 
@@ -112,31 +112,13 @@ class JointTargetEnv(DirectRLEnv):
         self.ee_markers.visualize(translations=EE_pos_lr)
 
     def get_joint_targets(self):
-        q_l = self.joints_target_l[self.episode_length_buf]
-        q_r = self.joints_target_r[self.episode_length_buf]
-
-        dq_l = self.cfg.action_scale * self.actions[:, :6]
-        dq_r = self.cfg.action_scale * self.actions[:, 6:]
-
-        q_l += dq_l
-        q_r += dq_r
+        q_l = self.joints_target_l[self.episode_length_buf] + self.cfg.action_scale * self.actions[:, :6]
+        q_r = self.joints_target_r[self.episode_length_buf] + self.cfg.action_scale * self.actions[:, 6:]
 
         return q_l, q_r
 
     def _apply_action(self) -> None:
         q_l, q_r = self.get_joint_targets()
-
-        # print(self.episode_length_buf)
-        # initial_joint_pos_l = self.joints_l[self.episode_length_buf+1]
-        # initial_joint_vel_l = torch.zeros_like(self.joint_vel_l[self.episode_length_buf+1])
-        # self.ur5_l.write_joint_state_to_sim(initial_joint_pos_l, initial_joint_vel_l)
-
-        # initial_joint_pos_r = self.joints_r[self.episode_length_buf+1]
-        # initial_joint_vel_r = torch.zeros_like(self.joint_vel_r[self.episode_length_buf+1])
-        # self.ur5_r.write_joint_state_to_sim(initial_joint_pos_r, initial_joint_vel_r)
-
-        # self.ur5_l.set_joint_position_target(initial_joint_pos_l)
-        # self.ur5_r.set_joint_position_target(initial_joint_pos_r)
 
         self.ur5_l.set_joint_position_target(q_l)
         self.ur5_r.set_joint_position_target(q_r)
@@ -168,8 +150,6 @@ class JointTargetEnv(DirectRLEnv):
         if env_ids is None:
             env_ids : Sequence[int] = self.scene._ALL_INDICES  # type: ignore
         super()._reset_idx(env_ids)
-
-        print("RESET", env_ids)
 
         # TODO: verify this is the correct range
         # self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length - 2, (len(env_ids),), device=self.device, dtype=torch.long)
