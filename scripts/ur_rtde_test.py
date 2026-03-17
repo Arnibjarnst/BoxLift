@@ -98,8 +98,8 @@ rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
 # Control parameters
 # ---------------------------
 
-velocity = 0.1
-acceleration = 0.1
+velocity = 0.5 # Not Used
+acceleration = 0.5 # Not Used
 dt = 1.0 / 500
 lookahead_time = 0.2
 gain = 100
@@ -140,13 +140,12 @@ np.set_printoptions(suppress=True, precision=3)
 # ---------------------------
 # Trajectory execution
 # ---------------------------
-upsample_factor = 4
+upsample_factor = 1
 sub_steps = int(10 * upsample_factor)
 try:
     for arm_idx in [0]:
         joint_qs = joint_pos[arm_idx]
         target_qs = joint_targets[arm_idx]
-        
 
         logger.info(
             f"Starting trajectory for arm {arm_idx}",

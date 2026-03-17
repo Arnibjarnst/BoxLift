@@ -146,15 +146,16 @@ class JointTargetEnv(DirectRLEnv):
         if env_ids is None:
             env_ids : Sequence[int] = self.scene._ALL_INDICES  # type: ignore
 
-    def _reset_idx(self, env_ids: Sequence[int] | None = None): # type: ignore
+    def _reset_idx(self, env_ids: Sequence[int] | None = None, fixed_value=None): # type: ignore
         if env_ids is None:
             env_ids : Sequence[int] = self.scene._ALL_INDICES  # type: ignore
         super()._reset_idx(env_ids)
 
         # TODO: verify this is the correct range
-        # self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length - 2, (len(env_ids),), device=self.device, dtype=torch.long)
-        self.episode_length_buf[env_ids] = torch.zeros((len(env_ids),), device=self.device, dtype=torch.long)
-        # self.episode_length_buf[env_ids] = torch.randint(0, 40, (len(env_ids),), device=self.device, dtype=torch.long)
+        if fixed_value is not None:
+            self.episode_length_buf[env_ids] = fixed_value * torch.ones((len(env_ids),), device=self.device, dtype=torch.long)
+        else:
+            self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length - 2, (len(env_ids),), device=self.device, dtype=torch.long)
 
         initial_joint_pos_l = self.joints_l[self.episode_length_buf[env_ids]]
         initial_joint_vel_l = self.joint_vel_l[self.episode_length_buf[env_ids]]

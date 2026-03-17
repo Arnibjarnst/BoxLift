@@ -177,6 +177,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     dt = env.unwrapped.step_dt
 
+    env.env.unwrapped._reset_idx(None, 0)
+
     # reset environment
     obs = env.get_observations()
     timestep = 0

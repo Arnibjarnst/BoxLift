@@ -202,12 +202,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # agent stepping
             actions = policy(obs)
 
-            # env stepping
-            obs, _, dones, extras = env.step(actions)
-
             joint_target_l, joint_target_r = get_joint_targets()
             joint_targets = torch.concatenate((joint_target_l[0], joint_target_r[0]))
             output["joint_targets_log"].append(joint_targets.tolist())
+
+            # env stepping
+            obs, _, dones, _ = env.step(actions)
 
             if torch.any(dones):
                 break
