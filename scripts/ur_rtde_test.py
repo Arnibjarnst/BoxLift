@@ -1,5 +1,6 @@
 import argparse
 import os
+import sys
 from datetime import datetime
 import json
 import logging
@@ -74,14 +75,22 @@ logger.info(
     extra={"segment": -1, "step": -1},
 )
 
+import psutil
+os_used = sys.platform
+process = psutil.Process(os.getpid())
+if os_used == "win32":  # Windows (either 32-bit or 64-bit)
+    process.nice(psutil.REALTIME_PRIORITY_CLASS)
 
 # ---------------------------
 # Robot connection
 # ---------------------------
 
-robot_ip = "192.168.56.1"
+if os_used == "win32":
+    robot_ip = "172.29.144.1"
+else:
+    robot_ip = "192.168.56.1"
 
-logger.info("Connecting to robot", extra={"segment": -1, "step": -1})
+logger.info(f"Connecting to robot at {robot_ip}", extra={"segment": -1, "step": -1})
 
 rtde_c = rtde_control.RTDEControlInterface(robot_ip)
 rtde_r = rtde_receive.RTDEReceiveInterface(robot_ip)
@@ -147,6 +156,7 @@ try:
         joint_qs = joint_pos[arm_idx]
         target_qs = joint_targets[arm_idx]
         
+        targets = [joint_qs[0]]
 
         logger.info(
             f"Starting trajectory for arm {arm_idx}",
@@ -216,6 +226,8 @@ try:
                 # expected joint configuration after step
                 joint_q = joint_q_prev * (1 - next_interp_t) + joint_q_next * next_interp_t
 
+                targets.append(target_q)
+
                 try:
                     loop_start = time.perf_counter()
 
@@ -266,7 +278,7 @@ try:
 
                     logger.debug(
                         f"interp={interp_t:.3f} "
-                        f"cmd_q={joint_q} "
+                        f"cmd_q={target_q} "
                         f"actual_q={actual_q} "
                         f"err={tracking_error:.6f}",
                         extra={"segment": i, "step": j},
@@ -328,6 +340,9 @@ try:
         logger.info(f"Plot saved to {plot_path}", extra={"segment": -1, "step": -1})
         plt.show()
 
+        # If we reach here the trajectory is acceptable so we save in a different location for real robot
+        successful_traj_path = os.path.join(log_dir, "successful_joint_targets.npz")
+        np.save(successful_traj_path , np.array(targets))
 
 except KeyboardInterrupt:
 
