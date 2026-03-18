@@ -48,7 +48,8 @@ class BoxliftEnv(DirectRLEnv):
         self.joints_target_r    = torch.from_numpy(traj["joints_target_r"]).float().to(self.device)
         self.EE_poses_l         = torch.from_numpy(traj["EE_poses_l"]).float().to(self.device)
         self.EE_poses_r         = torch.from_numpy(traj["EE_poses_r"]).float().to(self.device)
-        self.dt                 = float(traj["dt"])
+        # self.dt                 = float(traj["dt"])
+        self.dt = 0.02
 
         # TODO: Support last trajectory point
         self.cfg.episode_length_s = self.dt * (self.obj_poses.shape[0] - 1)
@@ -217,7 +218,6 @@ class BoxliftEnv(DirectRLEnv):
             self.episode_length_buf[env_ids] = fixed_value * torch.ones((len(env_ids),), device=self.device, dtype=torch.long)
         else:
             self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length - 2, (len(env_ids),), device=self.device, dtype=torch.long)
-        # self.episode_length_buf[env_ids] = torch.randint(0, 40, (len(env_ids),), device=self.device, dtype=torch.long)
 
         initial_joint_pos_l = self.joints_l[self.episode_length_buf[env_ids]]
         initial_joint_vel_l = self.joint_vel_l[self.episode_length_buf[env_ids]]

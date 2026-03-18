@@ -13,9 +13,9 @@ parser = argparse.ArgumentParser()
 parser.add_argument("joint_target_file_1", type=str)
 parser.add_argument("--joint_target_file_2", type=str, default=None)
 parser.add_argument("--hz", type=int, default=50)
-parser.add_argument("--hz2", type=int, default=50)
 args = parser.parse_args()
 
+dt = 1 / args.hz
 
 def read_json(file_path):
     with open(file_path) as f:
@@ -26,22 +26,27 @@ def read_json(file_path):
     return q_joints[:, :6], q_joints[:, 6:]
 
 def read_csv(file_path):
+    # Downsample to args.hz without interpolation
     q_joints_l = []
     q_joints_r = []
-    
+
     try:
         with open(file_path, mode='r', encoding='utf-8') as csvfile:
             # DictReader uses the first row as keys for each dictionary
             reader = csv.DictReader(csvfile)
-            
+            cum_frame_t = 0.0
             for row in reader:
-                arm_idx = int(row["arm_idx"])
-                q_joint = ast.literal_eval(row["actual_q"])
-                if arm_idx == 0:
-                    q_joints_l.append(q_joint)
-                else:
-                    q_joints_r.append(q_joint)
-
+                loop_time = float(row["loop_time"])
+                cum_frame_t += loop_time
+                while cum_frame_t > dt:
+                    arm_idx = int(row["arm_idx"])
+                    q_joint = ast.literal_eval(row["actual_q"])
+                    if arm_idx == 0:
+                        q_joints_l.append(q_joint)
+                    else:
+                        q_joints_r.append(q_joint)
+                    cum_frame_t -= dt
+                
     except FileNotFoundError:
         print("Error: File not found. Check your path!")
 
@@ -142,9 +147,8 @@ def on_keyboard_event(event):
 input_iface.subscribe_to_keyboard_events(None, on_keyboard_event)
 
 dt = 1 / args.hz
-dt2 = 1 / args.hz2
 N1 = len(q_joints_l) if robot == 0 else len(q_joints_r)
-# last_pause_i = -1
+
 while simulation_app.is_running():
     world.step(render=True)
 
@@ -152,14 +156,11 @@ while simulation_app.is_running():
 
     q_joints_i = q_joints_l[i] if robot == 0 else q_joints_r[i]
 
-
-    # if i != N1-1:
-    #     print(q_joints_i)
     arm_1.set_joint_positions(q_joints_i)
 
     if arm_2:
         N2 = len(q_joints_l_2) if robot == 0 else len(q_joints_r_2)
-        i2 = min(int(world.current_time // dt2), N2-1)
+        i2 = min(int(world.current_time // dt), N2-1)
         q_joints_2_i = q_joints_l_2[i2] if robot == 0 else q_joints_r_2[i2]
         arm_2.set_joint_positions(q_joints_2_i)
 

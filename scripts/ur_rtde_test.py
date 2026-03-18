@@ -18,6 +18,7 @@ import rtde_receive
 
 parser = argparse.ArgumentParser()
 parser.add_argument("joint_target_file", type=str)
+parser.add_argument("--real_robot", action=argparse.BooleanOptionalAction)
 args = parser.parse_args()
 log_dir = os.path.dirname(args.joint_target_file)
 
@@ -85,10 +86,15 @@ if os_used == "win32":  # Windows (either 32-bit or 64-bit)
 # Robot connection
 # ---------------------------
 
-if os_used == "win32":
-    robot_ip = "172.29.144.1"
+if args.real_robot:
+    # Single Robot
+    robot_ip = "192.168.1.100"
 else:
-    robot_ip = "192.168.56.1"
+    if os_used == "win32":
+        robot_ip = "172.29.144.1"
+    else:
+        robot_ip = "192.168.56.1"
+
 
 logger.info(f"Connecting to robot at {robot_ip}", extra={"segment": -1, "step": -1})
 
@@ -107,8 +113,8 @@ rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
 # Control parameters
 # ---------------------------
 
-velocity = 0.1
-acceleration = 0.1
+velocity = 0.5 # Not Used
+acceleration = 0.5 # Not Used
 dt = 1.0 / 500
 lookahead_time = 0.2
 gain = 100
@@ -149,7 +155,7 @@ np.set_printoptions(suppress=True, precision=3)
 # ---------------------------
 # Trajectory execution
 # ---------------------------
-upsample_factor = 4
+upsample_factor = 1
 sub_steps = int(10 * upsample_factor)
 try:
     for arm_idx in [0]:
@@ -169,47 +175,70 @@ try:
             extra={"segment": -1, "step": -1},
         )
 
-        success = rtde_c.moveJ(joint_qs[0])
-        start_time = time.perf_counter()
+        last_time = time.perf_counter()
+
+        success = rtde_c.moveJ(joint_qs[0], 0.5, 1.0, True)
         while not success:
+            print("Trying to start")
             curr_time = time.perf_counter()
-            if curr_time - start_time > 3:
-                raise TimeoutError()
-            success = rtde_c.moveJ(joint_qs[0])
+            success = rtde_c.moveJ(joint_qs[0], 0.5, 1.0, True)
+            if curr_time - last_time > 5:
+                raise TimeoutError("Ran out of time getting to initial position")
 
-        actual_q = np.array(rtde_r.getActualQ())
+        last_time = time.perf_counter()
 
-        # CSV logging
-        csv_writer.writerow(
-            [
-                arm_idx,
-                -1,
-                -1,
-                0,
-                joint_qs[0].tolist(),
-                actual_q.tolist(),
-                0,
-                0,
-                None,
-                None,
-            ]
-        )
+        while rtde_c.isSteady() == False:
+            # Get actual joint positions (6 floats)
+            curr_time = time.perf_counter()
+            actual_q = rtde_r.getActualQ()
+            target_error = np.linalg.norm(np.array(actual_q) - joint_qs[0])
+            loop_time = curr_time - last_time
+            last_time = curr_time
 
-        if success:
-            # Move to start
+            robot_mode = rtde_r.getRobotMode()
+            safety_mode = rtde_r.getSafetyMode()
+
+            if safety_mode != 1:  # 1 = NORMAL
+                logger.error(
+                    f"Robot left NORMAL safety mode. safety_mode={safety_mode}",
+                    extra={"segment": i, "step": j},
+                )
+                raise RuntimeError("Robot safety event")
+
+            if robot_mode != 7:  # 7 = RUNNING
+                logger.error(
+                    f"Robot not running. robot_mode={robot_mode}",
+                    extra={"segment": i, "step": j},
+                )
+                raise RuntimeError("Robot stopped")
+
+            csv_writer.writerow(
+                [
+                    arm_idx,
+                    None,
+                    None,
+                    None,
+                    joint_qs[0].tolist(),
+                    actual_q,
+                    None,
+                    loop_time,
+                    robot_mode,
+                    safety_mode,
+                ]
+            )
+
             logger.info(
-                f"Successfully moved to initial position",
+                f"Target error   {target_error:.6f}. Actual: {actual_q}. Target:   {joint_qs[0]}",
                 extra={"segment": -1, "step": -1},
             )
-        else:
-            logger.error(
-                f"Failed to reach initial position",
-                extra={"segment": -1, "step": -1},
-            )
-            raise RuntimeError()
+
+            # Control your sampling rate (e.g., 100Hz for Isaac Lab)
+            time.sleep(0.01)
         
         tracking_errors = []
         target_errors = []
+
+        print(joint_qs[0] - np.array(rtde_r.getActualQ()))
 
         for i in range(len(target_qs)-1):
             joint_q_prev = joint_qs[i]
@@ -308,7 +337,7 @@ try:
                             i,
                             j,
                             interp_t,
-                            joint_q.tolist(),
+                            target_q.tolist(),
                             actual_q.tolist(),
                             tracking_error,
                             loop_time,
