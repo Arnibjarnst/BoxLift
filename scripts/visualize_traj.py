@@ -81,14 +81,14 @@ simulation_app = SimulationApp({"headless": False})
 from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.api.world import World
-from omni.isaac.core.prims import RigidPrim
 import carb.input
-from pxr import UsdPhysics, PhysxSchema
-
+from omni.isaac.sensor import ContactSensor
 
 world = World()
 
-world.scene.add_default_ground_plane()
+ground_prim_path = "/World/GroundPlane"
+world.scene.add_default_ground_plane(prim_path=ground_prim_path)
+ground_contact_sensor = ContactSensor(ground_prim_path + "/ContactSensor")
 
 usd_path = "./robots/ur5e_sphere.usd"
 
@@ -156,7 +156,16 @@ while simulation_app.is_running():
 
     q_joints_i = q_joints_l[i] if robot == 0 else q_joints_r[i]
 
+    q_joints_i = np.random.rand(6) * np.pi * 2 - np.pi
+
     arm_1.set_joint_positions(q_joints_i)
+
+    world.step(render=False)
+
+    sensor_reading_1 = ground_contact_sensor.get_current_frame()
+    print(sensor_reading_1)
+
+    time.sleep(2)
 
     if arm_2:
         N2 = len(q_joints_l_2) if robot == 0 else len(q_joints_r_2)
