@@ -24,7 +24,9 @@ TABLE_CFG = RigidObjectCfg(
     spawn=sim_utils.CuboidCfg(
         size=(1.5, 1.5, 1.0),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(kinematic_enabled=True),
-        collision_props=sim_utils.CollisionPropertiesCfg(),
+        collision_props=sim_utils.CollisionPropertiesCfg(
+            contact_offset=0.01
+        ),
         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.3, 0.3, 0.3), metallic=0.2),
         activate_contact_sensors=True,
         physics_material=sim_utils.RigidBodyMaterialCfg(
@@ -34,7 +36,7 @@ TABLE_CFG = RigidObjectCfg(
             friction_combine_mode="multiply"
         )
     ),
-    init_state=RigidObjectCfg.InitialStateCfg(pos=(0,0,-0.5))
+    init_state=RigidObjectCfg.InitialStateCfg(pos=(0,0,-0.5)),
 )
 
 @configclass
@@ -150,7 +152,10 @@ class JointTargetEnvCfg(DirectRLEnvCfg):
     w_action_rate = 1e-1
     tol_action_rate = 0.0
 
-    w_illegal_contact = 0.1
+    w_proximity_to_contact = 1.0
+    max_proximity = 0.01
+
+    w_illegal_contact = 0.2
     min_contact_force = 0
     max_contact_force = 20
 
@@ -182,6 +187,21 @@ class JointTargetEnvCfg(DirectRLEnvCfg):
         for ur5_prim_path in [ur5_l_prim_path, ur5_r_prim_path]
     ]
 
+    wrist_3_contact_sensors = [
+        ContactSensorCfg(
+            prim_path=f"{ur5_prim_path}/wrist_3_link",
+            update_period=0.0,
+            history_length=0,
+            debug_vis=True,
+            force_threshold=0,
+            track_contact_points=True,
+            track_air_time=True,
+            # track_pose=True,
+            filter_prim_paths_expr=[TABLE_CFG.prim_path]
+        )
+        for ur5_prim_path in [ur5_l_prim_path, ur5_r_prim_path]
+    ]
+
     illegal_contact_sensor_cfgs = {
         "table": ContactSensorCfg(
             prim_path=table_cfg.prim_path,
@@ -189,6 +209,8 @@ class JointTargetEnvCfg(DirectRLEnvCfg):
             history_length=0,
             debug_vis=True,
             force_threshold=min_contact_force,
+            max_contact_data_count_per_prim=16,
+            track_air_time=True,
             filter_prim_paths_expr=filter_prim_paths_expr
         ),
     }
@@ -235,6 +257,9 @@ def get_ur5_cfg(
                 sleep_threshold=0.005,
                 stabilization_threshold=0.001,
                 fix_root_link=True
+            ),
+            collision_props=sim_utils.CollisionPropertiesCfg(
+                contact_offset=0.01
             ),
             copy_from_source=False,
             activate_contact_sensors=True,

@@ -213,7 +213,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 break
 
             joint_pos: torch.Tensor = get_joint_pos(False)
-            print((joint_targets - joint_pos).abs().mean())
             output["joint_positions_log"].append(joint_pos[0].tolist())
         if args_cli.video:
             timestep += 1

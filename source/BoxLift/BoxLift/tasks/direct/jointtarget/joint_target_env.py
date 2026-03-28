@@ -62,6 +62,8 @@ class JointTargetEnv(DirectRLEnv):
         self.illegal_contact_sensors = {name: ContactSensor(cfg) for name, cfg in self.cfg.illegal_contact_sensor_cfgs.items()}
 
         self.ee_contact_sensors = [ContactSensor(cfg) for cfg in self.cfg.ee_contact_sensors]
+        
+        self.wrist_3_contact_sensors = [ContactSensor(cfg) for cfg in self.cfg.wrist_3_contact_sensors]
 
         # Regularization stuff
         self.prev_actions = torch.zeros((self.num_envs, 12), device=self.device)
@@ -83,6 +85,8 @@ class JointTargetEnv(DirectRLEnv):
             self.scene.sensors[f"illegal_contact_sensor_{name}"] = sensor
         for i, sensor in enumerate(self.ee_contact_sensors):
             self.scene.sensors[f"ee_contact_sensor_{i}"] = sensor
+        for i, sensor in enumerate(self.wrist_3_contact_sensors):
+            self.scene.sensors[f"wrist_3_contact_sensors_{i}"] = sensor
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
@@ -214,19 +218,45 @@ class JointTargetEnv(DirectRLEnv):
         action_rate_penalty = action_rate_error.square().sum(dim=-1)
         rew_action_rate = self.cfg.w_action_rate * action_rate_penalty
 
-        total_illegal_force = torch.zeros((self.num_envs,), device=self.device)
+        rew_contact = torch.zeros((self.num_envs,), device=self.device)
+        rew_proximity = torch.zeros((self.num_envs,), device=self.device)
         for sensor in self.illegal_contact_sensors.values():
-            f_abs = sensor.data.force_matrix_w.norm(dim=-1)
-            f_abs_clamped = f_abs.clamp(max=self.cfg.max_contact_force)
-            total_illegal_force += f_abs_clamped.sum(dim=-1).flatten()
+            forces, _, _, separation, contact_count_per_link, _ = sensor.contact_physx_view.get_contact_data(self.dt)
+
+            contact_count = torch.sum(contact_count_per_link)
+
+            if contact_count == 0:
+                continue
+
+            # Only look at valid contacts
+            forces = forces[:contact_count, 0]
+            separation = separation[:contact_count, 0]
+
+            contact_count_per_env = torch.sum(contact_count_per_link, dim=-1) 
+
+            env_ids = torch.repeat_interleave(torch.arange(self.num_envs, device=self.device), contact_count_per_env)
+
+            min_sep = torch.full((self.num_envs,), 0.02, device=self.device)
+            # Find minimum separation for each environment
+            min_sep.index_reduce_(0, env_ids, separation, reduce='amin', include_self=True)
+
+            proximity = torch.clamp((self.cfg.max_proximity - min_sep) / self.cfg.max_proximity, min=0.0)
+            proximity_penalty = self.cfg.w_proximity_to_contact * (proximity ** 2) # Sum over each point close to contact
+
+            total_force_per_env = torch.zeros(self.num_envs, device=self.device)
+            total_force_per_env.index_add_(0, env_ids, forces)
+            total_force_per_env = torch.clamp(total_force_per_env, min=0.0, max=self.cfg.max_contact_force)
+            contact_penalty = self.cfg.w_illegal_contact * torch.square(total_force_per_env)
+
+            rew_proximity += proximity_penalty
+            rew_contact += contact_penalty
 
         mean_ee_force = torch.zeros((self.num_envs,), device=self.device)
         for sensor in self.ee_contact_sensors:
             mean_ee_force += sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1).flatten() / len(self.ee_contact_sensors)
 
-        rew_illegal_contact = self.cfg.w_illegal_contact * total_illegal_force
 
-        rew_regularization = self.cfg.w_regularization * (rew_joint_acc + rew_torque + rew_action_rate + rew_illegal_contact)
+        rew_regularization = self.cfg.w_regularization * (rew_joint_acc + rew_torque + rew_action_rate + rew_contact + rew_proximity)
 
         self.extras["log"] = {
             "Rewards_track/eef_pos": rew_EE_pos.mean(),
@@ -238,7 +268,8 @@ class JointTargetEnv(DirectRLEnv):
             "Rewards_regularization/joint_acceleration": rew_joint_acc.mean(), 
             "Rewards_regularization/torque": rew_torque.mean(),
             "Rewards_regularization/action_rate": rew_action_rate.mean(),
-            "Rewards_regularization/illegal_contact": rew_illegal_contact.mean(),
+            "Rewards_regularization/illegal_contact": rew_contact.mean(),
+            "Rewards_regularization/illegal_proximity": rew_proximity.mean(),
             "Extra/mean_EE_force": mean_ee_force.mean(),
         }
         

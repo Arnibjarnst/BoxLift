@@ -370,8 +370,8 @@ try:
         plt.show()
 
         # If we reach here the trajectory is acceptable so we save in a different location for real robot
-        successful_traj_path = os.path.join(log_dir, "successful_joint_targets.npz")
-        np.save(successful_traj_path , np.array(targets))
+        # successful_traj_path = os.path.join(log_dir, "successful_joint_targets")
+        # np.save(successful_traj_path , np.array(targets))
 
 except KeyboardInterrupt:
 

@@ -27,11 +27,13 @@ args = parser.parse_args()
 
 data = np.load(args.IK_file_path)
 
-obj_poses       = data["obj_poses"]
-joints_l        = data["joints_l"]
-joints_r        = data["joints_r"]
-joints_target_l = data["joints_target_l"]
-joints_target_r = data["joints_target_r"]
+skip_k = 0
+
+obj_poses       = data["obj_poses"][skip_k:]
+joints_l        = data["joints_l"][skip_k:]
+joints_r        = data["joints_r"][skip_k:]
+joints_target_l = data["joints_target_l"][skip_k:]
+joints_target_r = data["joints_target_r"][skip_k:]
 arm_l_pose    = data["arm_l_pose"]
 arm_r_pose    = data["arm_r_pose"]
 dt              = data["dt"]
@@ -39,10 +41,12 @@ dt              = data["dt"]
 N = len(joints_l)
 
 
+print(joints_l[:10])
+print(joints_r[:10])
+
 physics_dt = 1.0 / 240.0
 
 world = World(physics_dt=physics_dt)
-world
 
 z_position = 0 if args.simulate else -0.5
 world.scene.add_default_ground_plane(z_position=z_position)
@@ -118,8 +122,10 @@ def initialize():
 
     arm_l.set_joint_positions(joints_l[0])
     arm_l.set_world_pose(position=arm_l_pose[:3], orientation=arm_l_pose[3:])
+    arm_l.set_joint_velocities(np.zeros(joints_l[0].shape))
     arm_r.set_joint_positions(joints_r[0])
     arm_r.set_world_pose(position=arm_r_pose[:3], orientation=arm_r_pose[3:])
+    arm_r.set_joint_velocities(np.zeros(joints_r[0].shape))
 
     # ghost_arm_l.set_joint_positions(joints_l[0])
     # ghost_arm_l.set_world_pose(position=arm_l_pose[:3], orientation=arm_l_pose[3:])
@@ -193,6 +199,8 @@ while simulation_app.is_running():
 
     i = min(int(world.current_time // dt), N-1)
 
+    print(i)
+
     if args.simulate:
         # Create and apply articulation action
         action_l = ArticulationAction(joint_positions=joints_target_l[i])
@@ -212,6 +220,6 @@ while simulation_app.is_running():
 
     # ghost_arm_l.set_joint_positions(joints_l[i])
     # ghost_arm_r.set_joint_positions(joints_r[i])
-    print_state(i)
+    # print_state(i)
 
     time.sleep(physics_dt)

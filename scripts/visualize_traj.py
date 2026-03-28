@@ -83,17 +83,23 @@ from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.api.world import World
 import carb.input
 from omni.isaac.sensor import ContactSensor
+from omni.physx import get_physx_scene_query_interface
 
 world = World()
 
 ground_prim_path = "/World/GroundPlane"
-world.scene.add_default_ground_plane(prim_path=ground_prim_path)
-ground_contact_sensor = ContactSensor(ground_prim_path + "/ContactSensor")
+world.scene.add_default_ground_plane(prim_path=ground_prim_path, z_position=0.00)
 
 usd_path = "./robots/ur5e_sphere.usd"
 
 prim_path_1 = "/World/envs/env_0/ur5_1"
 add_reference_to_stage(usd_path, prim_path_1)
+
+robot_contact_sensors = [
+    ContactSensor(prim_path_1 + f"/{link_name}/ContactSensor")
+    for link_name in ["shoulder_link", "upper_arm_link", "forearm_link", "wrist_1_link", "wrist_2_link", "wrist_3_link"]
+]
+
 
 stage = get_current_stage()
 
@@ -156,16 +162,15 @@ while simulation_app.is_running():
 
     q_joints_i = q_joints_l[i] if robot == 0 else q_joints_r[i]
 
-    q_joints_i = np.random.rand(6) * np.pi * 2 - np.pi
-
     arm_1.set_joint_positions(q_joints_i)
 
-    world.step(render=False)
-
-    sensor_reading_1 = ground_contact_sensor.get_current_frame()
-    print(sensor_reading_1)
-
-    time.sleep(2)
+    contact_readings = [sensor.get_current_frame() for sensor in robot_contact_sensors]
+    in_contact = np.any([r["in_contact"] and r["force"] > 0.0 for r in contact_readings])
+    
+    if in_contact and world.is_playing():
+        print(f"IN CONTACT AT STEP: {i} ")
+        print(q_joints_i)
+        world.pause()
 
     if arm_2:
         N2 = len(q_joints_l_2) if robot == 0 else len(q_joints_r_2)
