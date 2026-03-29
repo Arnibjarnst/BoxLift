@@ -183,10 +183,12 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     direct_env._reset_idx(None, 0)
     get_joint_pos = direct_env._get_joint_pos
     get_joint_targets = direct_env.get_joint_targets
+    get_joint_torques = direct_env.get_joint_torques
 
     output = {
         "joint_targets_log": [],
         "joint_positions_log": [get_joint_pos(False)[0].tolist()],
+        "joint_torques_log": [],
         "arm_l_pose": direct_env.arm_l_pose.tolist(),
         "arm_r_pose": direct_env.arm_r_pose.tolist(),
     }
@@ -209,11 +211,16 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # env stepping
             obs, _, dones, _ = env.step(actions)
 
+            joint_pos: torch.Tensor = get_joint_pos(False)
+            output["joint_positions_log"].append(joint_pos[0].tolist())
+
+            joint_torque_l, joint_torque_r = get_joint_torques()
+            joint_torques = torch.concatenate((joint_torque_l[0], joint_torque_r[0]))
+            output["joint_torques_log"].append(joint_torques.tolist())
+
             if torch.any(dones):
                 break
 
-            joint_pos: torch.Tensor = get_joint_pos(False)
-            output["joint_positions_log"].append(joint_pos[0].tolist())
         if args_cli.video:
             timestep += 1
             # Exit the play loop after recording one video

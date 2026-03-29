@@ -5,8 +5,8 @@
 
 import numpy as np
 
-from isaaclab.actuators import ImplicitActuatorCfg, IdealPDActuatorCfg
-from isaaclab.assets import ArticulationCfg, RigidObjectCfg, AssetBaseCfg
+from isaaclab.actuators import ImplicitActuatorCfg, IdealPDActuatorCfg, DelayedPDActuatorCfg
+from isaaclab.assets import ArticulationCfg, RigidObjectCfg
 from isaaclab.envs import DirectRLEnvCfg, mdp
 from isaaclab.managers import EventTermCfg, SceneEntityCfg
 from isaaclab.scene import InteractiveSceneCfg
@@ -110,9 +110,11 @@ class JointTargetEnvCfg(DirectRLEnvCfg):
     # Arm Actuator parameters
     kp = 100
     kd = 10
-    actuator_type = "Implicit"  # or "IdealPD"
+    actuator_type = "Implicit"  # or "IdealPD" or "DelayedPD"
     velocity_limit=50.0
     effort_limit=87.0
+    actuator_min_delay = 0 # For DelayedPDActuatorCfg
+    actuator_max_delay = 0 # For DelayedPDActuatorCfg
 
     # table
     table_cfg = TABLE_CFG
@@ -233,7 +235,11 @@ def get_ur5_cfg(
         effort_limit=joint_target_cfg.effort_limit,
     )
 
-    if joint_target_cfg.actuator_type == "IdealPD":
+    if joint_target_cfg.actuator_type == "DelayedPD":
+        actuator_kwargs["min_delay"] = joint_target_cfg.actuator_min_delay
+        actuator_kwargs["max_delay"] = joint_target_cfg.actuator_max_delay
+        actuator_cfg = DelayedPDActuatorCfg(**actuator_kwargs)
+    elif joint_target_cfg.actuator_type == "IdealPD":
         actuator_cfg = IdealPDActuatorCfg(**actuator_kwargs)
     elif joint_target_cfg.actuator_type == "Implicit":
         actuator_cfg = ImplicitActuatorCfg(**actuator_kwargs)

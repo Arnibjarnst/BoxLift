@@ -9,8 +9,10 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 
-import rtde_control
-import rtde_receive
+from rtde_control import RTDEControlInterface as RTDEControl
+from rtde_receive import RTDEReceiveInterface as RTDEReceive
+
+ARM_IDX = 0
 
 # ---------------------------
 # Argument parsing
@@ -30,7 +32,7 @@ logger = logging.getLogger("trajectory_logger")
 logger.setLevel(logging.DEBUG)
 
 formatter = logging.Formatter(
-    "%(asctime)s | %(levelname)s | segment=%(segment)s step=%(step)s | %(message)s"
+    "%(asctime)s | %(levelname)s | step=%(step)s | %(message)s"
 )
 
 date_t = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
@@ -50,30 +52,58 @@ logger.addHandler(console_handler)
 # Load trajectory data
 # ---------------------------
 
-logger.info("Loading joint trajectory file", extra={"segment": -1, "step": -1})
+logger.info("Loading joint trajectory file", extra={"step": -1})
 
 with open(args.joint_target_file) as f:
     data = json.load(f)
 
 joint_targets = np.array(data["joint_targets_log"])
 joint_pos = np.array(data["joint_positions_log"])
+joint_torques = np.array(data["joint_torques_log"])
 
+assert np.all(joint_pos <= 2*np.pi) and np.all(joint_pos >= -2*np.pi)
+assert np.all(joint_targets <= 2*np.pi) and np.all(joint_targets >= -2*np.pi)
 
-joint_pos = np.clip(joint_pos, -2*np.pi, 2*np.pi)
-joint_targets = np.clip(joint_targets, -2*np.pi, 2*np.pi)
+def split_lr(arr):
+    arr_l = arr[..., :6]
+    arr_r = arr[..., 6:]
 
-joint_pos_l = joint_pos[:, :6]
-joint_pos_r = joint_pos[:, 6:]
-joint_pos = (joint_pos_l, joint_pos_r)
+    return arr_l, arr_r
 
-joint_target_l = joint_targets[:, :6]
-joint_target_r = joint_targets[:, 6:]
-joint_targets = (joint_target_l, joint_target_r)
+joint_pos = split_lr(joint_pos)
+joint_targets = split_lr(joint_targets)
+joint_torques = split_lr(joint_torques)
 
+def upsample_linear(matrix, scale_factor=10):
+    N, K = matrix.shape
+    if N < 2:
+        return matrix # Cannot interpolate a single row
+    
+    # Define original row indices: [0, 1, 2, ..., N-1]
+    original_indices = np.arange(N)
+    
+    # Define new indices. 
+    # Example: If steps_per_segment is 10, indices will be [0, 0.1, 0.2, ..., N-1]
+    num_samples = (N - 1) * scale_factor + 1
+    new_indices = np.linspace(0, N - 1, num_samples)
+    
+    # Interpolate each column independently across the new row indices
+    upsampled_matrix = np.apply_along_axis(
+        lambda col: np.interp(new_indices, original_indices, col), 
+        axis=0, 
+        arr=matrix
+    )
+    
+    return upsampled_matrix
+
+# 50hz -> 500hz
+joint_qs = upsample_linear(joint_pos[ARM_IDX], 10)
+joint_target_qs = upsample_linear(joint_targets[ARM_IDX], 10)
+joint_torques = upsample_linear(joint_torques[ARM_IDX], 10)
 
 logger.info(
-    f"Trajectory loaded. Total frames: {len(joint_target_l)}",
-    extra={"segment": -1, "step": -1},
+    f"Trajectory loaded. Total frames: {len(joint_target_qs)}",
+    extra={"step": -1}
 )
 
 import psutil
@@ -96,15 +126,20 @@ else:
         robot_ip = "192.168.56.1"
 
 
-logger.info(f"Connecting to robot at {robot_ip}", extra={"segment": -1, "step": -1})
+logger.info(f"Connecting to robot at {robot_ip}", extra={"step": -1})
 
-rtde_c = rtde_control.RTDEControlInterface(robot_ip)
-rtde_r = rtde_receive.RTDEReceiveInterface(robot_ip)
+rtde_frequency = 500
+dt = 1 / rtde_frequency
+rtde_c = RTDEControl(robot_ip, rtde_frequency, RTDEControl.FLAG_VERBOSE | RTDEControl.FLAG_UPLOAD_SCRIPT)
+rtde_r = RTDEReceive(robot_ip, rtde_frequency)
 
-logger.info("Connection established", extra={"segment": -1, "step": -1})
+# UR5e max torques
+max_torque = np.array([150.0, 150.0, 150.0, 28.0, 28.0, 28.0])
+
+logger.info("Connection established", extra={"step": -1})
 
 # Attempt to clear errors and reset robot state
-logger.info("Resetting robot state", extra={"segment": -1, "step": -1})
+logger.info("Resetting robot state", extra={"step": -1})
 rtde_c.reuploadScript()
 
 rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
@@ -115,16 +150,14 @@ rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
 
 velocity = 0.5 # Not Used
 acceleration = 0.5 # Not Used
-dt = 1.0 / 500
 lookahead_time = 0.2
-gain = 100
+gain = 300
 
 logger.info(
     f"Control parameters: dt={dt}, velocity={velocity}, accel={acceleration}, "
     f"lookahead={lookahead_time}, gain={gain}",
-    extra={"segment": -1, "step": -1},
+    extra={"step": -1},
 )
-
 
 # ---------------------------
 # CSV logging
@@ -137,12 +170,9 @@ csv_writer = csv.writer(csv_file)
 csv_writer.writerow(
     [
         "arm_idx",
-        "segment",
-        "interp_step",
-        "interp_t",
-        "cmd_q",
+        "step",
+        "target_q",
         "actual_q",
-        "tracking_error",
         "loop_time",
         "robot_mode",
         "safety_mode",
@@ -151,245 +181,190 @@ csv_writer.writerow(
 
 np.set_printoptions(suppress=True, precision=3)
 
+target_errors = np.zeros(len(joint_target_qs))
+tracking_errors = np.zeros(len(joint_target_qs))
+
+def log(i, dt):
+    actual_q = np.array(rtde_r.getActualQ())
+    target_q = joint_target_qs[i-1] if i >= 1 else joint_qs[0]
+    expected_q = joint_qs[i]  if i >= 0 else joint_qs[0]
+
+    tracking_error = np.linalg.norm(actual_q - expected_q)
+    target_error = np.linalg.norm(target_q - actual_q)
+
+    logger.info(
+        f"Target error   {target_error:.6f}. Actual: {actual_q}. Target:   {target_q}",
+        extra={"step": i},
+    )
+
+    logger.info(
+        f"Tracking error {tracking_error:.6f}. Actual: {actual_q}. Expected: {expected_q}",
+        extra={"step": i},
+    )
+
+    robot_mode = rtde_r.getRobotMode()
+    safety_mode = rtde_r.getSafetyMode()
+
+    if safety_mode != 1:  # 1 = NORMAL
+        logger.error(
+            f"Robot left NORMAL safety mode. safety_mode={safety_mode}",
+            extra={"step": i},
+        )
+        raise RuntimeError("Robot safety event")
+
+    if robot_mode != 7:  # 7 = RUNNING
+        logger.error(
+            f"Robot not running. robot_mode={robot_mode}",
+            extra={"step": i},
+        )
+        raise RuntimeError("Robot stopped")
+
+    # CSV logging
+    csv_writer.writerow(
+        [
+            ARM_IDX,
+            i,
+            target_q.tolist(),
+            actual_q.tolist(),
+            dt,
+            robot_mode,
+            safety_mode,
+        ]
+    )
+
+    if i >= 0:
+        target_errors[i] = target_error
+        tracking_errors[i] = tracking_error
+    
+        expected_torque = joint_torques[i]
+        external_torques = rtde_c.getJointTorques() # External Torque I think
+        target_moments = rtde_r.getTargetMoment() # What should happen?
+        raw_wrench = rtde_r.getFtRawWrench() # What is happening?
+        # current_as_torque = rtde_r.getActualCurrentAsTorque() # Doesn't exist?
+        
+        logger.info(
+            f"external_torques {external_torques}",
+            extra={"step": i},
+        )
+
+        logger.info(
+            f"target_moments {target_moments}",
+            extra={"step": i},
+        )
+
+        logger.info(
+            f"raw_wrench {raw_wrench}",
+            extra={"step": i},
+        )
+
+        logger.info(
+            f"Expected Torque: {expected_torque}",
+            extra={"step": i}
+        )
 
 # ---------------------------
 # Trajectory execution
 # ---------------------------
-upsample_factor = 1
-sub_steps = int(10 * upsample_factor)
 try:
-    for arm_idx in [0]:
-        joint_qs = joint_pos[arm_idx]
-        target_qs = joint_targets[arm_idx]
-        
-        targets = [joint_qs[0]]
+    logger.info(
+        f"Starting trajectory for arm {ARM_IDX}",
+        extra={"step": -1},
+    )
 
-        logger.info(
-            f"Starting trajectory for arm {arm_idx}",
-            extra={"segment": -1, "step": -1},
-        )
+    # Move to start
+    logger.info(
+        f"moveJ to initial position {joint_qs[0]}",
+        extra={"step": -1},
+    )
 
-        # Move to start
-        logger.info(
-            f"moveJ to initial position {joint_qs[0]}",
-            extra={"segment": -1, "step": -1},
-        )
+    last_time = time.perf_counter()
 
-        last_time = time.perf_counter()
-
+    success = rtde_c.moveJ(joint_qs[0], 0.5, 1.0, True)
+    while not success:
+        curr_time = time.perf_counter()
         success = rtde_c.moveJ(joint_qs[0], 0.5, 1.0, True)
-        while not success:
-            print("Trying to start")
-            curr_time = time.perf_counter()
-            success = rtde_c.moveJ(joint_qs[0], 0.5, 1.0, True)
-            if curr_time - last_time > 5:
-                raise TimeoutError("Ran out of time getting to initial position")
+        if curr_time - last_time > 5:
+            raise TimeoutError("Ran out of time getting to initial position")
 
-        last_time = time.perf_counter()
+    last_time = time.perf_counter()
 
-        while rtde_c.isSteady() == False:
-            # Get actual joint positions (6 floats)
-            curr_time = time.perf_counter()
-            actual_q = rtde_r.getActualQ()
-            target_error = np.linalg.norm(np.array(actual_q) - joint_qs[0])
-            loop_time = curr_time - last_time
-            last_time = curr_time
+    while rtde_c.isSteady() == False:
+        # Get actual joint positions (6 floats)
+        curr_time = time.perf_counter()
+        loop_time = curr_time - last_time
+        last_time = curr_time
 
-            robot_mode = rtde_r.getRobotMode()
-            safety_mode = rtde_r.getSafetyMode()
+        log(-1, loop_time)
 
-            if safety_mode != 1:  # 1 = NORMAL
-                logger.error(
-                    f"Robot left NORMAL safety mode. safety_mode={safety_mode}",
-                    extra={"segment": i, "step": j},
-                )
-                raise RuntimeError("Robot safety event")
+        # No need to check on this more often
+        time.sleep(0.01)
 
-            if robot_mode != 7:  # 7 = RUNNING
-                logger.error(
-                    f"Robot not running. robot_mode={robot_mode}",
-                    extra={"segment": i, "step": j},
-                )
-                raise RuntimeError("Robot stopped")
+    rtde_c.stopJ()
 
-            csv_writer.writerow(
-                [
-                    arm_idx,
-                    None,
-                    None,
-                    None,
-                    joint_qs[0].tolist(),
-                    actual_q,
-                    None,
-                    loop_time,
-                    robot_mode,
-                    safety_mode,
-                ]
+    for i, target_q in enumerate(joint_target_qs):
+        try:
+            t_start = rtde_c.initPeriod()
+
+            # send command
+            # rtde_c.servoJ(
+            #     target_q,
+            #     velocity,
+            #     acceleration,
+            #     dt,
+            #     lookahead_time,
+            #     gain,
+            # )
+
+            torque = joint_torques[i]
+
+            # rtde_c.directTorque(torque)
+            rtde_c.directTorque([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+            log(i, dt)
+
+            # Should be at the end to ensure correct timing
+            rtde_c.waitPeriod(t_start)
+
+        except Exception as e:
+
+            logger.error(
+                f"servoJ exception: {str(e)}",
+                extra={"step": i},
             )
 
-            logger.info(
-                f"Target error   {target_error:.6f}. Actual: {actual_q}. Target:   {joint_qs[0]}",
-                extra={"segment": -1, "step": -1},
-            )
-
-            # Control your sampling rate (e.g., 100Hz for Isaac Lab)
-            time.sleep(0.01)
-        
-        tracking_errors = []
-        target_errors = []
-
-        print(joint_qs[0] - np.array(rtde_r.getActualQ()))
-
-        for i in range(len(target_qs)-1):
-            joint_q_prev = joint_qs[i]
-            joint_q_next = joint_qs[i + 1]
-
-            target_q_prev = target_qs[i]
-            target_q_next = target_qs[i + 1]
-
-            for j in range(sub_steps):
-
-                interp_t = j / sub_steps
-                next_interp_t = (j + 1) / sub_steps
-                target_q = target_q_prev * (1 - interp_t) + target_q_next * interp_t
-                # expected joint configuration after step
-                joint_q = joint_q_prev * (1 - next_interp_t) + joint_q_next * next_interp_t
-
-                targets.append(target_q)
-
-                try:
-                    loop_start = time.perf_counter()
-
-                    t_start = rtde_c.initPeriod()
-
-                    # send command
-                    rtde_c.servoJ(
-                        target_q,
-                        velocity,
-                        acceleration,
-                        dt,
-                        lookahead_time,
-                        gain,
-                    )
-
-                    rtde_c.waitPeriod(t_start)
-
-                    loop_time = time.perf_counter() - loop_start
-
-                    # read robot state
-                    actual_q = np.array(rtde_r.getActualQ())
-
-                    robot_mode = rtde_r.getRobotMode()
-                    safety_mode = rtde_r.getSafetyMode()
-
-                    # timing violation detection
-                    if loop_time > dt + 1e-5:
-                        logger.warning(
-                            f"Loop overrun {loop_time:.6f}s > {dt}",
-                            extra={"segment": i, "step": j},
-                        )
-
-                    tracking_error = np.linalg.norm(actual_q - joint_q)
-                    target_error = np.linalg.norm(target_q - actual_q)
-
-                    tracking_errors.append(tracking_error)
-                    target_errors.append(target_error)
-
-                    logger.info(
-                        f"Target error   {target_error:.6f}. Actual: {actual_q}. Target:   {target_q}",
-                        extra={"segment": i, "step": j},
-                    )
-
-                    logger.info(
-                        f"Tracking error {tracking_error:.6f}. Actual: {actual_q}. Expected: {joint_q}",
-                        extra={"segment": i, "step": j},
-                    )
-
-                    logger.debug(
-                        f"interp={interp_t:.3f} "
-                        f"cmd_q={target_q} "
-                        f"actual_q={actual_q} "
-                        f"err={tracking_error:.6f}",
-                        extra={"segment": i, "step": j},
-                    )
-
-                    robot_mode = rtde_r.getRobotMode()
-                    safety_mode = rtde_r.getSafetyMode()
-
-                    if safety_mode != 1:  # 1 = NORMAL
-                        logger.error(
-                            f"Robot left NORMAL safety mode. safety_mode={safety_mode}",
-                            extra={"segment": i, "step": j},
-                        )
-                        raise RuntimeError("Robot safety event")
-
-                    if robot_mode != 7:  # 7 = RUNNING
-                        logger.error(
-                            f"Robot not running. robot_mode={robot_mode}",
-                            extra={"segment": i, "step": j},
-                        )
-                        raise RuntimeError("Robot stopped")
-
-                    # CSV logging
-                    csv_writer.writerow(
-                        [
-                            arm_idx,
-                            i,
-                            j,
-                            interp_t,
-                            target_q.tolist(),
-                            actual_q.tolist(),
-                            tracking_error,
-                            loop_time,
-                            robot_mode,
-                            safety_mode,
-                        ]
-                    )
-
-                except Exception as e:
-
-                    logger.error(
-                        f"servoJ exception: {str(e)}",
-                        extra={"segment": i, "step": j},
-                    )
-
-                    raise
-        
-        # Plot here
-        plt.figure(figsize=(10, 6))
-        plt.plot(tracking_errors, label='Tracking Error (Actual vs Expected)', alpha=0.7)
-        plt.plot(target_errors, label='Target Error (Actual vs Target)', alpha=0.7)
-        plt.xlabel('Step')
-        plt.ylabel('Error (L2 Norm)')
-        plt.title(f'Trajectory Errors - Arm {arm_idx}')
-        plt.legend()
-        plt.grid(True)
-        plot_path = os.path.join(log_dir, f"error_plot_arm_{arm_idx}_{date_t}.png")
-        plt.savefig(plot_path)
-        logger.info(f"Plot saved to {plot_path}", extra={"segment": -1, "step": -1})
-        plt.show()
-
-        # If we reach here the trajectory is acceptable so we save in a different location for real robot
-        # successful_traj_path = os.path.join(log_dir, "successful_joint_targets")
-        # np.save(successful_traj_path , np.array(targets))
+            raise
+    
+    # Plot here
+    plt.figure(figsize=(10, 6))
+    plt.plot(tracking_errors, label='Tracking Error (Actual vs Expected)', alpha=0.7)
+    plt.plot(target_errors, label='Target Error (Actual vs Target)', alpha=0.7)
+    plt.xlabel('Step')
+    plt.ylabel('Error (L2 Norm)')
+    plt.title(f'Trajectory Errors - Arm {ARM_IDX}')
+    plt.legend()
+    plt.grid(True)
+    plot_path = os.path.join(log_dir, f"error_plot_arm_{ARM_IDX}_{date_t}.png")
+    plt.savefig(plot_path)
+    logger.info(f"Plot saved to {plot_path}", extra={"step": -1})
+    plt.show()
 
 except KeyboardInterrupt:
 
     logger.warning(
         "Execution interrupted by user",
-        extra={"segment": -1, "step": -1},
+        extra={"step": -1},
     )
 
 
 finally:
 
-    logger.info("Stopping servo", extra={"segment": -1, "step": -1})
+    logger.info("Stopping servo", extra={"step": -1})
     rtde_c.servoStop()
     rtde_c.stopScript()
 
     csv_file.close()
 
     logger.info(
-        "Execution finished. Logs written to trajectory_debug.log and trajectory_debug.csv",
-        extra={"segment": -1, "step": -1},
+        f"Execution finished. Logs written to {log_path} and {csv_path}",
+        extra={"step": -1},
     )

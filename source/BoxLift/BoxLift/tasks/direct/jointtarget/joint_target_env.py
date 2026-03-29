@@ -120,6 +120,12 @@ class JointTargetEnv(DirectRLEnv):
         q_r = self.joints_target_r[self.episode_length_buf] + self.cfg.action_scale * self.actions[:, 6:]
 
         return q_l, q_r
+    
+    def get_joint_torques(self):
+        torque_l = self.ur5_l.data.applied_torque.clone()
+        torque_r = self.ur5_r.data.applied_torque.clone()
+
+        return torque_l, torque_r
 
     def _apply_action(self) -> None:
         q_l, q_r = self.get_joint_targets()
@@ -208,7 +214,7 @@ class JointTargetEnv(DirectRLEnv):
         joint_acc_penalty = joint_acc.square().sum(dim=-1)
         rew_joint_acc = self.cfg.w_joint_acc * joint_acc_penalty
 
-        torque = torch.cat((self.ur5_l.data.applied_torque.clone(), self.ur5_r.data.applied_torque.clone()), 1)
+        torque = torch.cat(self.get_joint_torques(), 1)
         torque *= torch.abs(torque) > self.cfg.tol_joint_torque
         torque_penalty = torque.square().sum(dim=-1)
         rew_torque = self.cfg.w_joint_torque * torque_penalty        
