@@ -299,6 +299,7 @@ class JointTargetEnv(DirectRLEnv):
         return torch.cat((joint_pos_l, joint_pos_r), 1)
     
     
+    # TODO: Make relative velocity?
     def _get_joint_vel(self):
         ur5_l_joint_vel = self.ur5_l.data.joint_vel.clone()
         ur5_r_joint_vel = self.ur5_r.data.joint_vel.clone()

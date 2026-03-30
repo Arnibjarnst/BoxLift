@@ -299,7 +299,6 @@ try:
         # No need to check on this more often
         time.sleep(0.01)
 
-    rtde_c.stopJ()
 
     for i, target_q in enumerate(joint_target_qs):
         try:

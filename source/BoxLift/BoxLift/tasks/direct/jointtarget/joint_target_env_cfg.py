@@ -108,20 +108,27 @@ class JointTargetEnvCfg(DirectRLEnvCfg):
     ur5_r_prim_path = f"{ENV_REGEX}/ur5_r"
 
     # Arm Actuator parameters
-    kp = 100
-    kd = 10
-    actuator_type = "Implicit"  # or "IdealPD" or "DelayedPD"
-    velocity_limit=50.0
-    effort_limit=87.0
-    actuator_min_delay = 0 # For DelayedPDActuatorCfg
-    actuator_max_delay = 0 # For DelayedPDActuatorCfg
+    kp = 100.0
+    kd = 10.0
+    actuator_type = "Implicit"  # "Implicit", "IdealPD" or "DelayedPD"
+    velocity_limit = 3.14
+    effort_limit= {
+        "shoulder_pan_joint": 150.0,
+        "shoulder_lift_joint": 150.0,
+        "elbow_joint": 150.0,
+        "wrist_1_joint": 28.0,
+        "wrist_2_joint": 28.0,
+        "wrist_3_joint": 28.0,
+    }
+    actuator_min_delay = 1 # For DelayedPDActuatorCfg
+    actuator_max_delay = 2 # For DelayedPDActuatorCfg
 
     # table
     table_cfg = TABLE_CFG
 
     # scene
     replicate_physics = bool(np.all([event["mode"] != "prestartup" and event["mode"] != "startup" for event in events.to_dict().values()])) # type: ignore
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=replicate_physics)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=4.0, replicate_physics=replicate_physics)
 
     # Action scale
     action_scale = 0.25
