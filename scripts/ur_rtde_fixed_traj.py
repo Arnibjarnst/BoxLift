@@ -24,7 +24,7 @@ ARM_IDX = 0
 parser = argparse.ArgumentParser()
 parser.add_argument("--duration", default=10.0, type=float)
 parser.add_argument("--amplitude", default=20.0, type=float)
-parser.add_argument("--delay", default=0.5, type=float)
+parser.add_argument("--delay", default=0.0, type=float)
 parser.add_argument("--real_robot", action=argparse.BooleanOptionalAction)
 args = parser.parse_args()
 
@@ -136,7 +136,6 @@ joints = joints_0[None, ...] + amplitude * np.sin(t)[:, None]
 def log(i):
     actual_q = np.array(rtde_r.getActualQ())
 
-
     expected_q = joints[i] if i >= 0 else joints_0
     tracking_error = np.linalg.norm(actual_q - expected_q)
 
@@ -203,15 +202,13 @@ try:
         success = rtde_c.moveJ(joints_0, 0.5, 1.0, True)
         if curr_time - last_time > 5:
             raise TimeoutError("Ran out of time getting to initial position")
+        
+        time.sleep(0.02)
 
     last_time = time.perf_counter()
 
     while rtde_c.isSteady() == False:
         # Get actual joint positions (6 floats)
-        curr_time = time.perf_counter()
-        loop_time = curr_time - last_time
-        last_time = curr_time
-
         log(-1)
 
         # No need to be accurate
@@ -223,12 +220,15 @@ except KeyboardInterrupt:
         extra={"step": -1},
     )
 
-finally:
-    rtde_c.stopJ()
-
+logger.info(
+    f"Finished moveJ to initial position {joints_0}",
+    extra={"step": -1},
+)
 
 first_command_time = None
 first_command_delay = None
+
+actual_q = []
 
 def control_thread():
     step_counter = 0
@@ -238,7 +238,9 @@ def control_thread():
             t_start = rtde_c.initPeriod()
                 
             if first_command_time is None:
-                first_command_time = time.perf_counter()
+                first_command_time = rtde_c.initPeriod().total_seconds()
+
+            actual_q.append(np.array(rtde_r.getActualQ()))
             
             # 4. Command the robot
             # TODO: Change to torque
@@ -250,8 +252,6 @@ def control_thread():
                 lookahead_time,
                 gain,
             )
-
-            print("Exec time:", rtde_r.getActualExecutionTime())
 
             step_counter += 1
 
@@ -287,16 +287,17 @@ def control_thread():
 
 
 def get_movement_start_t(delays):
-    threshold = 1e-3
+    # shouldn't be lower than 2e-4
+    threshold = 2e-4
     detected = np.zeros(6)
 
     while not np.all(detected):
-        curr_time = time.perf_counter()
+        curr_time = rtde_c.initPeriod().total_seconds()
         curr_joints = np.array(rtde_r.getActualQ())
         joint_error = np.abs(curr_joints - joints_0)
 
         for j in range(6):
-            if not detected[j] and joint_error[j] > threshold:
+            if not detected[j] and joint_error[j] > threshold and first_command_time is not None:
                 print(curr_time, first_command_time)
                 delays[j] = curr_time - first_command_time
                 detected[j] = True
@@ -313,4 +314,21 @@ t1.start()
 while t0.is_alive() or t1.is_alive():
     time.sleep(0.02)
 
-print(f"Motor Delay: {delays}")
+
+cc_delay = np.zeros(6)
+
+actual_q = np.array(actual_q)
+
+first_n = 100
+
+for i in range(6):
+
+    corr = np.correlate(actual_q[:,i] - np.mean(actual_q[:,i]),
+                        joints[:,i] - np.mean(joints[:,i]), mode='full')
+    lag = np.argmax(corr) - (len(joints) - 1)
+
+    cc_delay[i] = lag * dt
+
+
+print(f"Motor Delay (joint error):       {delays * 1000}ms")
+print(f"Motor Delay (cross-correlation): {cc_delay * 1000}ms")

@@ -122,7 +122,7 @@ logger.info("Connection established", extra={"step": -1})
 logger.info("Resetting robot state", extra={"step": -1})
 rtde_c.reuploadScript()
 
-rtde_c.setPayload(0.0, [0.0, 0.0, 0.0])
+rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
 
 # ---------------------------
 # CSV logging
@@ -144,7 +144,7 @@ csv_writer.writerow(
     ]
 )
 
-np.set_printoptions(suppress=True, precision=3)
+np.set_printoptions(suppress=True, precision=8)
 
 def log(i):
     actual_q = np.array(rtde_r.getActualQ())
@@ -183,28 +183,28 @@ def log(i):
         )
         raise RuntimeError("Robot stopped")
 
-    try:
-        external_torques = rtde_c.getJointTorques() # External Torque I think
-        target_moments = rtde_r.getTargetMoment() # What should happen?
-        raw_wrench = rtde_r.getFtRawWrench() # What is happening?
-        # current_as_torque = rtde_r.getActualCurrentAsTorque() # Doesn't exist?
+    # try:
+    #     external_torques = rtde_c.getJointTorques() # External Torque I think
+    #     target_moments = rtde_r.getTargetMoment() # What should happen?
+    #     raw_wrench = rtde_r.getFtRawWrench() # What is happening?
+    #     # current_as_torque = rtde_r.getActualCurrentAsTorque() # Doesn't exist?
         
-        logger.info(
-            f"external_torques {external_torques}",
-            extra={"step": i},
-        )
+    #     logger.info(
+    #         f"external_torques {external_torques}",
+    #         extra={"step": i},
+    #     )
 
-        logger.info(
-            f"target_moments {target_moments}",
-            extra={"step": i},
-        )
+    #     logger.info(
+    #         f"target_moments {target_moments}",
+    #         extra={"step": i},
+    #     )
 
-        logger.info(
-            f"raw_wrench {raw_wrench}",
-            extra={"step": i},
-        )
-    except:
-        pass
+    #     logger.info(
+    #         f"raw_wrench {raw_wrench}",
+    #         extra={"step": i},
+    #     )
+    # except:
+    #     pass
 
     # CSV logging
     csv_writer.writerow(
@@ -226,7 +226,7 @@ def log(i):
 
 velocity = 0.5 # Not Used
 acceleration = 0.5 # Not Used
-lookahead_time = 0.03
+lookahead_time = 0.05
 gain = 100
 
 
@@ -247,19 +247,22 @@ try:
         success = rtde_c.moveJ(joints_l[0], 0.5, 1.0, True)
         if curr_time - last_time > 5:
             raise TimeoutError("Ran out of time getting to initial position")
+        
+        time.sleep(dt)
 
     last_time = time.perf_counter()
 
     while rtde_c.isSteady() == False:
-        # Get actual joint positions (6 floats)
-        curr_time = time.perf_counter()
-        loop_time = curr_time - last_time
-        last_time = curr_time
-
         log(-1)
 
         # No need to be accurate
         time.sleep(dt)
+
+    logger.info(
+        f"moveJ finished to initial position {joints_l[0]}",
+        extra={"step": -1},
+    )
+    print(np.array(rtde_r.getActualQ()))
 except KeyboardInterrupt:
 
     logger.warning(
@@ -317,26 +320,27 @@ def policy_thread():
         trajectory_step += 1
 
 
-Kp = 100
-Kd = 10
-def PD(q_target):
-    try:
-        actual_q = np.array(rtde_r.getActualQ())
-        actual_q_vel = np.array(rtde_r.getActualQd())
-        mass_matrix = np.array(rtde_c.getMassMatrix()).reshape((6,6))
-        cc_matrix = np.array(rtde_c.getCoriolisAndCentrifugalTorques()).reshape((6,6))
+# Kp = 100
+# Kd = 10
+# def PD(q_target):
+#     try:
+#         actual_q = np.array(rtde_r.getActualQ())
+#         actual_q_vel = np.array(rtde_r.getActualQd())
+#         # TODO: add payload contribution maybe? might already be there (check real robot)
+#         mass_matrix = np.array(rtde_c.getMassMatrix()).reshape((6,6))
+#         cc_matrix = np.array(rtde_c.getCoriolisAndCentrifugalTorques())
 
-        acc = Kp * (q_target - actual_q) + Kd * (-actual_q_vel)
+#         acc = Kp * (q_target - actual_q) + Kd * (-actual_q_vel)
 
-        torques = mass_matrix @ acc + cc_matrix @ actual_q_vel
+#         torques = mass_matrix @ acc + cc_matrix
 
-        torques = np.clip(torques, -max_torque, max_torque)
+#         torques = np.clip(torques, -max_torque, max_torque)
 
-        return torques
-    except Exception as e:
-        print(e)
+#         return torques
+#     except Exception as e:
+#         print(e)
 
-    return np.zeros(6)
+#     return np.zeros(6)
 
 def control_thread():
     step_counter = 0
@@ -357,22 +361,16 @@ def control_thread():
             with data_lock:
                 interp_q = (1 - alpha) * previous_target_q + alpha * current_target_q
 
-                # torques = PD(interp_q)
-
                 # 4. Command the robot
                 # TODO: Change to torque
-                # rtde_c.servoJ(
-                #     interp_q,
-                #     velocity,
-                #     acceleration,
-                #     dt,
-                #     lookahead_time,
-                #     gain,
-                # )
-
-                torques = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
-
-                rtde_c.directTorque(torques)
+                rtde_c.servoJ(
+                    interp_q,
+                    velocity,
+                    acceleration,
+                    dt,
+                    lookahead_time,
+                    gain,
+                )
 
             alpha = min(alpha + 1.0 / policy_decimation, 1.0)
             step_counter += 1
