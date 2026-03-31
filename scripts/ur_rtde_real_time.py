@@ -122,7 +122,7 @@ logger.info("Connection established", extra={"step": -1})
 logger.info("Resetting robot state", extra={"step": -1})
 rtde_c.reuploadScript()
 
-rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
+rtde_c.setPayload(0.0, [0.0, 0.0, 0.0])
 
 # ---------------------------
 # CSV logging
@@ -226,7 +226,7 @@ def log(i):
 
 velocity = 0.5 # Not Used
 acceleration = 0.5 # Not Used
-lookahead_time = 0.05
+lookahead_time = 0.03
 gain = 100
 
 
@@ -320,15 +320,23 @@ def policy_thread():
 Kp = 100
 Kd = 10
 def PD(q_target):
-    actual_q = np.array(rtde_r.getActualQ())
-    actual_q_vel = np.array(rtde_r.getActualQd())
+    try:
+        actual_q = np.array(rtde_r.getActualQ())
+        actual_q_vel = np.array(rtde_r.getActualQd())
+        mass_matrix = np.array(rtde_c.getMassMatrix()).reshape((6,6))
+        cc_matrix = np.array(rtde_c.getCoriolisAndCentrifugalTorques()).reshape((6,6))
 
-    torques = Kp * (q_target - actual_q) + Kd * (-actual_q_vel)
+        acc = Kp * (q_target - actual_q) + Kd * (-actual_q_vel)
 
-    torques = np.clip(torques, -max_torque, max_torque)
+        torques = mass_matrix @ acc + cc_matrix @ actual_q_vel
 
-    return torques
+        torques = np.clip(torques, -max_torque, max_torque)
 
+        return torques
+    except Exception as e:
+        print(e)
+
+    return np.zeros(6)
 
 def control_thread():
     step_counter = 0
@@ -350,8 +358,7 @@ def control_thread():
                 interp_q = (1 - alpha) * previous_target_q + alpha * current_target_q
 
                 # torques = PD(interp_q)
-                
-                # print(torques, interp_q)
+
                 # 4. Command the robot
                 # TODO: Change to torque
                 # rtde_c.servoJ(
@@ -362,10 +369,6 @@ def control_thread():
                 #     lookahead_time,
                 #     gain,
                 # )
-
-# 2026-03-31 11:49:21,710 | INFO | step=2985 | external_torques [2.8475551887602544, -4.600332819295642, -4.416518460570918, -2.2947033831503982, 4.575430322955987, 0.7415632273434041]
-# 2026-03-31 11:49:21,711 | INFO | step=2985 | target_moments [-1.6041927209547142e-19, -3.77433962252622, -3.774402204575883, -3.7745849977328807, 4.400842839408965, 0.039869289049648975]
-# 2026-03-31 11:49:21,712 | INFO | step=2985 | raw_wrench [-2.5805692938072826, 0.18279472822880669, 0.40179033071538006, -1.5008423155383745, -0.22184468390525772, -0.5947197342975351]
 
                 torques = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
 

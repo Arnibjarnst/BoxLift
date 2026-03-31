@@ -71,13 +71,12 @@ from omni.isaac.kit import SimulationApp
 
 simulation_app = SimulationApp({"headless": False})
 
-
-from isaacsim.core.utils.stage import add_reference_to_stage, get_current_stage
+from isaacsim.core.utils.stage import add_reference_to_stage
 from isaacsim.core.prims import SingleArticulation
 from isaacsim.core.api.world import World
 import carb.input
 from omni.isaac.sensor import ContactSensor
-from omni.physx import get_physx_scene_query_interface
+from pxr import Usd, UsdPhysics, Sdf, Gf, UsdShade, UsdGeom
 
 world = World()
 
@@ -101,8 +100,7 @@ prim_path_2 = "/World/envs/env_0/ur5_2"
 add_reference_to_stage(usd_path, prim_path_2)
 arm_2 = SingleArticulation(prim_path=prim_path_2, name="ur5_2")
 
-from pxr import Usd, UsdPhysics
-
+# Disable collisions between the robots
 arm_1_group_path = "/World/Arm1Group"
 arm_2_group_path = "/World/Arm2Group"
 
@@ -116,6 +114,33 @@ arm_1_col_api.CreateIncludesRel().AddTarget(prim_path_1)
 arm_2_col_api.CreateIncludesRel().AddTarget(prim_path_2)
 
 arm_1_group.CreateFilteredGroupsRel().AddTarget(arm_2_group_path)
+
+
+# Modify arm visuals
+material_path = "/World/Looks/arm_2_material"
+
+material = UsdShade.Material.Define(world.stage, material_path)
+shader = UsdShade.Shader.Define(world.stage, f"{material_path}/Shader")
+shader.CreateIdAttr("UsdPreviewSurface")
+
+shader.CreateInput("diffuseColor", Sdf.ValueTypeNames.Color3f).Set(Gf.Vec3f(0.0, 1.0, 0.0))
+
+material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+
+arm_2_prim = world.stage.GetPrimAtPath(prim_path_2)
+
+for prim in Usd.PrimRange(arm_2_prim, Usd.TraverseInstanceProxies()):
+    if prim.IsInstanceable():
+        prim.SetInstanceable(False)
+
+for prim in Usd.PrimRange(arm_2_prim):
+    if prim.IsA(UsdGeom.Mesh) or prim.IsA(UsdGeom.Subset):
+        binding_api = UsdShade.MaterialBindingAPI(prim)
+        binding_api.Bind(
+            material,
+            bindingStrength=UsdShade.Tokens.strongerThanDescendants
+        )
+
 
 
 def initialize(robot):
