@@ -22,16 +22,16 @@ ARM_IDX = 0
 # ---------------------------
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--onnx_model_path", type=str)
-parser.add_argument("--reference_trajectory_path", type=str)
+parser.add_argument("--duration", default=10.0, type=float)
 parser.add_argument("--real_robot", action=argparse.BooleanOptionalAction)
 args = parser.parse_args()
-log_dir = os.path.join(os.path.dirname(os.path.dirname(args.onnx_model_path)), "ur_rtde_logs")
-os.makedirs(log_dir, exist_ok=True)
 
 # ---------------------------
 # Logging Setup
 # ---------------------------
+
+log_dir = "./logs/ur_rtde/"
+os.makedirs(log_dir, exist_ok=True)
 
 logger = logging.getLogger("trajectory_logger")
 logger.setLevel(logging.DEBUG)
@@ -41,7 +41,9 @@ formatter = logging.Formatter(
 )
 
 date_t = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-log_path = os.path.join(log_dir, f"trajectory_debug_{date_t}.log")
+real_or_sim_string = "real" if args.real_robot else "sim"
+filename = f"trajectory_{args.duration}_{real_or_sim_string}"
+log_path = os.path.join(log_dir, f"{filename}.log")
 file_handler = logging.FileHandler(log_path)
 file_handler.setFormatter(formatter)
 file_handler.setLevel(logging.DEBUG)
@@ -52,35 +54,6 @@ console_handler.setLevel(logging.INFO)
 
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
-
-# ---------------------------
-# Load model and trajectory
-# ---------------------------
-
-logger.info("Loading model", extra={"step": -1})
-# 'CUDAExecutionProvider' uses the GPU; 'CPUExecutionProvider' is the fallback
-session = ort.InferenceSession(args.onnx_model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-
-# 2. Identify input and output names (Isaac Lab usually uses "obs" and "mu" or "action")
-input_name = session.get_inputs()[0].name
-output_name = session.get_outputs()[0].name
-
-logger.info("Loading reference trajectory file", extra={"step": -1})
-traj = np.load(args.reference_trajectory_path)
-
-joints_l        = traj["joints_l"]
-joints_r        = traj["joints_r"]
-joint_vel_l     = traj["joint_vel_l"]
-joint_vel_r     = traj["joint_vel_r"]
-joints_target_l = traj["joints_target_l"]
-joints_target_r = traj["joints_target_r"]
-
-
-logger.info(
-    f"Trajectory loaded. Total frames: {len(joints_l)}",
-    extra={"step": -1}
-)
-
 
 # ---------------------------
 # Robot connection
@@ -106,14 +79,9 @@ logger.info(f"Connecting to robot at {robot_ip}", extra={"step": -1})
 
 rtde_frequency = 500
 dt = 1 / rtde_frequency
-policy_decimation = 10
-max_steps = (len(joints_l) - 1) * policy_decimation
 
 rtde_c = RTDEControl(robot_ip, rtde_frequency, RTDEControl.FLAG_VERBOSE | RTDEControl.FLAG_UPLOAD_SCRIPT)
 rtde_r = RTDEReceive(robot_ip, rtde_frequency)
-
-# UR5e max torques
-max_torque = np.array([150.0, 150.0, 150.0, 28.0, 28.0, 28.0])
 
 logger.info("Connection established", extra={"step": -1})
 
@@ -127,7 +95,7 @@ rtde_c.setPayload(0.0, [0.0, 0.0, 0.0])
 # CSV logging
 # ---------------------------
 
-csv_path = os.path.join(log_dir, f"trajectory_debug_{date_t}.csv")
+csv_path = os.path.join(log_dir, f"{filename}.csv")
 csv_file = open(csv_path, "w", newline="")
 csv_writer = csv.writer(csv_file)
 
@@ -143,21 +111,27 @@ csv_writer.writerow(
     ]
 )
 
-np.set_printoptions(suppress=True, precision=3)
+np.set_printoptions(suppress=True, precision=6)
+
+
+# ---------------------------
+# Create Trajectory
+# ---------------------------
+joints_0 = np.array([0.0, -np.pi/2, 0.0, 0.0, 0.0, 0.0])
+delay = 0.5
+amplitude = np.deg2rad(15)
+
+steps = int(args.duration * rtde_frequency)
+phase_shift = delay / args.duration * 2 * np.pi
+t = np.linspace(0, 2*np.pi, steps) + phase_shift
+joints = joints_0[None, ...] + amplitude * np.sin(t)[:, None]
+
 
 def log(i):
     actual_q = np.array(rtde_r.getActualQ())
 
-    if i < 0:
-        expected_q = joints_l[0]
-    else:
-        expected_i = i // policy_decimation
-        if expected_i == len(joints_l) - 1:
-            expected_q = joints_l[expected_i]
-        else:
-            expected_alpha = i / policy_decimation - expected_i
-            expected_q = (1 - expected_alpha) * joints_l[expected_i] + expected_alpha * joints_l[expected_i+1]
 
+    expected_q = joints[i] if i >= 0 else joints_0
     tracking_error = np.linalg.norm(actual_q - expected_q)
 
     logger.info(
@@ -211,16 +185,16 @@ gain = 100
 # ---------------------------
 try:
     logger.info(
-        f"moveJ to initial position {joints_l[0]}",
+        f"moveJ to initial position {joints_0}",
         extra={"step": -1},
     )
 
     last_time = time.perf_counter()
 
-    success = rtde_c.moveJ(joints_l[0], 0.5, 1.0, True)
+    success = rtde_c.moveJ(joints_0, 0.5, 1.0, True)
     while not success:
         curr_time = time.perf_counter()
-        success = rtde_c.moveJ(joints_l[0], 0.5, 1.0, True)
+        success = rtde_c.moveJ(joints_0, 0.5, 1.0, True)
         if curr_time - last_time > 5:
             raise TimeoutError("Ran out of time getting to initial position")
 
@@ -246,112 +220,38 @@ except KeyboardInterrupt:
 finally:
     rtde_c.stopJ()
 
-data_lock = threading.Lock()
-current_target_q = np.array(rtde_r.getActualQ())
-previous_target_q = np.copy(current_target_q)
-current_target_i = 0
-run_policy_event = threading.Event()  # Trigger for the policy
-new_data_event = threading.Event()
 
-
-
-def policy_thread():
-    global current_target_q, previous_target_q, current_target_i
-    trajectory_step = 0
-    while True:
-        run_policy_event.wait()
-        run_policy_event.clear()
-
-        q_l = rtde_r.getActualQ()
-        relative_q_l = q_l - joints_l[trajectory_step]
-        relative_q_r = np.zeros_like(relative_q_l)
-        relative_q = np.concatenate((relative_q_l, relative_q_r))
-
-        q_l_vel = rtde_r.getActualQd()
-        q_r_vel = joint_vel_r[trajectory_step]
-        q_vel = np.concatenate((q_l_vel, q_r_vel))
-
-        phase = np.array([trajectory_step / (len(joints_l) - 1)])
-        
-        obs = np.concatenate((relative_q, q_vel, phase))[None, ...].astype(np.float32)
-
-        output = session.run([output_name], {input_name: obs})[0][0]
-
-        # TODO: SHOULD NOT BE HARDCODED HERE
-        ACTION_SCALE = 0.2
-
-        # 2. RL Inference
-        new_joint_targets = joints_target_l[trajectory_step] + ACTION_SCALE * output[:6]
-        # new_q_goal = joints_target_l[trajectory_step]
-        
-        with data_lock:
-            previous_target_q = current_target_q
-            current_target_q = new_joint_targets
-            current_target_i = trajectory_step
-            new_data_event.set()
-
-        trajectory_step += 1
-
-
-Kp = 100
-Kd = 10
-def PD(q_target):
-    try:
-        actual_q = np.array(rtde_r.getActualQ())
-        actual_q_vel = np.array(rtde_r.getActualQd())
-        mass_matrix = np.array(rtde_c.getMassMatrix()).reshape((6,6))
-        cc_matrix = np.array(rtde_c.getCoriolisAndCentrifugalTorques()).reshape((6,6))
-
-        acc = Kp * (q_target - actual_q) + Kd * (-actual_q_vel)
-
-        torques = mass_matrix @ acc + cc_matrix @ actual_q_vel
-
-        torques = np.clip(torques, -max_torque, max_torque)
-
-        return torques
-    except Exception as e:
-        print(e)
-
-    return np.zeros(6)
+first_command_time = None
+first_command_delay = None
 
 def control_thread():
     step_counter = 0
-    alpha = 0
+    global first_command_time
     try:
         while True:
             t_start = rtde_c.initPeriod()
+                
+            if first_command_time is None:
+                first_command_time = time.perf_counter()
+            
+            # 4. Command the robot
+            # TODO: Change to torque
+            rtde_c.servoJ(
+                joints[step_counter],
+                velocity,
+                acceleration,
+                dt,
+                lookahead_time,
+                gain,
+            )
 
-            if step_counter % policy_decimation == 0:
-                run_policy_event.set()
+            print("Exec time:", rtde_r.getActualExecutionTime())
 
-            if new_data_event.is_set():
-                new_data_event.clear()
-
-                # Reset interpolation alpha
-                alpha = 1.0 / policy_decimation
-
-            with data_lock:
-                interp_q = (1 - alpha) * previous_target_q + alpha * current_target_q
-
-                # torques = PD(interp_q)
-
-                # 4. Command the robot
-                # TODO: Change to torque
-                rtde_c.servoJ(
-                    interp_q,
-                    velocity,
-                    acceleration,
-                    dt,
-                    lookahead_time,
-                    gain,
-                )
-
-            alpha = min(alpha + 1.0 / policy_decimation, 1.0)
             step_counter += 1
 
             log(step_counter)
 
-            if step_counter > max_steps:
+            if step_counter >= len(joints) - 1:
                 break
 
             # Should be at the end to ensure correct timing
@@ -380,12 +280,31 @@ def control_thread():
         )
 
 
-t1 = threading.Thread(target=policy_thread, daemon=True)
-t2 = threading.Thread(target=control_thread, daemon=True)
+def get_movement_start_t(delays):
+    threshold = 1e-3
+    detected = np.zeros(6)
 
+    while not np.all(detected):
+        curr_time = time.perf_counter()
+        curr_joints = np.array(rtde_r.getActualQ())
+        joint_error = np.abs(curr_joints - joints_0)
+
+        for j in range(6):
+            if not detected[j] and joint_error[j] > threshold:
+                print(curr_time, first_command_time)
+                delays[j] = curr_time - first_command_time
+                detected[j] = True
+
+delays = np.zeros(6)
+t0 = threading.Thread(target=get_movement_start_t, args=(delays,), daemon=True)
+
+t0.start()
+time.sleep(0.001)
+
+t1 = threading.Thread(target=control_thread, daemon=True)
 t1.start()
-t2.start()
 
-# Keep main thread alive
-while t1.is_alive() and t2.is_alive():
+while t0.is_alive() or t1.is_alive():
     time.sleep(0.02)
+
+print(f"Motor Delay: {delays}")
