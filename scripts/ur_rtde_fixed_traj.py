@@ -23,8 +23,14 @@ ARM_IDX = 0
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--duration", default=10.0, type=float)
+parser.add_argument("--amplitude", default=20.0, type=float)
+parser.add_argument("--delay", default=0.5, type=float)
 parser.add_argument("--real_robot", action=argparse.BooleanOptionalAction)
 args = parser.parse_args()
+
+assert args.amplitude >= 0 and args.amplitude <= 30
+assert args.delay >= 0 and args.delay <= args.duration
+assert args.duration >= 3
 
 # ---------------------------
 # Logging Setup
@@ -42,7 +48,7 @@ formatter = logging.Formatter(
 
 date_t = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 real_or_sim_string = "real" if args.real_robot else "sim"
-filename = f"trajectory_{args.duration}_{real_or_sim_string}"
+filename = f"trajectory_dur={args.duration}_delay={args.delay}_ampl={args.amplitude}_{real_or_sim_string}"
 log_path = os.path.join(log_dir, f"{filename}.log")
 file_handler = logging.FileHandler(log_path)
 file_handler.setFormatter(formatter)
@@ -118,8 +124,8 @@ np.set_printoptions(suppress=True, precision=6)
 # Create Trajectory
 # ---------------------------
 joints_0 = np.array([0.0, -np.pi/2, 0.0, 0.0, 0.0, 0.0])
-delay = 0.5
-amplitude = np.deg2rad(15)
+delay = args.delay
+amplitude = np.deg2rad(args.amplitude)
 
 steps = int(args.duration * rtde_frequency)
 phase_shift = delay / args.duration * 2 * np.pi
