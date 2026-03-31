@@ -109,8 +109,9 @@ dt = 1 / rtde_frequency
 policy_decimation = 10
 max_steps = (len(joints_l) - 1) * policy_decimation
 
-rtde_c = RTDEControl(robot_ip, rtde_frequency, RTDEControl.FLAG_VERBOSE | RTDEControl.FLAG_UPLOAD_SCRIPT)
 rtde_r = RTDEReceive(robot_ip, rtde_frequency)
+print("RTDE_r connected successfully")
+rtde_c = RTDEControl(robot_ip, rtde_frequency, RTDEControl.FLAG_VERBOSE | RTDEControl.FLAG_UPLOAD_SCRIPT)
 
 # UR5e max torques
 max_torque = np.array([150.0, 150.0, 150.0, 28.0, 28.0, 28.0])
@@ -181,6 +182,29 @@ def log(i):
             extra={"step": i},
         )
         raise RuntimeError("Robot stopped")
+
+    try:
+        external_torques = rtde_c.getJointTorques() # External Torque I think
+        target_moments = rtde_r.getTargetMoment() # What should happen?
+        raw_wrench = rtde_r.getFtRawWrench() # What is happening?
+        # current_as_torque = rtde_r.getActualCurrentAsTorque() # Doesn't exist?
+        
+        logger.info(
+            f"external_torques {external_torques}",
+            extra={"step": i},
+        )
+
+        logger.info(
+            f"target_moments {target_moments}",
+            extra={"step": i},
+        )
+
+        logger.info(
+            f"raw_wrench {raw_wrench}",
+            extra={"step": i},
+        )
+    except:
+        pass
 
     # CSV logging
     csv_writer.writerow(
@@ -325,19 +349,27 @@ def control_thread():
             with data_lock:
                 interp_q = (1 - alpha) * previous_target_q + alpha * current_target_q
 
-                torques = PD(interp_q)
+                # torques = PD(interp_q)
                 
-                print(torques, interp_q)
+                # print(torques, interp_q)
                 # 4. Command the robot
                 # TODO: Change to torque
-                rtde_c.servoJ(
-                    interp_q,
-                    velocity,
-                    acceleration,
-                    dt,
-                    lookahead_time,
-                    gain,
-                )
+                # rtde_c.servoJ(
+                #     interp_q,
+                #     velocity,
+                #     acceleration,
+                #     dt,
+                #     lookahead_time,
+                #     gain,
+                # )
+
+# 2026-03-31 11:49:21,710 | INFO | step=2985 | external_torques [2.8475551887602544, -4.600332819295642, -4.416518460570918, -2.2947033831503982, 4.575430322955987, 0.7415632273434041]
+# 2026-03-31 11:49:21,711 | INFO | step=2985 | target_moments [-1.6041927209547142e-19, -3.77433962252622, -3.774402204575883, -3.7745849977328807, 4.400842839408965, 0.039869289049648975]
+# 2026-03-31 11:49:21,712 | INFO | step=2985 | raw_wrench [-2.5805692938072826, 0.18279472822880669, 0.40179033071538006, -1.5008423155383745, -0.22184468390525772, -0.5947197342975351]
+
+                torques = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+
+                rtde_c.directTorque(torques)
 
             alpha = min(alpha + 1.0 / policy_decimation, 1.0)
             step_counter += 1
@@ -379,6 +411,10 @@ t2 = threading.Thread(target=control_thread, daemon=True)
 t1.start()
 t2.start()
 
-# Keep main thread alive
+# Keep main thread alive and when either thread dies we stop and exit
 while t1.is_alive() and t2.is_alive():
     time.sleep(0.02)
+
+rtde_c.stopJ()
+rtde_c.servoStop()
+rtde_c.stopScript()
