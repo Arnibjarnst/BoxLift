@@ -108,8 +108,22 @@ class JointTargetEnvCfg(DirectRLEnvCfg):
     ur5_r_prim_path = f"{ENV_REGEX}/ur5_r"
 
     # Arm Actuator parameters
-    kp = 100.0
-    kd = 10.0
+    kp = {
+        "shoulder_pan_joint": 150.0,
+        "shoulder_lift_joint": 150.0,
+        "elbow_joint": 150.0,
+        "wrist_1_joint": 28.0,
+        "wrist_2_joint": 28.0,
+        "wrist_3_joint": 28.0,
+    }
+    kd = {
+        "shoulder_pan_joint": 15.0,
+        "shoulder_lift_joint": 15.0,
+        "elbow_joint": 15.0,
+        "wrist_1_joint": 2.8,
+        "wrist_2_joint": 2.8,
+        "wrist_3_joint": 2.8,
+    }
     actuator_type = "Implicit"  # "Implicit", "IdealPD" or "DelayedPD"
     velocity_limit = 3.14
     effort_limit= {

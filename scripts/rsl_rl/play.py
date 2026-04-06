@@ -190,7 +190,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # agent stepping
             actions = policy(obs)
             # env stepping
-            obs, _, dones, _ = env.step(actions)
+            obs, _, dones, extras = env.step(actions)
+
+            print(extras["log"])
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
         if args_cli.video:
