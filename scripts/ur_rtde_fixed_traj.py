@@ -319,8 +319,6 @@ cc_delay = np.zeros(6)
 
 actual_q = np.array(actual_q)
 
-first_n = 100
-
 for i in range(6):
 
     corr = np.correlate(actual_q[:,i] - np.mean(actual_q[:,i]),
@@ -328,7 +326,6 @@ for i in range(6):
     lag = np.argmax(corr) - (len(joints) - 1)
 
     cc_delay[i] = lag * dt
-
 
 print(f"Motor Delay (joint error):       {delays * 1000}ms")
 print(f"Motor Delay (cross-correlation): {cc_delay * 1000}ms")
