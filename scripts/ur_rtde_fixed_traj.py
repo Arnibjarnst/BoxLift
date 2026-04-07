@@ -23,12 +23,12 @@ ARM_IDX = 0
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--duration", default=10.0, type=float)
-parser.add_argument("--amplitude", default=20.0, type=float)
 parser.add_argument("--delay", default=0.0, type=float)
+parser.add_argument("--lookahead", default=0.05, type=float)
+parser.add_argument("--gain", default=100, type=int)
 parser.add_argument("--real_robot", action=argparse.BooleanOptionalAction)
 args = parser.parse_args()
 
-assert args.amplitude >= 0 and args.amplitude <= 30
 assert args.delay >= 0 and args.delay <= args.duration
 assert args.duration >= 3
 
@@ -48,7 +48,7 @@ formatter = logging.Formatter(
 
 date_t = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 real_or_sim_string = "real" if args.real_robot else "sim"
-filename = f"trajectory_dur={args.duration}_delay={args.delay}_ampl={args.amplitude}_{real_or_sim_string}"
+filename = f"trajectory_dur={args.duration}_delay={args.delay}_gain={args.gain}_lh={args.lookahead}_{real_or_sim_string}"
 log_path = os.path.join(log_dir, f"{filename}.log")
 file_handler = logging.FileHandler(log_path)
 file_handler.setFormatter(formatter)
@@ -86,7 +86,7 @@ logger.info(f"Connecting to robot at {robot_ip}", extra={"step": -1})
 rtde_frequency = 500
 dt = 1 / rtde_frequency
 
-rtde_c = RTDEControl(robot_ip, rtde_frequency, RTDEControl.FLAG_VERBOSE | RTDEControl.FLAG_UPLOAD_SCRIPT)
+rtde_c = RTDEControl(robot_ip, rtde_frequency)
 rtde_r = RTDEReceive(robot_ip, rtde_frequency)
 
 logger.info("Connection established", extra={"step": -1})
@@ -110,7 +110,10 @@ csv_writer.writerow(
         "arm_idx",
         "step",
         "actual_q",
+        "actual_qd",
+        "target_q",
         "expected_q",
+        "applied_torque",
         "loop_time",
         "robot_mode",
         "safety_mode",
@@ -125,7 +128,7 @@ np.set_printoptions(suppress=True, precision=6)
 # ---------------------------
 joints_0 = np.array([0.0, -np.pi/2, 0.0, 0.0, 0.0, 0.0])
 delay = args.delay
-amplitude = np.deg2rad(args.amplitude)
+amplitude = np.deg2rad(20)
 
 steps = int(args.duration * rtde_frequency)
 phase_shift = delay / args.duration * 2 * np.pi
@@ -133,14 +136,31 @@ t = np.linspace(0, 2*np.pi, steps) + phase_shift
 joints = joints_0[None, ...] + amplitude * np.sin(t)[:, None]
 
 
+torques=np.zeros_like(joints)
+
 def log(i):
     actual_q = np.array(rtde_r.getActualQ())
+    actual_qd = np.array(rtde_r.getActualQd())
+    applied_torque = np.array(rtde_r.getTargetMoment())
+
+    if i >= 0:
+        torques[i] = applied_torque
 
     expected_q = joints[i] if i >= 0 else joints_0
     tracking_error = np.linalg.norm(actual_q - expected_q)
 
     logger.info(
         f"Tracking error {tracking_error:.6f}. Actual: {actual_q}. Expected: {expected_q}",
+        extra={"step": i},
+    )
+
+    logger.info(
+        f"Applied Torque: {applied_torque}",
+        extra={"step": i},
+    )
+
+    logger.info(
+        f"Joint Velocity: {actual_qd}",
         extra={"step": i},
     )
 
@@ -167,13 +187,15 @@ def log(i):
             ARM_IDX,
             i,
             actual_q.tolist(),
+            actual_qd.tolist(),
             expected_q.tolist(),
+            expected_q.tolist(),
+            applied_torque.tolist(),
             dt,
             robot_mode,
             safety_mode,
         ]
     )
-
 
 # ---------------------------
 # Control parameters
@@ -181,8 +203,33 @@ def log(i):
 
 velocity = 0.5 # Not Used
 acceleration = 0.5 # Not Used
-lookahead_time = 0.03
-gain = 100
+lookahead_time = args.lookahead
+gain = args.gain
+
+
+max_torque = np.array([150.0, 150.0, 150.0, 28.0, 28.0, 28.0])
+Kp = 100
+Kd = 10
+def PD(q_target):
+    try:
+        actual_q = np.array(rtde_r.getActualQ())
+        actual_q_vel = np.array(rtde_r.getActualQd())
+
+        acc = Kp * (q_target - actual_q) + Kd * (-actual_q_vel)
+
+        # mass_matrix = np.array(rtde_c.getMassMatrix()).reshape((6,6))
+        # cc_matrix = np.array(rtde_c.getCoriolisAndCentrifugalTorques())
+        # torques = mass_matrix @ acc + cc_matrix
+
+        torques = acc
+
+        torques = np.clip(torques, -max_torque, max_torque)
+
+        return torques
+    except Exception as e:
+        print(e)
+
+    return np.zeros(6)
 
 
 # ---------------------------
@@ -228,7 +275,7 @@ logger.info(
 first_command_time = None
 first_command_delay = None
 
-actual_q = []
+pd_torques = []
 
 def control_thread():
     step_counter = 0
@@ -239,8 +286,18 @@ def control_thread():
                 
             if first_command_time is None:
                 first_command_time = rtde_c.initPeriod().total_seconds()
+            
+            # torques = PD(joints[step_counter])
+            # pd_torques.append(torques)
 
-            actual_q.append(np.array(rtde_r.getActualQ()))
+            # dq = np.array(rtde_r.getActualQd())
+            # kd = 10
+            # damping = kd * dq
+            # tau_desired = np.array([0.0, 0.0, 0.0, 4.0, 0.0, 0.0])
+            # # clamp damping so it only ever opposes tau_desired, never amplifies it
+            # damping = np.clip(damping, -np.abs(tau_desired), np.abs(tau_desired))
+            # torques = tau_desired - damping
+            # rtde_c.directTorque(torques.tolist(), friction_comp=True)
             
             # 4. Command the robot
             # TODO: Change to torque
@@ -285,28 +342,39 @@ def control_thread():
             extra={"step": -1},
         )
 
+times = []
+vels = []
+currs = []
 
 def get_movement_start_t(delays):
     # shouldn't be lower than 2e-4
-    threshold = 2e-4
+    threshold = 1e-4
     detected = np.zeros(6)
 
     while not np.all(detected):
         curr_time = rtde_c.initPeriod().total_seconds()
-        curr_joints = np.array(rtde_r.getActualQ())
-        joint_error = np.abs(curr_joints - joints_0)
+        curr_vel = np.array(rtde_r.getActualQd())
+        current = np.array(rtde_r.getActualCurrent())
+
+        times.append(curr_time)
+        vels.append(curr_vel)
+        currs.append(current)
 
         for j in range(6):
-            if not detected[j] and joint_error[j] > threshold and first_command_time is not None:
-                print(curr_time, first_command_time)
+            if not detected[j] and curr_vel[j] > threshold and first_command_time is not None:
                 delays[j] = curr_time - first_command_time
                 detected[j] = True
+
+        busy_wait_s = 0.05 / 1000 #0.05ms
+        end = time.perf_counter() + busy_wait_s
+        while time.perf_counter() < end:
+            pass
 
 delays = np.zeros(6)
 t0 = threading.Thread(target=get_movement_start_t, args=(delays,), daemon=True)
 
 t0.start()
-time.sleep(0.001)
+time.sleep(0.005)
 
 t1 = threading.Thread(target=control_thread, daemon=True)
 t1.start()
@@ -315,17 +383,36 @@ while t0.is_alive() or t1.is_alive():
     time.sleep(0.02)
 
 
-cc_delay = np.zeros(6)
-
-actual_q = np.array(actual_q)
-
-for i in range(6):
-
-    corr = np.correlate(actual_q[:,i] - np.mean(actual_q[:,i]),
-                        joints[:,i] - np.mean(joints[:,i]), mode='full')
-    lag = np.argmax(corr) - (len(joints) - 1)
-
-    cc_delay[i] = lag * dt
-
 print(f"Motor Delay (joint error):       {delays * 1000}ms")
-print(f"Motor Delay (cross-correlation): {cc_delay * 1000}ms")
+
+times = (np.array(times) - first_command_time) * 1000
+vels = np.array(vels)
+currs = np.array(currs)
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+arrays = {"Velocities": vels, "Currents": currs}
+
+for name, arr in arrays.items():
+    fig, axes = plt.subplots(2, 3, figsize=(14, 6))
+    fig.suptitle(name, fontsize=14)
+    axes = axes.flatten()
+
+    for i in range(6):
+        ax = axes[i]
+        ax.plot(times, arr[:, i])
+        ax.set_title(f"Dim {i+1}")
+        ax.set_xlabel("Time (ms)")
+        ax.set_ylim(arr[:, i].min(), arr[:, i].max())
+
+    plt.tight_layout()
+    plt.show()
+
+
+pd_torques = np.array(pd_torques)
+plt.plot(torques)
+plt.show()
+
+plt.plot(pd_torques)
+plt.show()
