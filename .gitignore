@@ -70,3 +70,6 @@ tests/
 # Docker history
 .isaac-lab-docker-history
 .aider*
+
+# Claude stuff
+.mpc.json

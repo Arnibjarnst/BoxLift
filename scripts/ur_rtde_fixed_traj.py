@@ -143,6 +143,7 @@ def log(i):
     actual_qd = np.array(rtde_r.getActualQd())
     applied_torque = np.array(rtde_r.getTargetMoment())
 
+
     if i >= 0:
         torques[i] = applied_torque
 
@@ -152,10 +153,33 @@ def log(i):
     logger.info(
         f"Tracking error {tracking_error:.6f}. Actual: {actual_q}. Expected: {expected_q}",
         extra={"step": i},
-    )
+    )                                                                                                                                                             
 
     logger.info(
-        f"Applied Torque: {applied_torque}",
+        f"getTargetMoment:          {applied_torque}",
+        extra={"step": i},
+    )
+    logger.info(
+        f"getJointTorques:          {np.array(rtde_c.getJointTorques())}",
+        extra={"step": i},
+    )
+    logger.info(
+        f"getActualCurrent:         {np.array(rtde_r.getActualCurrent())}",
+        extra={"step": i},
+    )
+    try:
+        logger.info(
+            f"getActualCurrentAsTorque: {np.array(rtde_r.getActualCurrentAsTorque())}",
+            extra={"step": i},
+        )
+    except (AttributeError, RuntimeError) as e:
+        logger.info(f"getActualCurrentAsTorque: {e}", extra={"step": i})
+    logger.info(
+        f"getTargetCurrent:         {np.array(rtde_r.getTargetCurrent())}",
+        extra={"step": i},
+    )
+    logger.info(
+        f"getJointControlOutput:    {np.array(rtde_r.getJointControlOutput())}",
         extra={"step": i},
     )
 
