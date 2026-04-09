@@ -34,7 +34,7 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
-parser.add_argument("--trajectory_path", type=str, required=True)
+parser.add_argument("--trajectory_path", type=str, default=None, help="Override trajectory path (default: read from run's env.yaml)")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -58,6 +58,7 @@ import gymnasium as gym
 import os
 import time
 import torch
+import yaml
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -84,8 +85,6 @@ import BoxLift.tasks  # noqa: F401
 @hydra_task_config(args_cli.task, args_cli.agent)
 def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agent_cfg: RslRlBaseRunnerCfg):
     """Play with RSL-RL agent."""
-    # Set the trajectory file path
-    env_cfg.trajectory_path = args_cli.trajectory_path
     # grab task name for checkpoint path
     task_name = args_cli.task.split(":")[-1]
     train_task_name = task_name.replace("-Play", "")
@@ -114,6 +113,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
     log_dir = os.path.dirname(resume_path)
+
+    # Load trajectory path from training config, allow CLI override
+    if args_cli.trajectory_path is not None:
+        env_cfg.trajectory_path = args_cli.trajectory_path
+    else:
+        with open(os.path.join(log_dir, "params", "env.yaml"), "r") as f:
+            saved_env_cfg = yaml.unsafe_load(f)
+        env_cfg.trajectory_path = saved_env_cfg["trajectory_path"]
+    print(f"[INFO] Using trajectory: {env_cfg.trajectory_path}")
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
@@ -190,9 +198,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             # agent stepping
             actions = policy(obs)
             # env stepping
+            print(obs["policy"], actions * 0.25, env.episode_length_buf)
             obs, _, dones, extras = env.step(actions)
-
-            print(extras["log"])
+    
             # reset recurrent states for episodes that have terminated
             policy_nn.reset(dones)
         if args_cli.video:

@@ -1,12 +1,12 @@
 import argparse
 import os
 import sys
-from datetime import datetime
 import json
 import logging
 import csv
 import time
 import numpy as np
+import yaml
 import matplotlib.pyplot as plt
 import threading
 import onnxruntime as ort
@@ -22,12 +22,41 @@ ARM_IDX = 0
 # ---------------------------
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--onnx_model_path", type=str)
-parser.add_argument("--reference_trajectory_path", type=str)
+parser.add_argument("--run_dir", type=str, required=True, help="Path to training run directory (e.g. logs/rsl_rl/boxpush/2026-04-08_14-42-08)")
 parser.add_argument("--real_robot", action=argparse.BooleanOptionalAction)
+parser.add_argument("--gain", type=float, default=None, help="servoJ gain (overrides default)")
+parser.add_argument("--lookahead", type=float, default=None, help="servoJ lookahead_time (overrides default)")
+parser.add_argument("--action_scale", type=float, default=None, help="Override action scale (use 0 for pure trajectory)")
 args = parser.parse_args()
-log_dir = os.path.join(os.path.dirname(os.path.dirname(args.onnx_model_path)), "ur_rtde_logs")
+
+# Load training config
+with open(os.path.join(args.run_dir, "params", "env.yaml"), "r") as f:
+    env_cfg = yaml.unsafe_load(f)
+
+reference_trajectory_path = env_cfg["trajectory_path"]
+action_scale = args.action_scale if args.action_scale is not None else env_cfg["action_scale"]
+
+export_dir = os.path.join(args.run_dir, "exported")
+onnx_model_path = os.path.join(export_dir, "policy.onnx")
+if not os.path.exists(onnx_model_path):
+    raise FileNotFoundError(f"ONNX model not found: {onnx_model_path}. Run training first (exports automatically).")
+
+# Read export metadata
+metadata_path = os.path.join(export_dir, "metadata.yaml")
+if os.path.exists(metadata_path):
+    with open(metadata_path, "r") as f:
+        export_metadata = yaml.safe_load(f)
+    model_iteration = export_metadata.get("iteration", "unknown")
+else:
+    model_iteration = "unknown"
+
+log_dir = os.path.join(args.run_dir, "ur_rtde_logs")
 os.makedirs(log_dir, exist_ok=True)
+
+# Resolve servo parameters early for file naming
+_gain = args.gain if args.gain is not None else 100
+_lookahead = args.lookahead if args.lookahead is not None else 0.05
+run_tag = f"iter{model_iteration}_gain{_gain}_la{_lookahead}" + (f"_as{action_scale}" if args.action_scale is not None else "")
 
 # ---------------------------
 # Logging Setup
@@ -40,8 +69,7 @@ formatter = logging.Formatter(
     "%(asctime)s | %(levelname)s | step=%(step)s | %(message)s"
 )
 
-date_t = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-log_path = os.path.join(log_dir, f"trajectory_debug_{date_t}.log")
+log_path = os.path.join(log_dir, f"{run_tag}.log")
 file_handler = logging.FileHandler(log_path)
 file_handler.setFormatter(formatter)
 file_handler.setLevel(logging.DEBUG)
@@ -57,27 +85,34 @@ logger.addHandler(console_handler)
 # Load model and trajectory
 # ---------------------------
 
+logger.info(f"Run dir: {args.run_dir}, action_scale: {action_scale}, trajectory: {reference_trajectory_path}", extra={"step": -1})
 logger.info("Loading model", extra={"step": -1})
 # 'CUDAExecutionProvider' uses the GPU; 'CPUExecutionProvider' is the fallback
-session = ort.InferenceSession(args.onnx_model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
+session = ort.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
 
 # 2. Identify input and output names (Isaac Lab usually uses "obs" and "mu" or "action")
 input_name = session.get_inputs()[0].name
 output_name = session.get_outputs()[0].name
 
 logger.info("Loading reference trajectory file", extra={"step": -1})
-traj = np.load(args.reference_trajectory_path)
+traj = np.load(reference_trajectory_path)
 
-joints_l        = traj["joints_l"]
-joints_r        = traj["joints_r"]
-joint_vel_l     = traj["joint_vel_l"]
-joint_vel_r     = traj["joint_vel_r"]
-joints_target_l = traj["joints_target_l"]
-joints_target_r = traj["joints_target_r"]
+# Detect single vs dual arm trajectory
+dual_arm = "joints_l" in traj
 
+if dual_arm:
+    joints        = traj["joints_l"]
+    joint_vel_ref = traj["joint_vel_l"]
+    joints_target = traj["joints_target_l"]
+    joints_r      = traj["joints_r"]
+    joint_vel_r   = traj["joint_vel_r"]
+else:
+    joints        = traj["joints"]
+    joint_vel_ref = traj["joint_vel"]
+    joints_target = traj["joints_target"]
 
 logger.info(
-    f"Trajectory loaded. Total frames: {len(joints_l)}",
+    f"Trajectory loaded ({'dual' if dual_arm else 'single'} arm). Total frames: {len(joints)}",
     extra={"step": -1}
 )
 
@@ -107,7 +142,7 @@ logger.info(f"Connecting to robot at {robot_ip}", extra={"step": -1})
 rtde_frequency = 500
 dt = 1 / rtde_frequency
 policy_decimation = 10
-max_steps = (len(joints_l) - 1) * policy_decimation
+max_steps = (len(joints) - 1) * policy_decimation
 
 rtde_r = RTDEReceive(robot_ip, rtde_frequency)
 print("RTDE_r connected successfully")
@@ -128,7 +163,7 @@ rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
 # CSV logging
 # ---------------------------
 
-csv_path = os.path.join(log_dir, f"trajectory_debug_{date_t}.csv")
+csv_path = os.path.join(log_dir, f"{run_tag}.csv")
 csv_file = open(csv_path, "w", newline="")
 csv_writer = csv.writer(csv_file)
 
@@ -138,6 +173,7 @@ csv_writer.writerow(
         "step",
         "actual_q",
         "expected_q",
+        "target_q",
         "loop_time",
         "robot_mode",
         "safety_mode",
@@ -146,23 +182,35 @@ csv_writer.writerow(
 
 np.set_printoptions(suppress=True, precision=8)
 
-def log(i):
+# Per-timestep tracking data for analysis
+tracking_log = []  # list of (step, actual_q, expected_q, target_q, tracking_error)
+
+def log(i, target_q):
     actual_q = np.array(rtde_r.getActualQ())
 
     if i < 0:
-        expected_q = joints_l[0]
+        expected_q = joints[0]
     else:
         expected_i = i // policy_decimation
-        if expected_i == len(joints_l) - 1:
-            expected_q = joints_l[expected_i]
+        if expected_i == len(joints) - 1:
+            expected_q = joints[expected_i]
         else:
             expected_alpha = i / policy_decimation - expected_i
-            expected_q = (1 - expected_alpha) * joints_l[expected_i] + expected_alpha * joints_l[expected_i+1]
+            print(expected_i, expected_alpha)
+            expected_q = (1 - expected_alpha) * joints[expected_i] + expected_alpha * joints[expected_i+1]
 
     tracking_error = np.linalg.norm(actual_q - expected_q)
 
+    if i >= 0:
+        tracking_log.append({
+            "step": i,
+            "actual_q": actual_q.copy(),
+            "expected_q": expected_q.copy(),
+            "target_q": np.array(target_q).copy(),
+        })
+
     logger.info(
-        f"Tracking error {tracking_error:.6f}. Actual: {actual_q}. Expected: {expected_q}",
+        f"Tracking error {tracking_error:.6f}. Actual: {actual_q}. Expected: {expected_q}. Target: {target_q}",
         extra={"step": i},
     )
 
@@ -183,28 +231,23 @@ def log(i):
         )
         raise RuntimeError("Robot stopped")
 
-    # try:
-    #     external_torques = rtde_c.getJointTorques() # External Torque I think
-    #     target_moments = rtde_r.getTargetMoment() # What should happen?
-    #     raw_wrench = rtde_r.getFtRawWrench() # What is happening?
-    #     # current_as_torque = rtde_r.getActualCurrentAsTorque() # Doesn't exist?
-        
-    #     logger.info(
-    #         f"external_torques {external_torques}",
-    #         extra={"step": i},
-    #     )
+    # Safety: check tracking error
+    if i >= 0 and tracking_error > max_tracking_error:
+        logger.error(
+            f"Tracking error {tracking_error:.4f} exceeds limit {max_tracking_error}",
+            extra={"step": i},
+        )
+        raise RuntimeError("Tracking error too large")
 
-    #     logger.info(
-    #         f"target_moments {target_moments}",
-    #         extra={"step": i},
-    #     )
-
-    #     logger.info(
-    #         f"raw_wrench {raw_wrench}",
-    #         extra={"step": i},
-    #     )
-    # except:
-    #     pass
+    # Safety: check joint velocities
+    actual_qd = np.array(rtde_r.getActualQd())
+    max_vel = np.max(np.abs(actual_qd))
+    if max_vel > max_joint_velocity:
+        logger.error(
+            f"Joint velocity {max_vel:.4f} exceeds limit {max_joint_velocity}. Qd: {actual_qd}",
+            extra={"step": i},
+        )
+        raise RuntimeError("Joint velocity too high")
 
     # CSV logging
     csv_writer.writerow(
@@ -213,6 +256,7 @@ def log(i):
             i,
             actual_q.tolist(),
             expected_q.tolist(),
+            target_q.tolist(),
             dt,
             robot_mode,
             safety_mode,
@@ -226,25 +270,38 @@ def log(i):
 
 velocity = 0.5 # Not Used
 acceleration = 0.5 # Not Used
-lookahead_time = 0.05
-gain = 100
+lookahead_time = _lookahead
+gain = _gain
 
+# ---------------------------
+# Safety limits
+# ---------------------------
+
+# Max allowed deviation of command from current position (rad)
+max_target_delta = 0.5
+# Max allowed tracking error before stopping (rad)
+max_tracking_error = 10.0
+# Max allowed joint velocity before stopping (rad/s)
+max_joint_velocity = 10000
+# UR5e joint limits (rad) [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
+joint_limits_lower = np.array([-2*np.pi, -2*np.pi, -np.pi, -2*np.pi, -2*np.pi, -2*np.pi])
+joint_limits_upper = np.array([ 2*np.pi,  2*np.pi,  np.pi,  2*np.pi,  2*np.pi,  2*np.pi])
 
 # ---------------------------
 # Move To Start
 # ---------------------------
 try:
     logger.info(
-        f"moveJ to initial position {joints_l[0]}",
+        f"moveJ to initial position {joints[0]}",
         extra={"step": -1},
     )
 
     last_time = time.perf_counter()
 
-    success = rtde_c.moveJ(joints_l[0], 0.5, 1.0, True)
+    success = rtde_c.moveJ(joints[0], 0.5, 1.0, True)
     while not success:
         curr_time = time.perf_counter()
-        success = rtde_c.moveJ(joints_l[0], 0.5, 1.0, True)
+        success = rtde_c.moveJ(joints[0], 0.5, 1.0, True)
         if curr_time - last_time > 5:
             raise TimeoutError("Ran out of time getting to initial position")
         
@@ -253,13 +310,13 @@ try:
     last_time = time.perf_counter()
 
     while rtde_c.isSteady() == False:
-        log(-1)
+        log(-1, joints[0])
 
         # No need to be accurate
         time.sleep(dt)
 
     logger.info(
-        f"moveJ finished to initial position {joints_l[0]}",
+        f"moveJ finished to initial position {joints[0]}",
         extra={"step": -1},
     )
     print(np.array(rtde_r.getActualQ()))
@@ -289,28 +346,45 @@ def policy_thread():
         run_policy_event.wait()
         run_policy_event.clear()
 
-        q_l = rtde_r.getActualQ()
-        relative_q_l = q_l - joints_l[trajectory_step]
-        relative_q_r = np.zeros_like(relative_q_l)
-        relative_q = np.concatenate((relative_q_l, relative_q_r))
+        actual_q = np.array(rtde_r.getActualQ())
+        actual_qd = np.array(rtde_r.getActualQd())
+        phase = np.array([trajectory_step / (len(joints) - 1)])
 
-        q_l_vel = rtde_r.getActualQd()
-        q_r_vel = joint_vel_r[trajectory_step]
-        q_vel = np.concatenate((q_l_vel, q_r_vel))
+        if dual_arm:
+            relative_q_l = actual_q - joints[trajectory_step]
+            relative_q_r = np.zeros(6)
+            relative_qd_l = actual_qd - joint_vel_ref[trajectory_step]
+            relative_qd_r = np.zeros(6)
+            obs = np.concatenate((relative_q_l, relative_q_r, relative_qd_l, relative_qd_r, phase))
+        else:
+            relative_q = actual_q - joints[trajectory_step]
+            relative_qd = actual_qd - joint_vel_ref[trajectory_step]
+            feedforward = joints_target[trajectory_step] - joints[trajectory_step]
+            # obs = np.concatenate((relative_q, relative_qd, feedforward, phase))
+            obs = np.concatenate((relative_q, relative_qd, phase))
 
-        phase = np.array([trajectory_step / (len(joints_l) - 1)])
-        
-        obs = np.concatenate((relative_q, q_vel, phase))[None, ...].astype(np.float32)
-
+        obs = obs[None, ...].astype(np.float32)
         output = session.run([output_name], {input_name: obs})[0][0]
 
-        # TODO: SHOULD NOT BE HARDCODED HERE
-        ACTION_SCALE = 0.2
+        # # Option 0: pure trajectory targets (matches planner)
+        # new_joint_targets = joints_target[trajectory_step]
 
-        # 2. RL Inference
-        new_joint_targets = joints_target_l[trajectory_step] + ACTION_SCALE * output[:6]
-        # new_q_goal = joints_target_l[trajectory_step]
-        
+        # # Option A: residual on trajectory targets (matches get_joint_targets_A)
+        new_joint_targets = joints_target[trajectory_step] + action_scale * output[:6]
+
+        # # Option B: residual on trajectory positions (matches get_joint_targets_B)
+        # new_joint_targets = joints[trajectory_step] + action_scale * output[:6]
+
+        # Option C: residual on joint positions (matches get_joint_targets_C)
+        # new_joint_targets = actual_q + action_scale * output[:6]
+
+        # Safety: clamp to joint limits
+        new_joint_targets = np.clip(new_joint_targets, joint_limits_lower, joint_limits_upper)
+        # Safety: clamp command to be within max_target_delta of current position
+        new_joint_targets = np.clip(new_joint_targets, actual_q - max_target_delta, actual_q + max_target_delta)
+
+        print(obs, output * 0.25)
+
         with data_lock:
             previous_target_q = current_target_q
             current_target_q = new_joint_targets
@@ -319,28 +393,6 @@ def policy_thread():
 
         trajectory_step += 1
 
-
-# Kp = 100
-# Kd = 10
-# def PD(q_target):
-#     try:
-#         actual_q = np.array(rtde_r.getActualQ())
-#         actual_q_vel = np.array(rtde_r.getActualQd())
-#         # TODO: add payload contribution maybe? might already be there (check real robot)
-#         mass_matrix = np.array(rtde_c.getMassMatrix()).reshape((6,6))
-#         cc_matrix = np.array(rtde_c.getCoriolisAndCentrifugalTorques())
-
-#         acc = Kp * (q_target - actual_q) + Kd * (-actual_q_vel)
-
-#         torques = mass_matrix @ acc + cc_matrix
-
-#         torques = np.clip(torques, -max_torque, max_torque)
-
-#         return torques
-#     except Exception as e:
-#         print(e)
-
-#     return np.zeros(6)
 
 def control_thread():
     step_counter = 0
@@ -375,7 +427,7 @@ def control_thread():
             alpha = min(alpha + 1.0 / policy_decimation, 1.0)
             step_counter += 1
 
-            log(step_counter)
+            log(step_counter, interp_q)
 
             if step_counter > max_steps:
                 break
@@ -399,6 +451,21 @@ def control_thread():
         rtde_c.stopScript()
 
         csv_file.close()
+
+        # Save per-timestep tracking data for analysis
+        if tracking_log:
+            tracking_npz_path = os.path.join(log_dir, f"{run_tag}.npz")
+            np.savez(
+                tracking_npz_path,
+                steps=np.array([d["step"] for d in tracking_log]),
+                actual_q=np.array([d["actual_q"] for d in tracking_log]),
+                expected_q=np.array([d["expected_q"] for d in tracking_log]),
+                target_q=np.array([d["target_q"] for d in tracking_log]),
+                gain=gain,
+                lookahead_time=lookahead_time,
+                action_scale=action_scale,
+            )
+            logger.info(f"Tracking data saved to {tracking_npz_path}", extra={"step": -1})
 
         logger.info(
             f"Execution finished. Logs written to {log_path} and {csv_path}",

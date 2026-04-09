@@ -92,8 +92,8 @@ class LookaheadPActuatorCfg(ActuatorBaseCfg):
 
 ROBOT_USD = "./robots/ur5e.usd"
 
-PHYSICS_DT = 1.0 / 100.0
-DECIMATION = 2
+PHYSICS_DT = 1.0 / 500.0
+DECIMATION = 1
 CONTROL_DT = PHYSICS_DT * DECIMATION  # 0.02 s = 50 Hz
 
 CSV_HZ = 500
@@ -127,7 +127,7 @@ _act_kwargs = dict(joint_names_expr=[".*"], velocity_limit=UR5E_VELOCITY_LIMITS,
 
 GROUPS: dict[str, dict] = {
     "Implicit": {"factory": lambda kp, kd, **_: ImplicitActuatorCfg(stiffness=kp, damping=kd, **_act_kwargs)},
-    "IdealPD":  {"factory": lambda kp, kd, **_: IdealPDActuatorCfg(stiffness=kp, damping=kd, **_act_kwargs)},
+    # "IdealPD":  {"factory": lambda kp, kd, **_: IdealPDActuatorCfg(stiffness=kp, damping=kd, **_act_kwargs)},
     # "DelayedPD_0_1": {"factory": lambda kp, kd, **_: DelayedPDActuatorCfg(stiffness=kp, damping=kd, min_delay=0, max_delay=1, **_act_kwargs)},
     # "DelayedPD_1_2": {"factory": lambda kp, kd, **_: DelayedPDActuatorCfg(stiffness=kp, damping=kd, min_delay=1, max_delay=2, **_act_kwargs)},
     # "DelayedPD_1_3": {"factory": lambda kp, kd, **_: DelayedPDActuatorCfg(stiffness=kp, damping=kd, min_delay=1, max_delay=3, **_act_kwargs)},
@@ -143,15 +143,15 @@ def build_sweep_configs() -> dict[str, list[dict]]:
 
     # Gain grid shared across all types
     uniform_gains = []
-    for kp in [50, 100, 150, 200, 300, 400]: #, 500, 600, 800, 1000, 1500, 2000, 3000, 4000, 5000, 10000]:
-        for kd_ratio in [0.0, 0.025, 0.05, 0.1, 0.15, 0.2]:
+    for kp in [28, 50, 75, 100, 150, 200, 300, 400, 500, 600, 800, 1000, 1500, 2000, 3000, 4000, 5000, 10000]:
+        for kd_ratio in [0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3]:
             uniform_gains.append({"kp": float(kp), "kd": kp * kd_ratio})
 
     # Per-joint gains (UR5e torque ratio: 150 Nm shoulder/elbow, 28 Nm wrist)
     perjoint_gains = []
-    for kp_mult in [0.5, 1.0, 1.5, 2.0]: #, 3.0, 4.0, 5.0, 7.5, 10.0, 20.0, 30.0]:
+    for kp_mult in [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0, 5.0, 7.5, 10.0, 20.0, 30.0]:
         kp_vals = [150.0 * kp_mult] * 3 + [28.0 * kp_mult] * 3
-        for kd_ratio in [0.0, 0.025, 0.05, 0.1, 0.15, 0.2]:
+        for kd_ratio in [0.0, 0.025, 0.05, 0.1, 0.15, 0.2, 0.3]:
             kd_vals = [v * kd_ratio for v in kp_vals]
             perjoint_gains.append({"kp": kp_vals, "kd": kd_vals})
 
@@ -412,8 +412,6 @@ def main():
                 for robot in robots.values():
                     robot.update(PHYSICS_DT)
                 torque_robot.update(PHYSICS_DT)
-
-                print(robot.data.applied_torque[0])
 
             sim.render()
 

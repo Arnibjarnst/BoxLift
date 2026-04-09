@@ -80,6 +80,7 @@ import logging
 import os
 import time
 import torch
+import yaml
 from datetime import datetime
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
@@ -94,7 +95,7 @@ from isaaclab.envs import (
 from isaaclab.utils.dict import print_dict
 from isaaclab.utils.io import dump_yaml
 
-from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper
+from isaaclab_rl.rsl_rl import RslRlBaseRunnerCfg, RslRlVecEnvWrapper, export_policy_as_onnx
 
 import isaaclab_tasks  # noqa: F401
 from isaaclab_tasks.utils import get_checkpoint_path
@@ -218,6 +219,19 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     runner.learn(num_learning_iterations=agent_cfg.max_iterations, init_at_random_ep_len=True)
 
     print(f"Training time: {round(time.time() - start_time, 2)} seconds")
+
+    # export policy to ONNX
+    try:
+        policy_nn = runner.alg.policy
+    except AttributeError:
+        policy_nn = runner.alg.actor_critic
+    normalizer = getattr(policy_nn, "actor_obs_normalizer", None) or getattr(policy_nn, "student_obs_normalizer", None)
+    export_model_dir = os.path.join(log_dir, "exported")
+    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+    # Write metadata so downstream scripts know which checkpoint was exported
+    with open(os.path.join(export_model_dir, "metadata.yaml"), "w") as f:
+        yaml.dump({"iteration": agent_cfg.max_iterations}, f)
+    print(f"[INFO] ONNX exported to {export_model_dir}/policy.onnx (iteration {agent_cfg.max_iterations})")
 
     if agent_cfg.logger == "wandb":
         runner.writer.stop() # type: ignore

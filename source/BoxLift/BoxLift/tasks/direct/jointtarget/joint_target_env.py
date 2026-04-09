@@ -137,7 +137,7 @@ class JointTargetEnv(DirectRLEnv):
         obs = torch.cat(
             (
                 self._get_joint_pos(relative=True),
-                self._get_joint_vel(),
+                self._get_joint_vel(relative=True),
                 self.episode_length_buf[:, None] / self.max_episode_length,
             ),
             dim=-1,
@@ -225,37 +225,13 @@ class JointTargetEnv(DirectRLEnv):
         rew_action_rate = self.cfg.w_action_rate * action_rate_penalty
 
         rew_contact = torch.zeros((self.num_envs,), device=self.device)
-        rew_proximity = torch.zeros((self.num_envs,), device=self.device)
         for sensor in self.illegal_contact_sensors.values():
-            forces, _, _, separation, contact_count_per_link, _ = sensor.contact_physx_view.get_contact_data(self.dt)
+            f_abs = sensor.data.force_matrix_w.norm(dim=-1)
+            f_abs_clamped = f_abs.clamp(max=self.cfg.max_contact_force)
+            rew_contact += f_abs_clamped.sum(dim=-1).flatten()
+        rew_contact = self.cfg.w_illegal_contact * rew_contact
 
-            contact_count = torch.sum(contact_count_per_link)
-
-            if contact_count == 0:
-                continue
-
-            # Only look at valid contacts
-            forces = forces[:contact_count, 0]
-            separation = separation[:contact_count, 0]
-
-            contact_count_per_env = torch.sum(contact_count_per_link, dim=-1) 
-
-            env_ids = torch.repeat_interleave(torch.arange(self.num_envs, device=self.device), contact_count_per_env)
-
-            min_sep = torch.full((self.num_envs,), 0.02, device=self.device)
-            # Find minimum separation for each environment
-            min_sep.index_reduce_(0, env_ids, separation, reduce='amin', include_self=True)
-
-            proximity = torch.clamp((self.cfg.max_proximity - min_sep) / self.cfg.max_proximity, min=0.0)
-            proximity_penalty = self.cfg.w_proximity_to_contact * (proximity ** 2) # Sum over each point close to contact
-
-            total_force_per_env = torch.zeros(self.num_envs, device=self.device)
-            total_force_per_env.index_add_(0, env_ids, forces)
-            total_force_per_env = torch.clamp(total_force_per_env, min=0.0, max=self.cfg.max_contact_force)
-            contact_penalty = self.cfg.w_illegal_contact * torch.square(total_force_per_env)
-
-            rew_proximity += proximity_penalty
-            rew_contact += contact_penalty
+        rew_proximity = self._compute_proximity_penalty()
 
         mean_ee_force = torch.zeros((self.num_envs,), device=self.device)
         for sensor in self.ee_contact_sensors:
@@ -288,7 +264,28 @@ class JointTargetEnv(DirectRLEnv):
         return total_reward
 
     
-    def _get_joint_pos(self, relative=True):
+    def _compute_proximity_penalty(self) -> torch.Tensor:
+        """Penalize links approaching illegal contact surfaces based on PhysX separation distance."""
+        penalty = torch.zeros(self.num_envs, device=self.device)
+        for sensor in self.illegal_contact_sensors.values():
+            _, _, _, separation, contact_count_per_link, _ = sensor.contact_physx_view.get_contact_data(self.dt)
+            total_count = contact_count_per_link.sum().item()
+            if total_count == 0:
+                continue
+            separation = separation[:total_count, 0]
+            contact_count_per_env = contact_count_per_link.sum(dim=-1)
+            env_ids = torch.repeat_interleave(
+                torch.arange(self.num_envs, device=self.device), contact_count_per_env
+            )
+            # Find minimum separation per env; default well above threshold
+            min_sep = torch.full((self.num_envs,), self.cfg.max_proximity * 2, device=self.device)
+            min_sep.index_reduce_(0, env_ids, separation, reduce='amin', include_self=True)
+            # 1.0 at contact, 0.0 at max_proximity distance
+            proximity = torch.clamp(1.0 - min_sep / self.cfg.max_proximity, min=0.0)
+            penalty += proximity.square()
+        return self.cfg.w_proximity_to_contact * penalty
+
+    def _get_joint_pos(self, relative=False):
         joint_pos_l = self.ur5_l.data.joint_pos.clone()
         joint_pos_r = self.ur5_r.data.joint_pos.clone()
 
@@ -300,9 +297,13 @@ class JointTargetEnv(DirectRLEnv):
     
     
     # TODO: Make relative velocity?
-    def _get_joint_vel(self):
+    def _get_joint_vel(self, relative=False):
         ur5_l_joint_vel = self.ur5_l.data.joint_vel.clone()
         ur5_r_joint_vel = self.ur5_r.data.joint_vel.clone()
+
+        if relative:
+            ur5_l_joint_vel -= self.joint_vel_l[self.episode_length_buf]
+            ur5_r_joint_vel -= self.joint_vel_r[self.episode_length_buf]
 
         return torch.cat((ur5_l_joint_vel, ur5_r_joint_vel), 1)
     

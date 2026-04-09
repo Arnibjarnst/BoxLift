@@ -11,25 +11,26 @@ import omni.usd
 from collections.abc import Sequence
 
 import isaaclab.sim as sim_utils
+from isaaclab.sim.schemas import modify_collision_properties
 from isaaclab.assets import Articulation, RigidObject
 from isaaclab.envs import DirectRLEnv
 from isaaclab.sim.spawners.from_files import spawn_ground_plane, GroundPlaneCfg
 from isaaclab.sensors.contact_sensor import ContactSensor
 from isaaclab.markers import VisualizationMarkers, VisualizationMarkersCfg
 
-from BoxLift.tasks.direct.boxlift.boxlift_env_cfg import *
+from BoxLift.tasks.direct.boxpush.boxpush_env_cfg import *
 
 from isaaclab.utils.math import quat_apply, quat_mul, quat_inv, quat_error_magnitude
 
-class BoxliftEnv(DirectRLEnv):
-    cfg: BoxliftEnvCfg
+class BoxpushEnv(DirectRLEnv):
+    cfg: BoxpushEnvCfg
 
-    def __init__(self, cfg: BoxliftEnvCfg, render_mode: str | None = None, **kwargs):
+    def __init__(self, cfg: BoxpushEnvCfg, render_mode: str | None = None, **kwargs):
         super().__init__(cfg, render_mode, **kwargs)
-       
-        self.EE_link_idx = self.ur5e_r.body_names.index("Sphere")
-        self.flange_idx = self.ur5e_r.body_names.index("wrist_3_link")
-        self.forearm_link_idx = self.ur5e_r.body_names.index("forearm_link")
+
+        self.EE_link_idx = self.ur5e.body_names.index("wrist_3_link")
+        self.flange_idx = self.ur5e.body_names.index("wrist_3_link")
+        self.forearm_link_idx = self.ur5e.body_names.index("forearm_link")
 
     def _setup_scene(self):
         # Load the trajectory file
@@ -38,18 +39,12 @@ class BoxliftEnv(DirectRLEnv):
         # Store initial positions and joint states
         self.obj_poses          = torch.from_numpy(traj["obj_poses"]).float().to(self.device)
         self.obj_vel            = torch.from_numpy(traj["obj_vel"]).float().to(self.device)
-        self.arm_l_pose         = torch.from_numpy(traj["arm_l_pose"]).float().to(self.device)
-        self.arm_r_pose         = torch.from_numpy(traj["arm_r_pose"]).float().to(self.device)
-        self.joints_l           = torch.from_numpy(traj["joints_l"]).float().to(self.device)
-        self.joints_r           = torch.from_numpy(traj["joints_r"]).float().to(self.device)
-        self.joint_vel_l        = torch.from_numpy(traj["joint_vel_l"]).float().to(self.device)
-        self.joint_vel_r        = torch.from_numpy(traj["joint_vel_r"]).float().to(self.device)
-        self.joints_target_l    = torch.from_numpy(traj["joints_target_l"]).float().to(self.device)
-        self.joints_target_r    = torch.from_numpy(traj["joints_target_r"]).float().to(self.device)
-        self.EE_poses_l         = torch.from_numpy(traj["EE_poses_l"]).float().to(self.device)
-        self.EE_poses_r         = torch.from_numpy(traj["EE_poses_r"]).float().to(self.device)
-        # self.dt                 = float(traj["dt"])
-        self.dt = 0.02
+        self.arm_pose           = torch.from_numpy(traj["arm_pose"]).float().to(self.device)
+        self.joints             = torch.from_numpy(traj["joints"]).float().to(self.device)
+        self.joint_vel          = torch.from_numpy(traj["joint_vel"]).float().to(self.device)
+        self.joints_target      = torch.from_numpy(traj["joints_target"]).float().to(self.device)
+        self.EE_poses           = torch.from_numpy(traj["EE_poses"]).float().to(self.device)
+        self.dt                 = float(traj["dt"])
 
         # Set scene params from trajectory
         if "object_dims" in traj:
@@ -62,44 +57,45 @@ class BoxliftEnv(DirectRLEnv):
         # TODO: Support last trajectory point
         self.cfg.episode_length_s = self.dt * (self.obj_poses.shape[0] - 1)
 
-        ur5e_l_cfg = get_ur5e_cfg(self.cfg.ur5e_l_prim_path, self.arm_l_pose, self.cfg)
-        ur5e_r_cfg = get_ur5e_cfg(self.cfg.ur5e_r_prim_path, self.arm_r_pose, self.cfg)
+        ur5e_cfg = get_ur5e_cfg(self.cfg.ur5e_prim_path, self.arm_pose, self.cfg)
+        self.ur5e = Articulation(ur5e_cfg)
 
-        self.ur5e_l = Articulation(ur5e_l_cfg)
-        self.ur5e_r = Articulation(ur5e_r_cfg)
-        
+        # Disable collision on base_link (ground is raised 1.8cm for the box pushing surface,
+        # but the robot base sits at the original level — only the area near the box is elevated)
+        modify_collision_properties(
+            "/World/envs/env_0/ur5e/base_link",
+            sim_utils.CollisionPropertiesCfg(collision_enabled=False),
+        )
+
         # add ground plane
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(), translation=(0,0,-0.5))
 
         self.object = RigidObject(cfg=self.cfg.cube_cfg)
-
         self.table = RigidObject(cfg=self.cfg.table_cfg)
 
         self.illegal_contact_sensors = {name: ContactSensor(cfg) for name, cfg in self.cfg.illegal_contact_sensor_cfgs.items()}
 
-        self.ee_contact_sensors = [ContactSensor(cfg) for cfg in self.cfg.ee_contact_sensors]
-
         # Regularization stuff
-        self.prev_actions = torch.zeros((self.num_envs, 12), device=self.device)
-        self.prev_joint_vel = torch.zeros((self.num_envs, 12), device=self.device)
+        self.prev_actions = torch.zeros((self.num_envs, 6), device=self.device)
+        self.prev_joint_vel = torch.zeros((self.num_envs, 6), device=self.device)
+
+        # Perturbation state
+        self.perturbation_counter = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
+        self.perturbation_forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
+        self.perturbation_torques = torch.zeros(self.num_envs, 1, 3, device=self.device)
 
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
-        # we need to explicitly filter collisions for CPU simulation
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
         # add articulation to scene
-        self.scene.articulations["ur5e_left"] = self.ur5e_l
-        self.scene.articulations["ur5e_right"] = self.ur5e_r
+        self.scene.articulations["ur5e"] = self.ur5e
         # add object to the scene
         self.scene.rigid_objects["object"] = self.object
-        # add table to the scene
         self.scene.rigid_objects["table"] = self.table
         # add sensors to the scene
         for name, sensor in self.illegal_contact_sensors.items():
             self.scene.sensors[f"illegal_contact_sensor_{name}"] = sensor
-        for i, sensor in enumerate(self.ee_contact_sensors):
-            self.scene.sensors[f"ee_contact_sensor_{i}"] = sensor
         # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
@@ -108,18 +104,13 @@ class BoxliftEnv(DirectRLEnv):
             VisualizationMarkersCfg(
                 prim_path="/Visuals/eeMarkers",
                 markers={
-                    "ee_l": sim_utils.SphereCfg(
-                        radius=0.02,
-                        visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
-                    ),
-                    "ee_r": sim_utils.SphereCfg(
+                    "ee": sim_utils.SphereCfg(
                         radius=0.02,
                         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0)),
                     ),
                 },
             )
         )
-
 
         self.cube_marker = VisualizationMarkers(
             VisualizationMarkersCfg(
@@ -129,7 +120,7 @@ class BoxliftEnv(DirectRLEnv):
                         size=self.cfg.cube_cfg.spawn.size,
                         visual_material=sim_utils.PreviewSurfaceCfg(
                             diffuse_color=(0.7, 0.7, 0.7),
-                        ),                
+                        ),
                     ),
                 },
             )
@@ -137,45 +128,88 @@ class BoxliftEnv(DirectRLEnv):
 
         self.cube_marker.set_visibility(False)
 
+    def _apply_perturbations(self):
+        """Apply random external forces to the forearm to improve robustness."""
+        # Decrement active perturbation counters
+        self.perturbation_counter = torch.clamp(self.perturbation_counter - 1, min=0)
+
+        # Start new perturbations with some probability
+        new_perturbation = torch.rand(self.num_envs, device=self.device) < self.cfg.perturbation_probability
+        new_perturbation &= self.perturbation_counter == 0  # don't overlap
+        new_ids = new_perturbation.nonzero(as_tuple=False).squeeze(-1)
+
+        if len(new_ids) > 0:
+            self.perturbation_counter[new_ids] = self.cfg.perturbation_duration_steps
+            # Random force direction and magnitude on forearm
+            self.perturbation_forces[new_ids, 0] = (
+                torch.randn(len(new_ids), 3, device=self.device)
+                * self.cfg.perturbation_force_max
+            )
+            self.perturbation_torques[new_ids, 0] = (
+                torch.randn(len(new_ids), 3, device=self.device)
+                * self.cfg.perturbation_torque_max
+            )
+
+        # Clear expired perturbations
+        expired = self.perturbation_counter == 0
+        self.perturbation_forces[expired] = 0.0
+        self.perturbation_torques[expired] = 0.0
+
+        # Apply to forearm link
+        self.ur5e.set_external_force_and_torque(
+            self.perturbation_forces,
+            self.perturbation_torques,
+            body_ids=[self.forearm_link_idx],
+            is_global=True,
+        )
+
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
 
-        EE_pos_l = self.EE_poses_l[self.episode_length_buf, :3] + self.scene.env_origins
-        EE_pos_r = self.EE_poses_r[self.episode_length_buf, :3] + self.scene.env_origins
+        self._apply_perturbations()
 
-        # Visualize EE markers
-        ee_marker_pos = torch.stack([EE_pos_l, EE_pos_r], dim=1).view(-1, 3)
-        self.ee_markers.visualize(translations=ee_marker_pos)
+        EE_pos = self.EE_poses[self.episode_length_buf, :3] + self.scene.env_origins
+        self.ee_markers.visualize(translations=EE_pos)
 
         obj_pos = self.obj_poses[self.episode_length_buf, :3] + self.scene.env_origins
         obj_quat = self.obj_poses[self.episode_length_buf, 3:]
-
         self.cube_marker.visualize(translations=obj_pos, orientations=obj_quat)
 
+
+    def get_joint_targets_A(self):
+        """Residual on planner targets. Planner feedforward is baked into the action."""
+        return self.joints_target[self.episode_length_buf] + self.cfg.action_scale * self.actions
+
+    def get_joint_targets_B(self):
+        """Residual on trajectory positions. Pair with feedforward obs."""
+        return self.joints[self.episode_length_buf] + self.cfg.action_scale * self.actions
+    
+    def get_joint_targets_C(self):
+        """Residual on current joint positions. Pair with feedforward obs."""
+        return self._get_joint_pos() + self.cfg.action_scale * self.actions
+
     def get_joint_targets(self):
-        q_l = self.joints_target_l[self.episode_length_buf] + self.cfg.action_scale * self.actions[:, :6]
-        q_r = self.joints_target_r[self.episode_length_buf] + self.cfg.action_scale * self.actions[:, 6:]
-
-        return q_l, q_r
-
+        return self.get_joint_targets_A()
 
     def _apply_action(self) -> None:
-        q_l, q_r = self.get_joint_targets()
+        # print(self.episode_length_buf)
+        # print(self._get_joint_pos())
+        # print(self.joints[self.episode_length_buf])
+        q = self.get_joint_targets()
+        q = q.clamp(self.ur5e.data.joint_pos_limits[...,0], self.ur5e.data.joint_pos_limits[..., 1])
+        # print(q)
+        self.ur5e.set_joint_position_target(q)
 
-        q_l = q_l.clamp(self.ur5e_l.data.joint_pos_limits[...,0], self.ur5e_l.data.joint_pos_limits[..., 1])
-        q_r = q_r.clamp(self.ur5e_r.data.joint_pos_limits[...,0], self.ur5e_r.data.joint_pos_limits[..., 1])
-
-        self.ur5e_l.set_joint_position_target(q_l)
-        self.ur5e_r.set_joint_position_target(q_r)
+    def _get_feedforward(self):
+        """Planner's intended feedforward: joints_target - joints (proportional to desired PD force)."""
+        return self.joints_target[self.episode_length_buf] - self.joints[self.episode_length_buf]
 
     def _get_observations(self) -> dict:
         obs = torch.cat(
             (
                 self._get_joint_pos(relative=True),
                 self._get_joint_vel(relative=True),
-                self._get_obj_pos(relative=True),
-                self._get_obj_quat(relative=True),
-                self._get_obj_vel(),
+                # self._get_feedforward(),
                 self.episode_length_buf[:, None] / self.max_episode_length,
             ),
             dim=-1,
@@ -199,19 +233,16 @@ class BoxliftEnv(DirectRLEnv):
             env_ids : Sequence[int] = self.scene._ALL_INDICES  # type: ignore
         super()._reset_idx(env_ids)
 
-        # TODO: verify this is the correct range
         if fixed_value is not None:
             self.episode_length_buf[env_ids] = fixed_value * torch.ones((len(env_ids),), device=self.device, dtype=torch.long)
         else:
             self.episode_length_buf[env_ids] = torch.randint(0, self.max_episode_length - 2, (len(env_ids),), device=self.device, dtype=torch.long)
 
-        initial_joint_pos_l = self.joints_l[self.episode_length_buf[env_ids]]
-        initial_joint_vel_l = self.joint_vel_l[self.episode_length_buf[env_ids]]
-        self.ur5e_l.write_joint_state_to_sim(initial_joint_pos_l, initial_joint_vel_l, env_ids=env_ids)
-
-        initial_joint_pos_r = self.joints_r[self.episode_length_buf[env_ids]]
-        initial_joint_vel_r = self.joint_vel_r[self.episode_length_buf[env_ids]]
-        self.ur5e_r.write_joint_state_to_sim(initial_joint_pos_r, initial_joint_vel_r, env_ids=env_ids)
+        initial_joint_pos = self.joints[self.episode_length_buf[env_ids]].clone()
+        initial_joint_vel = self.joint_vel[self.episode_length_buf[env_ids]].clone()
+        initial_joint_pos += self.cfg.reset_joint_pos_noise * torch.randn_like(initial_joint_pos)
+        initial_joint_vel += self.cfg.reset_joint_vel_noise * torch.randn_like(initial_joint_vel)
+        self.ur5e.write_joint_state_to_sim(initial_joint_pos, initial_joint_vel, env_ids=env_ids)
 
         # Reset Object
         initial_object_pose = self.obj_poses[self.episode_length_buf[env_ids]].clone()
@@ -222,10 +253,13 @@ class BoxliftEnv(DirectRLEnv):
         self.object.write_root_velocity_to_sim(initial_object_vel, env_ids)
 
         # Reset prev variables
-        self.prev_actions[env_ids, :6] = initial_joint_pos_l
-        self.prev_actions[env_ids, 6:] = initial_joint_pos_r
-        self.prev_joint_vel[env_ids, :6] = initial_joint_vel_l
-        self.prev_joint_vel[env_ids, 6:] = initial_joint_vel_r
+        self.prev_actions[env_ids] = initial_joint_pos
+        self.prev_joint_vel[env_ids] = initial_joint_vel
+
+        # Clear perturbations
+        self.perturbation_counter[env_ids] = 0
+        self.perturbation_forces[env_ids] = 0.0
+        self.perturbation_torques[env_ids] = 0.0
 
     def _reward_track(self, error, sigma, tolerance=0.0):
         error *= error > tolerance
@@ -236,30 +270,21 @@ class BoxliftEnv(DirectRLEnv):
         # Task Reward
         obj_pos_error = self._get_obj_pos_error()
         rew_obj_pos = self.cfg.w_obj_pos * self._reward_track(obj_pos_error ** 2, self.cfg.sigma_obj_pos, self.cfg.tol_obj_pos)
-        
+
         obj_quat_error = self._get_obj_quat_error()
         rew_obj_quat = self.cfg.w_obj_quat * self._reward_track(obj_quat_error ** 2, self.cfg.sigma_obj_quat, self.cfg.tol_obj_quat)
 
         rew_task = self.cfg.w_task * (rew_obj_pos + rew_obj_quat)
 
         # Tracking Reward
-        EE_pos_error_l, EE_pos_error_r = self._get_EE_pos_error()
-        rew_EE_pos_l = self._reward_track(EE_pos_error_l ** 2, self.cfg.sigma_eef_pos, self.cfg.tol_eef_pos)
-        rew_EE_pos_r = self._reward_track(EE_pos_error_r ** 2, self.cfg.sigma_eef_pos, self.cfg.tol_eef_pos)
-        rew_EE_pos = self.cfg.w_eef_pos * (rew_EE_pos_l + rew_EE_pos_r)
+        EE_pos_error = self._get_EE_pos_error()
+        rew_EE_pos = self.cfg.w_eef_pos * self._reward_track(EE_pos_error ** 2, self.cfg.sigma_eef_pos, self.cfg.tol_eef_pos)
 
-        eef_quat_error_l, eef_quat_error_r = self._get_EE_quat_error()
-        rew_EE_quat_l = self._reward_track(eef_quat_error_l ** 2, self.cfg.sigma_eef_quat, self.cfg.tol_eef_quat)
-        rew_EE_quat_r = self._reward_track(eef_quat_error_r ** 2, self.cfg.sigma_eef_quat, self.cfg.tol_eef_quat)
-        rew_EE_quat = self.cfg.w_eef_quat * (rew_EE_quat_l + rew_EE_quat_r)
+        eef_quat_error = self._get_EE_quat_error()
+        rew_EE_quat = self.cfg.w_eef_quat * self._reward_track(eef_quat_error ** 2, self.cfg.sigma_eef_quat, self.cfg.tol_eef_quat)
 
-        joint_pos_lr2 = self._get_joint_pos(relative=True) ** 2
-        joint_pos_l2, joint_pos_r2 = joint_pos_lr2[:,:6], joint_pos_lr2[:,6:]
-        joint_pos_error_l = joint_pos_l2.sum(dim=-1)
-        joint_pos_error_r = joint_pos_r2.sum(dim=-1)
-        rew_joint_pos_l = self._reward_track(joint_pos_error_l, self.cfg.sigma_joint_pos, self.cfg.tol_joint_pos)
-        rew_joint_pos_r = self._reward_track(joint_pos_error_r, self.cfg.sigma_joint_pos, self.cfg.tol_joint_pos)
-        rew_joint_pos = self.cfg.w_joint_pos * (rew_joint_pos_l + rew_joint_pos_r)
+        joint_pos_error = (self._get_joint_pos(relative=True) ** 2).sum(dim=-1)
+        rew_joint_pos = self.cfg.w_joint_pos * self._reward_track(joint_pos_error, self.cfg.sigma_joint_pos, self.cfg.tol_joint_pos)
 
         rew_track = self.cfg.w_track * (rew_EE_pos + rew_EE_quat + rew_joint_pos)
 
@@ -269,10 +294,10 @@ class BoxliftEnv(DirectRLEnv):
         joint_acc_penalty = joint_acc.square().sum(dim=-1)
         rew_joint_acc = self.cfg.w_joint_acc * joint_acc_penalty
 
-        torque = torch.cat((self.ur5e_l.data.applied_torque.clone(), self.ur5e_r.data.applied_torque.clone()), 1)
+        torque = self.ur5e.data.applied_torque.clone()
         torque *= torch.abs(torque) > self.cfg.tol_joint_torque
         torque_penalty = torque.square().sum(dim=-1)
-        rew_torque = self.cfg.w_joint_torque * torque_penalty        
+        rew_torque = self.cfg.w_joint_torque * torque_penalty
 
         action_rate_error = (self.actions - self.prev_actions)
         action_rate_error *= torch.abs(action_rate_error) > self.cfg.tol_action_rate
@@ -280,37 +305,24 @@ class BoxliftEnv(DirectRLEnv):
         rew_action_rate = self.cfg.w_action_rate * action_rate_penalty
 
         # Joint limit penalty
-        q_l, q_r = self.get_joint_targets()
-        q_limits_l = self.ur5e_l.data.joint_pos_limits
-        q_limits_r = self.ur5e_r.data.joint_pos_limits
-        
-        limit_violation_l = torch.clamp(q_limits_l[..., 0] - q_l, min=0.0) + torch.clamp(q_l - q_limits_l[..., 1], min=0.0)
-        limit_violation_r = torch.clamp(q_limits_r[..., 0] - q_r, min=0.0) + torch.clamp(q_r - q_limits_r[..., 1], min=0.0)
-        
-        rew_joint_limit = self.cfg.w_joint_limit * (limit_violation_l.square().sum(dim=-1) + limit_violation_r.square().sum(dim=-1))
+        q = self.get_joint_targets()
+        q_limits = self.ur5e.data.joint_pos_limits
+        limit_violation = torch.clamp(q_limits[..., 0] - q, min=0.0) + torch.clamp(q - q_limits[..., 1], min=0.0)
+        rew_joint_limit = self.cfg.w_joint_limit * limit_violation.square().sum(dim=-1)
 
         total_illegal_force = torch.zeros((self.num_envs,), device=self.device)
         for sensor in self.illegal_contact_sensors.values():
             f_abs = sensor.data.force_matrix_w.norm(dim=-1)
             f_abs_clamped = f_abs.clamp(max=self.cfg.max_contact_force)
             total_illegal_force += f_abs_clamped.sum(dim=-1).flatten()
-        
+
         rew_illegal_contact = self.cfg.w_illegal_contact * total_illegal_force
 
         rew_proximity = self._compute_proximity_penalty()
 
-        mean_ee_force = torch.zeros((self.num_envs,), device=self.device)
-        for sensor in self.ee_contact_sensors:
-            mean_ee_force += sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1).flatten() / len(self.ee_contact_sensors)
-
-        flange_to_forearm_dist_l = self._get_flange_to_forearm_distance(self.ur5e_l)
-        flange_to_forearm_dist_r = self._get_flange_to_forearm_distance(self.ur5e_r)
-
-        # Boolean (binary) penalty for breaching the safety zone
-        is_too_close_l = (flange_to_forearm_dist_l < self.cfg.max_flange_forearm_distance).float()
-        is_too_close_r = (flange_to_forearm_dist_r < self.cfg.max_flange_forearm_distance).float()
-        
-        rew_flange_forearm_dist = self.cfg.w_flange_forearm_dist * (is_too_close_l + is_too_close_r)
+        flange_to_forearm_dist = self._get_flange_to_forearm_distance(self.ur5e)
+        is_too_close = (flange_to_forearm_dist < self.cfg.max_flange_forearm_distance).float()
+        rew_flange_forearm_dist = self.cfg.w_flange_forearm_dist * is_too_close
 
         rew_regularization = self.cfg.w_regularization * (
             rew_joint_acc + rew_torque + rew_action_rate + rew_joint_limit + rew_illegal_contact + rew_proximity + rew_flange_forearm_dist
@@ -326,18 +338,17 @@ class BoxliftEnv(DirectRLEnv):
             "Rewards_track/total": rew_track.mean(),
             "Error/obj_pos_error": obj_pos_error.mean(),
             "Error/obj_quat_error": obj_quat_error.mean(),
-            "Error/EE_pos_error": (EE_pos_error_l + EE_pos_error_r).mean() / 2.0,
+            "Error/EE_pos_error": EE_pos_error.mean(),
             "Rewards_regularization/total": rew_regularization.mean(),
-            "Rewards_regularization/joint_acceleration": rew_joint_acc.mean(), 
+            "Rewards_regularization/joint_acceleration": rew_joint_acc.mean(),
             "Rewards_regularization/torque": rew_torque.mean(),
             "Rewards_regularization/action_rate": rew_action_rate.mean(),
             "Rewards_regularization/joint_limit": rew_joint_limit.mean(),
             "Rewards_regularization/illegal_contact": rew_illegal_contact.mean(),
             "Rewards_regularization/illegal_proximity": rew_proximity.mean(),
             "Rewards_regularization/flange_forearm_distance": rew_flange_forearm_dist.mean(),
-            "Extra/mean_EE_force": mean_ee_force.mean(),
         }
-        
+
         total_reward = rew_task + rew_track - rew_regularization
 
         # Can update prev_action/joint_vel now
@@ -346,76 +357,57 @@ class BoxliftEnv(DirectRLEnv):
 
         return total_reward
 
-    
     def _get_joint_pos(self, relative=False):
-        joint_pos_l = self.ur5e_l.data.joint_pos.clone()
-        joint_pos_r = self.ur5e_r.data.joint_pos.clone()
-
+        joint_pos = self.ur5e.data.joint_pos.clone()
         if relative:
-            joint_pos_l -= self.joints_l[self.episode_length_buf]
-            joint_pos_r -= self.joints_r[self.episode_length_buf]
+            joint_pos -= self.joints[self.episode_length_buf]
+        return joint_pos
 
-        return torch.cat((joint_pos_l, joint_pos_r), 1)
-    
-    
     def _get_joint_vel(self, relative=False):
-        ur5e_l_joint_vel = self.ur5e_l.data.joint_vel.clone()
-        ur5e_r_joint_vel = self.ur5e_r.data.joint_vel.clone()
-
+        joint_vel = self.ur5e.data.joint_vel.clone()
         if relative:
-            ur5e_l_joint_vel -= self.joint_vel_l[self.episode_length_buf]
-            ur5e_r_joint_vel -= self.joint_vel_r[self.episode_length_buf]
+            joint_vel -= self.joint_vel[self.episode_length_buf]
+        return joint_vel
 
-        return torch.cat((ur5e_l_joint_vel, ur5e_r_joint_vel), 1)
-    
     def _get_forearm_endpoints(self, robot: Articulation):
-        # Height of the forearm cylinder is ~0.4225.
         forearm_length = 0.4225
-        # Local offset of the Cylinder center relative to forearm_link
         p2_local = torch.tensor([-forearm_length, 0.0, 0.0], device=self.device)
 
         forearm_pos = robot.data.body_pos_w[:, self.forearm_link_idx]
         forearm_quat = robot.data.body_quat_w[:, self.forearm_link_idx]
 
-        # Map link frame to world frame
         p2 = forearm_pos + quat_apply(forearm_quat, p2_local.repeat(self.num_envs, 1))
         return forearm_pos, p2
-    
+
     def _get_closest_point_on_forearm(self, robot: Articulation):
         flange_pos = robot.data.body_pos_w[:, self.flange_idx]
         p1, p2 = self._get_forearm_endpoints(robot)
 
-        # Calculate distance from flange_pos to line segment [p1, p2]
         line_vec = p2 - p1
         p1_to_flange = flange_pos - p1
-        
+
         line_len_sq = torch.sum(line_vec**2, dim=-1)
-        # Project flange_pos onto the line segment, clamped between 0 and 1
         t = torch.sum(p1_to_flange * line_vec, dim=-1) / line_len_sq
         t = torch.clamp(t, 0.0, 1.0)
-        
-        closest_point = p1 + t.unsqueeze(-1) * line_vec
 
+        closest_point = p1 + t.unsqueeze(-1) * line_vec
         return closest_point
 
     def _get_flange_to_forearm_distance(self, robot: Articulation):
         flange_pos = robot.data.body_pos_w[:, self.flange_idx]
         p1, p2 = self._get_forearm_endpoints(robot)
 
-        # Calculate distance from flange_pos to line segment [p1, p2]
         line_vec = p2 - p1
         p1_to_flange = flange_pos - p1
-        
+
         line_len_sq = torch.sum(line_vec**2, dim=-1)
-        # Project flange_pos onto the line segment, clamped between 0 and 1
         t = torch.sum(p1_to_flange * line_vec, dim=-1) / line_len_sq
         t = torch.clamp(t, 0.0, 1.0)
-        
+
         closest_point = p1 + t.unsqueeze(-1) * line_vec
         distance = torch.norm(flange_pos - closest_point, dim=-1)
-        
         return distance
-    
+
     def _compute_proximity_penalty(self) -> torch.Tensor:
         """Penalize links approaching illegal contact surfaces based on PhysX separation distance."""
         penalty = torch.zeros(self.num_envs, device=self.device)
@@ -436,78 +428,46 @@ class BoxliftEnv(DirectRLEnv):
         return self.cfg.w_proximity_to_contact * penalty
 
     def _get_EE_pos(self, relative=True) -> torch.Tensor:
-        EE_pos_l = self.ur5e_l.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
-        EE_pos_r = self.ur5e_r.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
-
+        EE_pos = self.ur5e.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
         if relative:
-            EE_pos_l -= self.EE_poses_l[self.episode_length_buf, :3]
-            EE_pos_r -= self.EE_poses_r[self.episode_length_buf, :3]
+            EE_pos -= self.EE_poses[self.episode_length_buf, :3]
+        return EE_pos
 
-        return torch.cat((EE_pos_l, EE_pos_r), 1)
-    
     def _get_EE_pos_error(self):
-        EE_pos_lr = self._get_EE_pos(relative=True)
-        EE_pos_l = EE_pos_lr[:, :3]
-        EE_pos_r = EE_pos_lr[:, 3:]
+        return torch.norm(self._get_EE_pos(relative=True), dim=-1)
 
-        EE_pos_error_l = torch.norm(EE_pos_l, dim=-1)
-        EE_pos_error_r = torch.norm(EE_pos_r, dim=-1)
-        
-        return EE_pos_error_l, EE_pos_error_r
-    
     def _get_EE_quat(self, relative=True) -> torch.Tensor:
-        # TODO: check orientation in usd file. might not match the one from the planner
-        EE_quat_l = self.ur5e_l.data.body_quat_w[:, self.EE_link_idx].clone()
-        EE_quat_r = self.ur5e_r.data.body_quat_w[:, self.EE_link_idx].clone()
-
+        EE_quat = self.ur5e.data.body_quat_w[:, self.EE_link_idx].clone()
         if relative:
-            desired_quat_l = self.EE_poses_l[self.episode_length_buf, 3:]
-            EE_quat_l = quat_mul(desired_quat_l, quat_inv(EE_quat_l))
-            desired_quat_r = self.EE_poses_r[self.episode_length_buf, 3:]
-            EE_quat_r = quat_mul(desired_quat_r, quat_inv(EE_quat_r))
+            desired_quat = self.EE_poses[self.episode_length_buf, 3:]
+            EE_quat = quat_mul(desired_quat, quat_inv(EE_quat))
+        return EE_quat
 
-        return torch.cat((EE_quat_l, EE_quat_r), 1)
-    
     def _get_EE_quat_error(self):
-        # TODO: check orientation in usd file. might not match the one from the planner
-        EE_quat_l = self.ur5e_l.data.body_quat_w[:, self.EE_link_idx].clone()
-        EE_quat_r = self.ur5e_r.data.body_quat_w[:, self.EE_link_idx].clone()
+        EE_quat = self.ur5e.data.body_quat_w[:, self.EE_link_idx].clone()
+        desired_quat = self.EE_poses[self.episode_length_buf, 3:]
+        return torch.abs(quat_error_magnitude(EE_quat, desired_quat))
 
-        desired_quat_l = self.EE_poses_l[self.episode_length_buf, 3:]
-        desired_quat_r = self.EE_poses_r[self.episode_length_buf, 3:]
-
-        error_l = torch.abs(quat_error_magnitude(EE_quat_l, desired_quat_l))
-        error_r = torch.abs(quat_error_magnitude(EE_quat_r, desired_quat_r))
-
-        return error_l, error_r
-    
     def _get_EE_vel(self) -> torch.Tensor:
-        EE_vel_l = self.ur5e_l.data.body_vel_w[:, self.EE_link_idx].clone()
-        EE_vel_r = self.ur5e_r.data.body_vel_w[:, self.EE_link_idx].clone()
+        return self.ur5e.data.body_vel_w[:, self.EE_link_idx].clone()
 
-        return torch.cat((EE_vel_l, EE_vel_r), 1)
-    
     def _get_obj_pos(self, relative=True):
         obj_pos = self.object.data.root_pos_w.clone() - self.scene.env_origins
-
         if relative:
             desired_obj_pos = self.obj_poses[self.episode_length_buf, :3]
             obj_pos -= desired_obj_pos
-
         return obj_pos
-    
+
     def _get_obj_pos_error(self):
         return torch.norm(self._get_obj_pos(relative=True), dim=-1)
-    
+
     def _get_obj_quat(self, relative=True):
         obj_quat = self.object.data.root_quat_w.clone()
-
         if relative:
             desired_obj_quat = self.obj_poses[self.episode_length_buf, 3:]
             obj_quat = quat_mul(desired_obj_quat, quat_inv(obj_quat))
-
         return obj_quat
-    
+
     def _get_obj_quat_error(self):
         obj_quat = self.object.data.root_quat_w.clone()
         desired_obj_quat = self.obj_poses[self.episode_length_buf, 3:]
@@ -515,4 +475,3 @@ class BoxliftEnv(DirectRLEnv):
 
     def _get_obj_vel(self):
         return self.object.data.root_vel_w.clone()
-

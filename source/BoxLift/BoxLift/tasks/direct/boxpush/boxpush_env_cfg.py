@@ -16,22 +16,22 @@ from isaaclab.utils import configclass
 from isaaclab.sensors.contact_sensor import ContactSensorCfg
 
 
-ROBOT_PATH = "./robots/ur5e_sphere.usd"
+ROBOT_PATH = "./robots/ur5e.usd"
 ENV_REGEX = "/World/envs/env_.*"
 
 
 CUBE_CFG = RigidObjectCfg(
     prim_path="/World/envs/env_.*/Cube",
     spawn=sim_utils.CuboidCfg(
-        size=(0.4, 0.6, 0.06),
+        size=(0.235, 0.34, 0.27),
         rigid_props=sim_utils.RigidBodyPropertiesCfg(),
-        mass_props=sim_utils.MassPropertiesCfg(mass=1.0),
+        mass_props=sim_utils.MassPropertiesCfg(mass=4.4),
         collision_props=sim_utils.CollisionPropertiesCfg(),
         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.0, 1.0, 0.0), metallic=0.2),
         activate_contact_sensors=True,
         physics_material=sim_utils.RigidBodyMaterialCfg(
-            static_friction=0.5,
-            dynamic_friction=0.5,
+            static_friction=0.35,
+            dynamic_friction=0.35,
             restitution=0.2,
             friction_combine_mode="multiply"
         )
@@ -47,47 +47,25 @@ TABLE_CFG = RigidObjectCfg(
         visual_material=sim_utils.PreviewSurfaceCfg(diffuse_color=(0.3, 0.3, 0.3), metallic=0.2),
         activate_contact_sensors=True,
         physics_material=sim_utils.RigidBodyMaterialCfg(
-            static_friction=0.5,
-            dynamic_friction=0.5,
+            static_friction=0.35,
+            dynamic_friction=0.35,
             restitution=0.2,
             friction_combine_mode="multiply"
         )
     ),
-    init_state=RigidObjectCfg.InitialStateCfg(pos=(0,0,-0.5))
+    init_state=RigidObjectCfg.InitialStateCfg(pos=(0,0,-0.5 + 0.018))
 )
 
 @configclass
 class EventCfg:
-    ur5e_l_physics_material = EventTermCfg(
-        func=mdp.randomize_rigid_body_material,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("ur5e_left", body_names="Sphere"),
-            "static_friction_range": (0.7, 1.3),
-            "dynamic_friction_range": (0.7, 1.3),
-            "restitution_range": (0.7, 0.9),
-            "num_buckets": 250,
-        },
-    )
-    ur5e_r_physics_material = EventTermCfg(
-        func=mdp.randomize_rigid_body_material,
-        mode="reset",
-        params={
-            "asset_cfg": SceneEntityCfg("ur5e_right", body_names="Sphere"),
-            "static_friction_range": (0.7, 1.3),
-            "dynamic_friction_range": (0.7, 1.3),
-            "restitution_range": (0.7, 0.9),
-            "num_buckets": 250,
-        },
-    )
     object_physics_material = EventTermCfg(
         func=mdp.randomize_rigid_body_material,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("object"),
-            "static_friction_range": (0.3, 0.7),
-            "dynamic_friction_range": (0.3, 0.7),
-            "restitution_range": (0.0, 0.4),
+            "static_friction_range": (0.2, 0.5),
+            "dynamic_friction_range": (0.2, 0.5),
+            "restitution_range": (0.1, 0.4),
             "num_buckets": 250,
         },
     )
@@ -96,9 +74,9 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("table"),
-            "static_friction_range": (0.3, 0.7),
-            "dynamic_friction_range": (0.3, 0.7),
-            "restitution_range": (0.0, 0.4),
+            "static_friction_range": (0.2, 0.5),
+            "dynamic_friction_range": (0.2, 0.5),
+            "restitution_range": (0.3, 0.6),
             "num_buckets": 250,
         },
     )
@@ -107,30 +85,11 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("object"),
-            "mass_distribution_params": (0.5, 2.0),
+            "mass_distribution_params": (0.8, 1.2),
             "operation": "scale",
             "distribution": "uniform"
         },
     )
-    # object_scale = EventTermCfg(
-    #     func=mdp.randomize_rigid_body_scale,
-    #     mode="prestartup",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("object"),
-    #         "scale_range": (0.975, 1.025)
-    #     },
-    # )
-    # object_com = EventTermCfg(
-    #     func=mdp.randomize_rigid_body_com,
-    #     mode="startup",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("object"),
-    #         "com_range": {
-    #             "x": (-0.1, 0.1), # not relative to scale but absolute addition uniformly sampled
-    #             "y": (-0.1, 0.1),
-    #         }
-    #     },
-    # )
     reset_gravity = EventTermCfg(
         func=mdp.randomize_physics_scene_gravity,
         mode="reset",
@@ -140,9 +99,20 @@ class EventCfg:
             "distribution": "gaussian",
         },
     )
-    
+    actuator_gains = EventTermCfg(
+        func=mdp.randomize_actuator_gains,
+        mode="reset",
+        params={
+            "asset_cfg": SceneEntityCfg("ur5e"),
+            "stiffness_distribution_params": (0.7, 1.3),
+            "damping_distribution_params": (0.7, 1.3),
+            "operation": "scale",
+            "distribution": "uniform",
+        },
+    )
+
 @configclass
-class BoxliftEnvCfg(DirectRLEnvCfg):
+class BoxpushEnvCfg(DirectRLEnvCfg):
     # Trajectory file path
     trajectory_path = ""
     # env
@@ -150,9 +120,10 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     physics_dt = 1.0 / 100.0
     decimation = 2
     episode_length_s = 3.0
-    # - spaces definition
-    action_space = 12
-    observation_space = 38
+    # - spaces definition (single arm: 6 actions, reduced obs)
+    action_space = 6
+    observation_space = 13  # 6 joint_pos + 6 joint_vel + 1 phase
+    # observation_space = 19  # 6 joint_pos + 6 joint_vel + 6 feedforward + 1 phase
     state_space = 0
 
     # simulation
@@ -161,12 +132,11 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     # Domain Randomization
     events: EventCfg = EventCfg()
 
-    ur5e_l_prim_path = f"{ENV_REGEX}/ur5e_l"
-    ur5e_r_prim_path = f"{ENV_REGEX}/ur5e_r"
+    ur5e_prim_path = f"{ENV_REGEX}/ur5e"
 
     # Arm Actuator parameters
-    kp = 100.0
-    kd = 20.0
+    kp = 300.0
+    kd = 45.0
     actuator_type = "Implicit"  # or "IdealPD"
     velocity_limit = 3.14
     effort_limit = {
@@ -189,7 +159,17 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=replicate_physics)
 
     # Action scale
-    action_scale = 0.25
+    action_scale = 0.05
+
+    # Reset noise (for sim-to-real robustness)
+    reset_joint_pos_noise = 0.05    # rad, std of Gaussian noise added to joint positions on reset
+    reset_joint_vel_noise = 0.1     # rad/s, std of Gaussian noise added to joint velocities on reset
+
+    # Perturbation forces (for sim-to-real robustness)
+    perturbation_force_max = 10.0       # N, max random force magnitude
+    perturbation_torque_max = 2.0       # Nm, max random joint torque
+    perturbation_probability = 0.05     # probability of applying a perturbation each step
+    perturbation_duration_steps = 5     # how many steps the perturbation lasts
 
     # Reward parameteres
     w_task = 0.7
@@ -205,7 +185,6 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     sigma_obj_quat = 0.1
     tol_obj_quat = 0.0
 
-    # TODO: Use or delete?
     w_obj_vel = 0.0
     sigma_obj_vel = 0.0
     tol_obj_vel = 0.0
@@ -215,7 +194,6 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     sigma_eef_pos = 0.1
     tol_eef_pos = 0.0
 
-    # TODO: Use or delete?
     w_eef_quat = 0.0
     sigma_eef_quat = 0.5
     tol_eef_quat = 0.1
@@ -237,7 +215,7 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     w_joint_limit = 50.0
 
     w_proximity_to_contact = 1.0
-    max_proximity = 0.01
+    max_proximity = 0.05
 
     w_illegal_contact = 0.1
     min_contact_force = 0
@@ -254,25 +232,11 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
         "forearm_link",
         "wrist_1_link",
         "wrist_2_link",
-        "wrist_3_link",
     ]
 
     filter_prim_paths_expr = []
-    for robot_prim_path in [ur5e_l_prim_path, ur5e_r_prim_path]:
-        for link_name in non_ee_link_names:
-            filter_prim_paths_expr.append(f"{robot_prim_path}/{link_name}/")
-
-    ee_contact_sensors = [
-        ContactSensorCfg(
-            prim_path=f"{ur5e_prim_path}/Sphere",
-            update_period=0.0,
-            history_length=0,
-            debug_vis=True,
-            force_threshold=0,
-            filter_prim_paths_expr=[CUBE_CFG.prim_path, TABLE_CFG.prim_path]
-        )
-        for ur5e_prim_path in [ur5e_l_prim_path, ur5e_r_prim_path]
-    ]
+    for link_name in non_ee_link_names:
+        filter_prim_paths_expr.append(f"{ur5e_prim_path}/{link_name}/")
 
     illegal_contact_sensor_cfgs = {
         "cube": ContactSensorCfg(
@@ -303,22 +267,22 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
 def get_ur5e_cfg(
     prim_path,
     init_pose,
-    box_lift_cfg: BoxliftEnvCfg,
+    cfg: BoxpushEnvCfg,
 ):
     actuator_kwargs = dict(
         joint_names_expr=[".*"],
-        stiffness=box_lift_cfg.kp,
-        damping=box_lift_cfg.kd,
-        velocity_limit=box_lift_cfg.velocity_limit,
-        effort_limit=box_lift_cfg.effort_limit,
+        stiffness=cfg.kp,
+        damping=cfg.kd,
+        velocity_limit=cfg.velocity_limit,
+        effort_limit=cfg.effort_limit,
     )
 
-    if box_lift_cfg.actuator_type == "IdealPD":
+    if cfg.actuator_type == "IdealPD":
         actuator_cfg = IdealPDActuatorCfg(**actuator_kwargs)
-    elif box_lift_cfg.actuator_type == "Implicit":
+    elif cfg.actuator_type == "Implicit":
         actuator_cfg = ImplicitActuatorCfg(**actuator_kwargs)
     else:
-        raise ValueError(f"Unknown actuator type: {box_lift_cfg.actuator_type}")
+        raise ValueError(f"Unknown actuator type: {cfg.actuator_type}")
 
     return ArticulationCfg(
         prim_path=prim_path,
