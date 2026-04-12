@@ -1,9 +1,9 @@
 import argparse
 import os
 import sys
+from datetime import datetime
 import json
 import logging
-import csv
 import time
 import numpy as np
 import yaml
@@ -14,8 +14,6 @@ import onnxruntime as ort
 from rtde_control import RTDEControlInterface as RTDEControl
 from rtde_receive import RTDEReceiveInterface as RTDEReceive
 
-
-ARM_IDX = 0
 
 # ---------------------------
 # Argument parsing
@@ -41,22 +39,14 @@ onnx_model_path = os.path.join(export_dir, "policy.onnx")
 if not os.path.exists(onnx_model_path):
     raise FileNotFoundError(f"ONNX model not found: {onnx_model_path}. Run training first (exports automatically).")
 
-# Read export metadata
-metadata_path = os.path.join(export_dir, "metadata.yaml")
-if os.path.exists(metadata_path):
-    with open(metadata_path, "r") as f:
-        export_metadata = yaml.safe_load(f)
-    model_iteration = export_metadata.get("iteration", "unknown")
-else:
-    model_iteration = "unknown"
-
 log_dir = os.path.join(args.run_dir, "ur_rtde_logs")
 os.makedirs(log_dir, exist_ok=True)
 
 # Resolve servo parameters early for file naming
 _gain = args.gain if args.gain is not None else 100
 _lookahead = args.lookahead if args.lookahead is not None else 0.05
-run_tag = f"iter{model_iteration}_gain{_gain}_la{_lookahead}" + (f"_as{action_scale}" if args.action_scale is not None else "")
+date_t = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+run_tag = f"{date_t}_gain{_gain}_la{_lookahead}" + (f"_as{action_scale}" if args.action_scale is not None else "")
 
 # ---------------------------
 # Logging Setup
@@ -159,27 +149,6 @@ rtde_c.reuploadScript()
 
 rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
 
-# ---------------------------
-# CSV logging
-# ---------------------------
-
-csv_path = os.path.join(log_dir, f"{run_tag}.csv")
-csv_file = open(csv_path, "w", newline="")
-csv_writer = csv.writer(csv_file)
-
-csv_writer.writerow(
-    [
-        "arm_idx",
-        "step",
-        "actual_q",
-        "expected_q",
-        "target_q",
-        "loop_time",
-        "robot_mode",
-        "safety_mode",
-    ]
-)
-
 np.set_printoptions(suppress=True, precision=8)
 
 # Per-timestep tracking data for analysis
@@ -248,20 +217,6 @@ def log(i, target_q):
             extra={"step": i},
         )
         raise RuntimeError("Joint velocity too high")
-
-    # CSV logging
-    csv_writer.writerow(
-        [
-            ARM_IDX,
-            i,
-            actual_q.tolist(),
-            expected_q.tolist(),
-            target_q.tolist(),
-            dt,
-            robot_mode,
-            safety_mode,
-        ]
-    )
 
 
 # ---------------------------
@@ -338,7 +293,6 @@ run_policy_event = threading.Event()  # Trigger for the policy
 new_data_event = threading.Event()
 
 
-
 def policy_thread():
     global current_target_q, previous_target_q, current_target_i
     trajectory_step = 0
@@ -359,31 +313,19 @@ def policy_thread():
         else:
             relative_q = actual_q - joints[trajectory_step]
             relative_qd = actual_qd - joint_vel_ref[trajectory_step]
-            feedforward = joints_target[trajectory_step] - joints[trajectory_step]
+            # feedforward = joints_target[trajectory_step] - joints[trajectory_step]
             # obs = np.concatenate((relative_q, relative_qd, feedforward, phase))
             obs = np.concatenate((relative_q, relative_qd, phase))
 
         obs = obs[None, ...].astype(np.float32)
         output = session.run([output_name], {input_name: obs})[0][0]
 
-        # # Option 0: pure trajectory targets (matches planner)
-        # new_joint_targets = joints_target[trajectory_step]
-
-        # # Option A: residual on trajectory targets (matches get_joint_targets_A)
+        # Option A: residual on trajectory targets (matches get_joint_targets_A)
         new_joint_targets = joints_target[trajectory_step] + action_scale * output[:6]
 
-        # # Option B: residual on trajectory positions (matches get_joint_targets_B)
-        # new_joint_targets = joints[trajectory_step] + action_scale * output[:6]
-
-        # Option C: residual on joint positions (matches get_joint_targets_C)
-        # new_joint_targets = actual_q + action_scale * output[:6]
-
-        # Safety: clamp to joint limits
+        # Safety: clamp to joint limits, then clamp to be near current position
         new_joint_targets = np.clip(new_joint_targets, joint_limits_lower, joint_limits_upper)
-        # Safety: clamp command to be within max_target_delta of current position
         new_joint_targets = np.clip(new_joint_targets, actual_q - max_target_delta, actual_q + max_target_delta)
-
-        print(obs, output * 0.25)
 
         with data_lock:
             previous_target_q = current_target_q
@@ -411,6 +353,8 @@ def control_thread():
                 alpha = 1.0 / policy_decimation
 
             with data_lock:
+                # TODO: try interp_q = (1 - alpha) * interp_q + alpha * current_target_q
+                # It is smoother but might be less accurate
                 interp_q = (1 - alpha) * previous_target_q + alpha * current_target_q
 
                 # 4. Command the robot
@@ -450,8 +394,6 @@ def control_thread():
         rtde_c.servoStop()
         rtde_c.stopScript()
 
-        csv_file.close()
-
         # Save per-timestep tracking data for analysis
         if tracking_log:
             tracking_npz_path = os.path.join(log_dir, f"{run_tag}.npz")
@@ -468,7 +410,7 @@ def control_thread():
             logger.info(f"Tracking data saved to {tracking_npz_path}", extra={"step": -1})
 
         logger.info(
-            f"Execution finished. Logs written to {log_path} and {csv_path}",
+            f"Execution finished. Log written to {log_path}",
             extra={"step": -1},
         )
 
