@@ -1,10 +1,8 @@
 import numpy as np
-import csv
 import os
 import argparse
 import json
 import time
-import ast
 
 # ----------------------------
 # Parse input JSON file
@@ -24,45 +22,26 @@ def read_json(file_path):
 
     return q_joints[:, :6], q_joints[:, 6:], np.zeros_like(q_joints[:, :6]), np.zeros_like(q_joints[:, :6])
 
-def read_csv(file_path):
-    # Downsample to args.hz without interpolation
-    q_joints_l = []
-    q_joints_r = []
+def read_npz(file_path):
+    # Downsample 500Hz log to args.hz without interpolation
+    d = np.load(file_path)
+    actual = d["actual_q"]      # (N, 6)
+    expected = d["expected_q"]  # (N, 6)
 
-    q_joints_gt_l = []
-    q_joints_gt_r = []
+    # Source rate is 500Hz (1/dt = 500)
+    src_dt = 1 / 500.0
+    stride = max(1, int(round(dt / src_dt)))
+    actual_ds = actual[::stride]
+    expected_ds = expected[::stride]
 
-    try:
-        with open(file_path, mode='r', encoding='utf-8') as csvfile:
-            # DictReader uses the first row as keys for each dictionary
-            reader = csv.DictReader(csvfile)
-            cum_frame_t = 0.0
-            for row in reader:
-                loop_time = float(row["loop_time"])
-                cum_frame_t += loop_time
-                while cum_frame_t > dt:
-                    arm_idx = int(row["arm_idx"])
-                    q_joint = ast.literal_eval(row["actual_q"])
-                    q_joint_gt = ast.literal_eval(row["expected_q"])
-                    q_joints_l.append(q_joint)
-                    q_joints_gt_l.append(q_joint_gt)
-                    cum_frame_t -= dt
-                
-    except FileNotFoundError:
-        print("Error: File not found. Check your path!")
-
-    q_joints_l = np.array(q_joints_l)
-    q_joints_r = np.array(q_joints_r)
-    q_joints_gt_l = np.array(q_joints_gt_l)
-    q_joints_gt_r = np.array(q_joints_gt_r)
-
-    return q_joints_l, q_joints_r, q_joints_gt_l, q_joints_gt_r
+    zeros = np.zeros_like(actual_ds)
+    return actual_ds, zeros, expected_ds, zeros
 
 extension = args.joint_target_file_1.split(".")[-1]
 if extension == "json":
     q_joints_l , q_joints_r, q_joints_gt_l, q_joints_gt_r = read_json(args.joint_target_file_1)
-elif extension == "csv":
-    q_joints_l , q_joints_r, q_joints_gt_l, q_joints_gt_r = read_csv(args.joint_target_file_1)
+elif extension == "npz":
+    q_joints_l , q_joints_r, q_joints_gt_l, q_joints_gt_r = read_npz(args.joint_target_file_1)
 
 
 np.set_printoptions(precision=5, suppress=True)

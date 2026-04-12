@@ -156,7 +156,7 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
 
     # scene
     replicate_physics = bool(np.all([event["mode"] != "prestartup" and event["mode"] != "startup" for event in events.to_dict().values()])) # type: ignore
-    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=4096, env_spacing=4.0, replicate_physics=replicate_physics)
+    scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=4.0, replicate_physics=replicate_physics)
 
     # Action scale
     action_scale = 0.05
