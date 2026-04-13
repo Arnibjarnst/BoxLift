@@ -46,7 +46,8 @@ os.makedirs(log_dir, exist_ok=True)
 _gain = args.gain if args.gain is not None else 100
 _lookahead = args.lookahead if args.lookahead is not None else 0.05
 date_t = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-run_tag = f"{date_t}_gain{_gain}_la{_lookahead}" + (f"_as{action_scale}" if args.action_scale is not None else "")
+robot_name = "real" if args.real_robot else "sim"
+run_tag = f"{date_t}_gain{_gain}_la{_lookahead}_{robot_name}" + (f"_as{action_scale}" if args.action_scale is not None else "")
 
 # ---------------------------
 # Logging Setup
