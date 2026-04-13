@@ -33,6 +33,8 @@ with open(os.path.join(args.run_dir, "params", "env.yaml"), "r") as f:
 
 reference_trajectory_path = env_cfg["trajectory_path"]
 action_scale = args.action_scale if args.action_scale is not None else env_cfg["action_scale"]
+action_mode = env_cfg.get("action_mode", "A")  # default A for backward compat with older runs
+obs_history_steps = int(env_cfg.get("obs_history_steps", 1))
 
 export_dir = os.path.join(args.run_dir, "exported")
 onnx_model_path = os.path.join(export_dir, "policy.onnx")
@@ -75,7 +77,7 @@ logger.addHandler(console_handler)
 # Load model and trajectory
 # ---------------------------
 
-logger.info(f"Run dir: {args.run_dir}, action_scale: {action_scale}, trajectory: {reference_trajectory_path}", extra={"step": -1})
+logger.info(f"Run dir: {args.run_dir}, action_scale: {action_scale}, action_mode: {action_mode}, obs_history_steps: {obs_history_steps}, trajectory: {reference_trajectory_path}", extra={"step": -1})
 logger.info("Loading model", extra={"step": -1})
 # 'CUDAExecutionProvider' uses the GPU; 'CPUExecutionProvider' is the fallback
 session = ort.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
@@ -296,6 +298,10 @@ new_data_event = threading.Event()
 def policy_thread():
     global current_target_q, previous_target_q, current_target_i
     trajectory_step = 0
+    # Observation history buffer: (history_steps, per_step_features). Zero-initialized to
+    # match sim reset behavior.
+    per_step_features = 12 if not dual_arm else 24
+    obs_history = np.zeros((obs_history_steps, per_step_features), dtype=np.float32)
     while True:
         run_policy_event.wait()
         run_policy_event.clear()
@@ -309,19 +315,32 @@ def policy_thread():
             relative_q_r = np.zeros(6)
             relative_qd_l = actual_qd - joint_vel_ref[trajectory_step]
             relative_qd_r = np.zeros(6)
-            obs = np.concatenate((relative_q_l, relative_q_r, relative_qd_l, relative_qd_r, phase))
+            current_features = np.concatenate((relative_q_l, relative_q_r, relative_qd_l, relative_qd_r))
         else:
             relative_q = actual_q - joints[trajectory_step]
             relative_qd = actual_qd - joint_vel_ref[trajectory_step]
-            # feedforward = joints_target[trajectory_step] - joints[trajectory_step]
-            # obs = np.concatenate((relative_q, relative_qd, feedforward, phase))
-            obs = np.concatenate((relative_q, relative_qd, phase))
+            current_features = np.concatenate((relative_q, relative_qd))
 
+        # Shift history and append newest
+        obs_history = np.roll(obs_history, shift=-1, axis=0)
+        obs_history[-1] = current_features
+
+        obs = np.concatenate((obs_history.flatten(), phase))
         obs = obs[None, ...].astype(np.float32)
         output = session.run([output_name], {input_name: obs})[0][0]
 
-        # Option A: residual on trajectory targets (matches get_joint_targets_A)
-        new_joint_targets = joints_target[trajectory_step] + action_scale * output[:6]
+        residual = action_scale * output[:6]
+        if action_mode == "A":
+            new_joint_targets = joints_target[trajectory_step] + residual
+        elif action_mode == "B":
+            new_joint_targets = joints[trajectory_step] + residual
+        elif action_mode == "C":
+            new_joint_targets = actual_q + residual
+        elif action_mode == "D":
+            planner_pd_error = joints_target[trajectory_step] - joints[trajectory_step]
+            new_joint_targets = actual_q + planner_pd_error + residual
+        else:
+            raise ValueError(f"Unknown action_mode: {action_mode!r}")
 
         # Safety: clamp to joint limits, then clamp to be near current position
         new_joint_targets = np.clip(new_joint_targets, joint_limits_lower, joint_limits_upper)
