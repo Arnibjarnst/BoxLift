@@ -32,9 +32,27 @@ with open(os.path.join(args.run_dir, "params", "env.yaml"), "r") as f:
     env_cfg = yaml.unsafe_load(f)
 
 reference_trajectory_path = env_cfg["trajectory_path"]
-action_scale = args.action_scale if args.action_scale is not None else env_cfg["action_scale"]
+action_scale_cfg = args.action_scale if args.action_scale is not None else env_cfg["action_scale"]
+# action_scale can be a scalar or a per-joint list in newer configs.
+action_scale = np.asarray(action_scale_cfg, dtype=np.float32) if isinstance(action_scale_cfg, (list, tuple)) else float(action_scale_cfg)
 action_mode = env_cfg.get("action_mode", "A")  # default A for backward compat with older runs
 obs_history_steps = int(env_cfg.get("obs_history_steps", 1))
+# New observation flags (defaults match legacy runs that predate these features).
+include_object_obs = bool(env_cfg.get("include_object_obs", False))
+# Velocity-in-obs flag: legacy runs implicitly had it on (vel was always part of the
+# obj-obs block); new runs default it off for sim2real. Default True preserves backwards
+# compat with checkpoints from before the flag existed.
+include_obj_vel_obs = bool(env_cfg.get("include_obj_vel_obs", True))
+future_obs_steps = tuple(env_cfg.get("future_obs_steps", ()) or ())
+include_prev_actions = bool(env_cfg.get("include_prev_actions", False))
+include_absolute_obs = bool(env_cfg.get("include_absolute_obs", False))
+enable_phase_slowdown = bool(env_cfg.get("enable_phase_slowdown", False))
+# Phase-slowdown / mode-D curriculum settings. Sentinel <0 on force_alpha disables the
+# override; 1.0 ≈ "training completed warmup" which is what we usually want at deploy.
+dphase_min = float(env_cfg.get("dphase_min", 0.5))
+action_alpha_floor = float(env_cfg.get("action_alpha_floor", 0.1))
+force_alpha = float(env_cfg.get("force_alpha", -1.0))
+eff_alpha = float(force_alpha) if 0.0 <= force_alpha <= 1.0 else 1.0
 
 export_dir = os.path.join(args.run_dir, "exported")
 onnx_model_path = os.path.join(export_dir, "policy.onnx")
@@ -78,7 +96,18 @@ logger.addHandler(console_handler)
 # Load model and trajectory
 # ---------------------------
 
-logger.info(f"Run dir: {args.run_dir}, action_scale: {action_scale}, action_mode: {action_mode}, obs_history_steps: {obs_history_steps}, trajectory: {reference_trajectory_path}", extra={"step": -1})
+logger.info(
+    f"Run dir: {args.run_dir}, action_scale: {action_scale_cfg}, action_mode: {action_mode}, "
+    f"obs_history_steps: {obs_history_steps}, include_object_obs: {include_object_obs}, "
+    f"include_obj_vel_obs: {include_obj_vel_obs}, "
+    f"future_obs_steps: {future_obs_steps}, include_prev_actions: {include_prev_actions}, "
+    f"include_absolute_obs: {include_absolute_obs}, "
+    f"enable_phase_slowdown: {enable_phase_slowdown}, dphase_min: {dphase_min}, "
+    f"eff_alpha: {eff_alpha:.3f} (force_alpha={force_alpha}, "
+    f"action_alpha_floor={action_alpha_floor}), "
+    f"trajectory: {reference_trajectory_path}",
+    extra={"step": -1},
+)
 logger.info("Loading model", extra={"step": -1})
 # 'CUDAExecutionProvider' uses the GPU; 'CPUExecutionProvider' is the fallback
 session = ort.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
@@ -103,6 +132,34 @@ else:
     joints        = traj["joints"]
     joint_vel_ref = traj["joint_vel"]
     joints_target = traj["joints_target"]
+
+# Reference object pose trajectory — needed for future-obs deltas (and sanity).
+obj_poses_ref = traj["obj_poses"] if "obj_poses" in traj.files else None
+if (include_object_obs or future_obs_steps) and obj_poses_ref is None:
+    raise KeyError(
+        "Trajectory file has no 'obj_poses' but the training cfg enables object-obs / future-obs. "
+        "Regenerate the trajectory or retrain without those flags."
+    )
+
+
+def quat_mul_np(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
+    """Hamilton product, wxyz convention (matches isaaclab.utils.math.quat_mul)."""
+    w1, x1, y1, z1 = q1
+    w2, x2, y2, z2 = q2
+    return np.array([
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+    ], dtype=np.float32)
+
+
+def quat_inv_np(q: np.ndarray) -> np.ndarray:
+    """Conjugate for unit quaternion (wxyz)."""
+    return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
+
+
+IDENTITY_QUAT_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
 logger.info(
     f"Trajectory loaded ({'dual' if dual_arm else 'single'} arm). Total frames: {len(joints)}",
@@ -298,48 +355,133 @@ new_data_event = threading.Event()
 
 def policy_thread():
     global current_target_q, previous_target_q, current_target_i
-    trajectory_step = 0
+    # Float phase to support enable_phase_slowdown. Indexed via floor() into trajectory
+    # arrays. For legacy (no-slowdown) policies dphase=1 each step → phase increments by 1
+    # → indexing matches the old integer trajectory_step behavior exactly.
+    phase = 0.0
+    # Per-step feature dim must match training: joints (12 or 24 for dual-arm)
+    # [+ 13 for object state (rel_pos 3 + rel_quat 4 + rel_vel 6) if include_object_obs]
+    # [+ same again (absolute versions) if include_absolute_obs].
+    if dual_arm:
+        per_step_features = 24
+        if include_object_obs:
+            raise NotImplementedError("include_object_obs with dual-arm is not supported in the real-robot script yet.")
+        if include_absolute_obs:
+            raise NotImplementedError("include_absolute_obs with dual-arm is not supported in the real-robot script yet.")
+    else:
+        # 12 = relative joint pos (6) + relative joint vel (6); always present.
+        # +7 (pos+quat) if include_object_obs, +6 more for vel if include_obj_vel_obs.
+        obj_block = (7 + (6 if include_obj_vel_obs else 0)) if include_object_obs else 0
+        per_step_features = 12 + obj_block
+        if include_absolute_obs:
+            per_step_features *= 2
     # Observation history buffer: (history_steps, per_step_features). Zero-initialized to
     # match sim reset behavior.
-    per_step_features = 12 if not dual_arm else 24
     obs_history = np.zeros((obs_history_steps, per_step_features), dtype=np.float32)
+    # Previous raw policy action (pre-scale), fed back into obs when include_prev_actions=True.
+    prev_action = np.zeros(6, dtype=np.float32)
+    max_traj_idx = len(joints) - 1
+    max_obj_idx = (len(obj_poses_ref) - 1) if obj_poses_ref is not None else None
     while True:
         run_policy_event.wait()
         run_policy_event.clear()
 
         actual_q = np.array(rtde_r.getActualQ())
         actual_qd = np.array(rtde_r.getActualQd())
-        phase = np.array([trajectory_step / (len(joints) - 1)])
+        traj_idx = min(int(np.floor(phase)), max_traj_idx)
+        phase_obs = np.array([phase / max_traj_idx])
 
         if dual_arm:
-            relative_q_l = actual_q - joints[trajectory_step]
+            relative_q_l = actual_q - joints[traj_idx]
             relative_q_r = np.zeros(6)
-            relative_qd_l = actual_qd - joint_vel_ref[trajectory_step]
+            relative_qd_l = actual_qd - joint_vel_ref[traj_idx]
             relative_qd_r = np.zeros(6)
             current_features = np.concatenate((relative_q_l, relative_q_r, relative_qd_l, relative_qd_r))
         else:
-            relative_q = actual_q - joints[trajectory_step]
-            relative_qd = actual_qd - joint_vel_ref[trajectory_step]
-            current_features = np.concatenate((relative_q, relative_qd))
+            relative_q = actual_q - joints[traj_idx]
+            relative_qd = actual_qd - joint_vel_ref[traj_idx]
+            feature_parts = [relative_q, relative_qd]
+            if include_object_obs:
+                # No object tracker on the real robot: assume actual == reference, so all
+                # relative quantities are identity/zero. Same trick as "right-arm zeroed".
+                feature_parts.append(np.zeros(3, dtype=np.float32))             # relative obj pos
+                feature_parts.append(IDENTITY_QUAT_WXYZ)                        # relative obj quat
+                if include_obj_vel_obs:
+                    feature_parts.append(np.zeros(6, dtype=np.float32))         # relative obj vel
+            if include_absolute_obs:
+                # Absolute joint state is directly observable from the robot.
+                feature_parts.append(actual_q.astype(np.float32))
+                feature_parts.append(actual_qd.astype(np.float32))
+                if include_object_obs:
+                    # No object tracker: use the reference pose/vel at the current phase as our
+                    # best estimate of the absolute object state (consistent with "actual==ref").
+                    obj_idx = min(traj_idx, max_obj_idx)
+                    feature_parts.append(obj_poses_ref[obj_idx, :3].astype(np.float32))
+                    feature_parts.append(obj_poses_ref[obj_idx, 3:].astype(np.float32))
+                    if include_obj_vel_obs:
+                        obj_vel_ref = traj["obj_vel"][obj_idx] if "obj_vel" in traj.files else np.zeros(6, dtype=np.float32)
+                        feature_parts.append(obj_vel_ref.astype(np.float32))
+            current_features = np.concatenate(feature_parts).astype(np.float32)
 
         # Shift history and append newest
         obs_history = np.roll(obs_history, shift=-1, axis=0)
         obs_history[-1] = current_features
 
-        obs = np.concatenate((obs_history.flatten(), phase))
-        obs = obs[None, ...].astype(np.float32)
+        obs_parts = [obs_history.flatten().astype(np.float32), phase_obs.astype(np.float32)]
+
+        # Future reference obj pose look-ahead (pos delta + world-frame quat delta,
+        # plus absolute future pos/quat if include_absolute_obs).
+        if future_obs_steps:
+            cur_idx = min(traj_idx, max_obj_idx)
+            cur_pos = obj_poses_ref[cur_idx, :3]
+            cur_quat = obj_poses_ref[cur_idx, 3:]
+            inv_cur_quat = quat_inv_np(cur_quat)
+            futures = []
+            for k in future_obs_steps:
+                fut_idx = min(traj_idx + int(k), max_obj_idx)
+                fut_pos = obj_poses_ref[fut_idx, :3]
+                fut_quat = obj_poses_ref[fut_idx, 3:]
+                futures.append(fut_pos - cur_pos)
+                futures.append(quat_mul_np(fut_quat, inv_cur_quat))
+                if include_absolute_obs:
+                    futures.append(fut_pos)
+                    futures.append(fut_quat)
+            obs_parts.append(np.concatenate(futures).astype(np.float32))
+
+        # Previous raw residual action.
+        if include_prev_actions:
+            obs_parts.append(prev_action)
+
+        obs = np.concatenate(obs_parts)[None, ...].astype(np.float32)
         output = session.run([output_name], {input_name: obs})[0][0]
 
-        residual = action_scale * output[:6]
+        raw_action = output[:6].astype(np.float32)
+        # Phase-slowdown action: when enabled the policy emits a 7th dim controlling dphase.
+        # dphase = (1 + (1 - dphase_min) * tanh(action[6])).clamp(dphase_min, 1).
+        if enable_phase_slowdown and len(output) >= 7:
+            dphase = 1.0 + (1.0 - dphase_min) * float(np.tanh(output[6]))
+            dphase = float(np.clip(dphase, dphase_min, 1.0))
+        else:
+            dphase = 1.0
+
+        # Mode D applies the curriculum α to blend planner feedforward with the residual.
+        # eff_alpha is read from saved env.yaml (force_alpha if set, else 1.0). At α=1 mode D
+        # collapses to mode C. For modes A/B/C the formulas are α-independent.
         if action_mode == "A":
-            new_joint_targets = joints_target[trajectory_step] + residual
+            new_joint_targets = joints_target[traj_idx] + action_scale * raw_action
         elif action_mode == "B":
-            new_joint_targets = joints[trajectory_step] + residual
+            new_joint_targets = joints[traj_idx] + action_scale * raw_action
         elif action_mode == "C":
-            new_joint_targets = actual_q + residual
+            new_joint_targets = actual_q + action_scale * raw_action
         elif action_mode == "D":
-            planner_pd_error = joints_target[trajectory_step] - joints[trajectory_step]
-            new_joint_targets = actual_q + planner_pd_error + residual
+            eps = action_alpha_floor
+            action_gain = eff_alpha + eps * (1.0 - eff_alpha)
+            planner_pd_error = joints_target[traj_idx] - joints[traj_idx]
+            new_joint_targets = (
+                actual_q
+                + (1.0 - eff_alpha) * planner_pd_error
+                + action_gain * action_scale * raw_action
+            )
         else:
             raise ValueError(f"Unknown action_mode: {action_mode!r}")
 
@@ -350,10 +492,13 @@ def policy_thread():
         with data_lock:
             previous_target_q = current_target_q
             current_target_q = new_joint_targets
-            current_target_i = trajectory_step
+            current_target_i = traj_idx
             new_data_event.set()
 
-        trajectory_step += 1
+        prev_action = raw_action
+        # Advance phase by dphase (≤ 1; deepens slowdown when policy commands a pause).
+        # Clamp at max_traj_idx so we don't index past the end of the trajectory.
+        phase = min(phase + dphase, float(max_traj_idx))
 
 
 def control_thread():
@@ -373,12 +518,9 @@ def control_thread():
                 alpha = 1.0 / policy_decimation
 
             with data_lock:
-                # TODO: try interp_q = (1 - alpha) * interp_q + alpha * current_target_q
-                # It is smoother but might be less accurate
                 interp_q = (1 - alpha) * previous_target_q + alpha * current_target_q
 
                 # 4. Command the robot
-                # TODO: Change to torque
                 rtde_c.servoJ(
                     interp_q,
                     velocity,

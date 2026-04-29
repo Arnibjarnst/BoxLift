@@ -56,6 +56,7 @@ simulation_app = app_launcher.app
 import gymnasium as gym
 import json
 import os
+import re
 import time
 import torch
 import yaml
@@ -115,14 +116,38 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     log_dir = os.path.dirname(resume_path)
 
-    # Load trajectory path from training config, allow CLI override
+    # Load saved training config so obs/action layout matches the checkpoint
+    with open(os.path.join(log_dir, "params", "env.yaml"), "r") as f:
+        saved_env_cfg = yaml.unsafe_load(f)
+
     if args_cli.trajectory_path is not None:
         env_cfg.trajectory_path = args_cli.trajectory_path
     else:
-        with open(os.path.join(log_dir, "params", "env.yaml"), "r") as f:
-            saved_env_cfg = yaml.unsafe_load(f)
         env_cfg.trajectory_path = saved_env_cfg["trajectory_path"]
     print(f"[INFO] Using trajectory: {env_cfg.trajectory_path}")
+
+    # Restore fields that affect obs/action layout from the trained run
+    if "obs_history_steps" in saved_env_cfg:
+        env_cfg.obs_history_steps = int(saved_env_cfg["obs_history_steps"])
+    if "action_mode" in saved_env_cfg:
+        env_cfg.action_mode = saved_env_cfg["action_mode"]
+    if "observation_space" in saved_env_cfg:
+        env_cfg.observation_space = int(saved_env_cfg["observation_space"])
+    print(f"[INFO] obs_history_steps={getattr(env_cfg, 'obs_history_steps', None)}, "
+          f"action_mode={getattr(env_cfg, 'action_mode', None)}, "
+          f"observation_space={env_cfg.observation_space}")
+
+    # Pin curriculum α to the value the policy was trained at (see play.py for rationale).
+    m = re.search(r"model_(\d+)\.pt", os.path.basename(resume_path))
+    ckpt_iter = int(m.group(1)) if m else 0
+    num_steps_per_env = int(getattr(agent_cfg, "num_steps_per_env", 24))
+    warmup = int(saved_env_cfg.get("alpha_warmup_steps", 0) or 0)
+    if warmup > 0:
+        env_cfg.force_alpha = min(1.0, ckpt_iter * num_steps_per_env / warmup)
+    else:
+        env_cfg.force_alpha = 1.0
+    print(f"[INFO] Pinning curriculum α = {env_cfg.force_alpha:.3f} "
+          f"(ckpt_iter={ckpt_iter}, num_steps_per_env={num_steps_per_env}, warmup={warmup})")
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
@@ -189,17 +214,54 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     direct_env = env.env.unwrapped
     direct_env._reset_idx(None, 0)
-    get_joint_pos = direct_env._get_joint_pos
-    get_joint_targets = direct_env.get_joint_targets
-    get_joint_torques = direct_env.get_joint_torques
+
+    # Detect single-arm (boxpush) vs dual-arm (boxlift) layout
+    dual_arm = hasattr(direct_env, "ur5e_l") and hasattr(direct_env, "ur5e_r")
+
+    def _flatten(x):
+        """Concatenate tuples of per-arm tensors into a flat (12,) vector; pass through (6,) tensors."""
+        if isinstance(x, (tuple, list)):
+            return torch.cat([t[0] for t in x]).cpu().tolist()
+        return x[0].cpu().tolist()
+
+    def _joint_positions():
+        if dual_arm:
+            return torch.cat((direct_env.ur5e_l.data.joint_pos[0], direct_env.ur5e_r.data.joint_pos[0])).cpu().tolist()
+        return direct_env.ur5e.data.joint_pos[0].cpu().tolist()
+
+    def _applied_torques():
+        if dual_arm:
+            return torch.cat((direct_env.ur5e_l.data.applied_torque[0], direct_env.ur5e_r.data.applied_torque[0])).cpu().tolist()
+        return direct_env.ur5e.data.applied_torque[0].cpu().tolist()
 
     output = {
-        "joint_targets_log": [],
-        "joint_positions_log": [get_joint_pos(False)[0].tolist()],
-        "joint_torques_log": [],
-        "arm_l_pose": direct_env.arm_l_pose.tolist(),
-        "arm_r_pose": direct_env.arm_r_pose.tolist(),
+        "joint_targets": [],
+        "joint_positions": [_joint_positions()],
+        "joint_torques": [],
+        "rewards": [],
+        "extras": [],
+        "trajectory_path": str(env_cfg.trajectory_path),
+        "action_scale": float(getattr(env_cfg, "action_scale", 0.0)),
+        "action_mode": getattr(env_cfg, "action_mode", None),
+        "obs_history_steps": int(getattr(env_cfg, "obs_history_steps", 1)),
+        "dual_arm": dual_arm,
     }
+
+    def _to_py(v):
+        """Convert a torch tensor / numpy scalar / python scalar into a json-safe value."""
+        if hasattr(v, "detach"):
+            v = v.detach()
+        if hasattr(v, "cpu"):
+            v = v.cpu()
+        if hasattr(v, "tolist"):
+            return v.tolist()
+        return v
+
+    if dual_arm:
+        output["arm_l_pose"] = direct_env.arm_l_pose.cpu().tolist()
+        output["arm_r_pose"] = direct_env.arm_r_pose.cpu().tolist()
+    else:
+        output["arm_pose"] = direct_env.arm_pose.cpu().tolist()
 
     # reset environment
     obs = env.get_observations()
@@ -209,45 +271,42 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         start_time = time.time()
         # run everything in inference mode
         with torch.inference_mode():
-            # agent stepping
             actions = policy(obs)
 
-            joint_target_l, joint_target_r = get_joint_targets()
-            joint_targets = torch.concatenate((joint_target_l[0], joint_target_r[0]))
-            output["joint_targets_log"].append(joint_targets.tolist())
+            joint_targets = _flatten(direct_env.get_joint_targets())
+            output["joint_targets"].append(joint_targets)
 
-            # env stepping
-            obs, _, dones, _ = env.step(actions)
+            obs, rewards, dones, extras = env.step(actions)
 
-            joint_pos: torch.Tensor = get_joint_pos(False)
-            output["joint_positions_log"].append(joint_pos[0].tolist())
+            output["joint_positions"].append(_joint_positions())
+            output["joint_torques"].append(_applied_torques())
+            output["rewards"].append(float(rewards[0].item()))
 
-            joint_torque_l, joint_torque_r = get_joint_torques()
-            joint_torques = torch.concatenate((joint_torque_l[0], joint_torque_r[0]))
-            output["joint_torques_log"].append(joint_torques.tolist())
+            # Flatten extras["log"] (dict of scalar tensors) into a json-serializable dict
+            log_entry = {}
+            raw_log = extras.get("log", {}) if isinstance(extras, dict) else {}
+            for k, v in raw_log.items():
+                log_entry[k] = _to_py(v)
+            output["extras"].append(log_entry)
 
             if torch.any(dones):
                 break
 
         if args_cli.video:
             timestep += 1
-            # Exit the play loop after recording one video
             if timestep == args_cli.video_length:
                 break
 
-        # time delay for real-time evaluation
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
-    joint_targets_path = os.path.join(log_dir, "rollout", "output.json")
-    joint_targets_dir = os.path.dirname(joint_targets_path)
-
-    os.makedirs(joint_targets_dir, exist_ok=True)
-
-    with open(joint_targets_path, 'w') as fp:
+    rollout_path = os.path.join(log_dir, "rollout", "output.json")
+    os.makedirs(os.path.dirname(rollout_path), exist_ok=True)
+    with open(rollout_path, 'w') as fp:
         json.dump(output, fp, indent=4)
-    # close the simulator
+    print(f"[INFO] Rollout saved to: {rollout_path}")
+
     env.close()
 
 

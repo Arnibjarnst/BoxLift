@@ -18,7 +18,7 @@ def read_json(file_path):
     with open(file_path) as f:
         data = json.load(f)
 
-    q_joints = np.array(data["joint_positions_log"])
+    q_joints = np.array(data["joint_positions"])
 
     return q_joints[:, :6], q_joints[:, 6:], np.zeros_like(q_joints[:, :6]), np.zeros_like(q_joints[:, :6])
 

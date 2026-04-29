@@ -48,8 +48,7 @@ class BoxliftEnv(DirectRLEnv):
         self.joints_target_r    = torch.from_numpy(traj["joints_target_r"]).float().to(self.device)
         self.EE_poses_l         = torch.from_numpy(traj["EE_poses_l"]).float().to(self.device)
         self.EE_poses_r         = torch.from_numpy(traj["EE_poses_r"]).float().to(self.device)
-        # self.dt                 = float(traj["dt"])
-        self.dt = 0.02
+        self.dt                 = float(traj["dt"])
 
         # Set scene params from trajectory
         if "object_dims" in traj:

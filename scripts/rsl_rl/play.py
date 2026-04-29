@@ -56,6 +56,7 @@ simulation_app = app_launcher.app
 
 import gymnasium as gym
 import os
+import re
 import time
 import torch
 import yaml
@@ -114,14 +115,41 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     log_dir = os.path.dirname(resume_path)
 
-    # Load trajectory path from training config, allow CLI override
+    # Load saved training config so obs/action layout matches the checkpoint
+    with open(os.path.join(log_dir, "params", "env.yaml"), "r") as f:
+        saved_env_cfg = yaml.unsafe_load(f)
+
     if args_cli.trajectory_path is not None:
         env_cfg.trajectory_path = args_cli.trajectory_path
     else:
-        with open(os.path.join(log_dir, "params", "env.yaml"), "r") as f:
-            saved_env_cfg = yaml.unsafe_load(f)
         env_cfg.trajectory_path = saved_env_cfg["trajectory_path"]
     print(f"[INFO] Using trajectory: {env_cfg.trajectory_path}")
+
+    # Restore fields that affect obs/action layout from the trained run
+    if "obs_history_steps" in saved_env_cfg:
+        env_cfg.obs_history_steps = int(saved_env_cfg["obs_history_steps"])
+    if "action_mode" in saved_env_cfg:
+        env_cfg.action_mode = saved_env_cfg["action_mode"]
+    if "observation_space" in saved_env_cfg:
+        env_cfg.observation_space = int(saved_env_cfg["observation_space"])
+    print(f"[INFO] obs_history_steps={getattr(env_cfg, 'obs_history_steps', None)}, "
+          f"action_mode={getattr(env_cfg, 'action_mode', None)}, "
+          f"observation_space={env_cfg.observation_space}")
+
+    # Pin curriculum α to the value the policy was trained at. The frozen policy was only
+    # ever rolled out at α(ckpt_iter), and during eval the env's common_step_counter resets
+    # to 0 — without this override, _curriculum_alpha ramps from 0 and the action blend /
+    # reward shape don't match what the policy expects.
+    m = re.search(r"model_(\d+)\.pt", os.path.basename(resume_path))
+    ckpt_iter = int(m.group(1)) if m else 0
+    num_steps_per_env = int(getattr(agent_cfg, "num_steps_per_env", 24))
+    warmup = int(saved_env_cfg.get("alpha_warmup_steps", 0) or 0)
+    if warmup > 0:
+        env_cfg.force_alpha = min(1.0, ckpt_iter * num_steps_per_env / warmup)
+    else:
+        env_cfg.force_alpha = 1.0
+    print(f"[INFO] Pinning curriculum α = {env_cfg.force_alpha:.3f} "
+          f"(ckpt_iter={ckpt_iter}, num_steps_per_env={num_steps_per_env}, warmup={warmup})")
 
     # set the log directory for the environment (works for all environment types)
     env_cfg.log_dir = log_dir
