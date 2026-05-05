@@ -10,9 +10,15 @@ import time
 parser = argparse.ArgumentParser()
 parser.add_argument("joint_target_file_1", type=str)
 parser.add_argument("--hz", type=int, default=50)
+parser.add_argument("--box_dims", type=str, default="0.357,0.259,0.277",
+                    help="Box visual dimensions Lx,Ly,Lz in meters.")
+parser.add_argument("--show_ref", action="store_true",
+                    help="Also spawn a second (green) arm following the reference trajectory.")
 args = parser.parse_args()
 
 dt = 1 / args.hz
+box_dims = tuple(float(x) for x in args.box_dims.split(","))
+assert len(box_dims) == 3, "--box_dims must be 'Lx,Ly,Lz'"
 
 def read_json(file_path):
     with open(file_path) as f:
@@ -20,7 +26,11 @@ def read_json(file_path):
 
     q_joints = np.array(data["joint_positions"])
 
-    return q_joints[:, :6], q_joints[:, 6:], np.zeros_like(q_joints[:, :6]), np.zeros_like(q_joints[:, :6])
+    return (
+        q_joints[:, :6], q_joints[:, 6:],
+        np.zeros_like(q_joints[:, :6]), np.zeros_like(q_joints[:, :6]),
+        None, None,
+    )
 
 def read_npz(file_path):
     # Downsample 500Hz log to args.hz without interpolation
@@ -34,14 +44,18 @@ def read_npz(file_path):
     actual_ds = actual[::stride]
     expected_ds = expected[::stride]
 
+    # Optional box pose stream (added to npz by ur_rtde_real_time.py).
+    obj_pos_ds = d["actual_obj_pos"][::stride] if "actual_obj_pos" in d.files else None
+    obj_quat_ds = d["actual_obj_quat"][::stride] if "actual_obj_quat" in d.files else None
+
     zeros = np.zeros_like(actual_ds)
-    return actual_ds, zeros, expected_ds, zeros
+    return actual_ds, zeros, expected_ds, zeros, obj_pos_ds, obj_quat_ds
 
 extension = args.joint_target_file_1.split(".")[-1]
 if extension == "json":
-    q_joints_l , q_joints_r, q_joints_gt_l, q_joints_gt_r = read_json(args.joint_target_file_1)
+    q_joints_l, q_joints_r, q_joints_gt_l, q_joints_gt_r, obj_pos, obj_quat = read_json(args.joint_target_file_1)
 elif extension == "npz":
-    q_joints_l , q_joints_r, q_joints_gt_l, q_joints_gt_r = read_npz(args.joint_target_file_1)
+    q_joints_l, q_joints_r, q_joints_gt_l, q_joints_gt_r, obj_pos, obj_quat = read_npz(args.joint_target_file_1)
 
 
 np.set_printoptions(precision=5, suppress=True)
@@ -62,7 +76,7 @@ world = World()
 ground_prim_path = "/World/GroundPlane"
 world.scene.add_default_ground_plane(prim_path=ground_prim_path, z_position=0.00)
 
-usd_path = "./robots/ur5e_sphere.usd"
+usd_path = "./robots/ur5e.usd"
 
 prim_path_1 = "/World/envs/env_0/ur5_1"
 add_reference_to_stage(usd_path, prim_path_1)
@@ -75,9 +89,25 @@ robot_contact_sensors = [
 # Create SingleArticulation wrapper (automatically creates articulation controller)
 arm_1 = SingleArticulation(prim_path=prim_path_1, name="ur5_1")
 
+# Always spawn the second arm — Isaac Sim's articulation discovery seems to need both
+# present for arm_1.initialize() to succeed. When --show_ref is off we just hide its
+# meshes (further down) so it isn't visible.
 prim_path_2 = "/World/envs/env_0/ur5_2"
 add_reference_to_stage(usd_path, prim_path_2)
 arm_2 = SingleArticulation(prim_path=prim_path_2, name="ur5_2")
+
+# Optional box visual driven by recorded pose-estimation data (npz only).
+box_visual = None
+if obj_pos is not None and obj_quat is not None and not np.all(np.isnan(obj_pos)):
+    from isaacsim.core.api.objects import VisualCuboid
+    box_visual = VisualCuboid(
+        prim_path="/World/box_visual",
+        name="box_visual",
+        position=np.array([0.0, 0.0, 0.0]),
+        orientation=np.array([1.0, 0.0, 0.0, 0.0]),  # wxyz
+        scale=np.array(box_dims, dtype=float),
+        color=np.array([0.7, 0.7, 0.7]),
+    )
 
 # Disable collisions between the robots
 arm_1_group_path = "/World/Arm1Group"
@@ -120,6 +150,11 @@ for prim in Usd.PrimRange(arm_2_prim):
             bindingStrength=UsdShade.Tokens.strongerThanDescendants
         )
 
+# When the user only wants the real trajectory, hide the reference arm's meshes.
+# The articulation still exists in physics (so arm_1.initialize() works), but isn't drawn.
+if not args.show_ref:
+    UsdGeom.Imageable(arm_2_prim).MakeInvisible()
+
 
 
 def initialize(robot):
@@ -128,8 +163,6 @@ def initialize(robot):
 
     arm_1.initialize()
     arm_2.initialize()
-
-    # arm_2.set_world_pose(position=[1,0,0])
 
     init_q = q_joints_l[0] if robot == 0 else q_joints_r[0]
     arm_1.set_joint_positions(init_q)
@@ -166,7 +199,7 @@ N = len(q_joints_l)
 
 while simulation_app.is_running():
     world.step(render=True)
-    
+
     i = min(int(world.current_time // dt), N-1)
 
     q_joints_1 = q_joints_l[i] if robot == 0 else q_joints_r[i]
@@ -174,6 +207,10 @@ while simulation_app.is_running():
 
     arm_1.set_joint_positions(q_joints_1)
     arm_2.set_joint_positions(q_joints_2)
+
+    # Drive the box visual from recorded pose, skipping frames where pose was missing.
+    if box_visual is not None and not np.isnan(obj_pos[i]).any():
+        box_visual.set_world_pose(position=obj_pos[i], orientation=obj_quat[i])
 
     contact_readings = [sensor.get_current_frame() for sensor in robot_contact_sensors]
     in_contact = np.any([r["in_contact"] and r["force"] > 0.0 for r in contact_readings])

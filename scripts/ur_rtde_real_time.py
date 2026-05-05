@@ -1,7 +1,9 @@
 import argparse
 import os
+import subprocess
 import sys
 from datetime import datetime
+from pathlib import Path
 import json
 import logging
 import time
@@ -13,6 +15,31 @@ import onnxruntime as ort
 
 from rtde_control import RTDEControlInterface as RTDEControl
 from rtde_receive import RTDEReceiveInterface as RTDEReceive
+
+# Make tag_pose_estimation importable regardless of pip-install state.
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_TAG_POSE_DIR = _REPO_ROOT / "tag_pose_estimation"
+sys.path.insert(0, str(_TAG_POSE_DIR))
+from tag_pose_estimation.board_pose_listener import BoardPoseListener  # noqa: E402
+
+# ---------------------------
+# Pose-estimation streaming (hardcoded for now; promote to flag once we
+# support multiple objects).
+# ---------------------------
+ENABLE_POSE_ESTIMATION = True
+POSE_ESTIMATION_SCRIPT = _TAG_POSE_DIR / "scripts" / "run_pose_estimation.py"
+# Path is relative to _TAG_POSE_DIR (which we set as the subprocess cwd).
+POSE_ESTIMATION_CONFIG = (
+    "config/pose_estimation_configs/bigbox_pose_estimation_config.json"
+)
+POSE_ESTIMATION_PORT = 5555
+BOX_BOARD_ID = "0"
+POSE_FIRST_POSE_TIMEOUT_S = 30.0
+
+# Fixed transform from the pose-estimation world frame into the robot's frame.
+# The policy was trained with the robot base at (0,0,0), so we shift box-pose readings
+# by this translation. Rotation is identity, so quaternions pass through unchanged.
+WORLD_TO_ROBOT_TRANSLATION = np.array([0.02, 0.508, 0.018], dtype=np.float32)
 
 
 # ---------------------------
@@ -133,13 +160,9 @@ else:
     joint_vel_ref = traj["joint_vel"]
     joints_target = traj["joints_target"]
 
-# Reference object pose trajectory — needed for future-obs deltas (and sanity).
-obj_poses_ref = traj["obj_poses"] if "obj_poses" in traj.files else None
-if (include_object_obs or future_obs_steps) and obj_poses_ref is None:
-    raise KeyError(
-        "Trajectory file has no 'obj_poses' but the training cfg enables object-obs / future-obs. "
-        "Regenerate the trajectory or retrain without those flags."
-    )
+# Reference object pose trajectory. Assumed to always be present and the same length as
+# `joints` (i.e. one entry per trajectory step).
+obj_poses_ref = traj["obj_poses"]
 
 
 def quat_mul_np(q1: np.ndarray, q2: np.ndarray) -> np.ndarray:
@@ -159,12 +182,74 @@ def quat_inv_np(q: np.ndarray) -> np.ndarray:
     return np.array([q[0], -q[1], -q[2], -q[3]], dtype=np.float32)
 
 
+def interp_np(traj: np.ndarray, phase: float) -> np.ndarray:
+    """Linear interpolation along the trajectory time axis (matches env._interp)."""
+    T = traj.shape[0]
+    p = float(np.clip(phase, 0.0, T - 1 - 1e-6))
+    i0 = int(np.floor(p))
+    i1 = min(i0 + 1, T - 1)
+    a = p - i0
+    return ((1.0 - a) * traj[i0] + a * traj[i1]).astype(np.float32)
+
+
+def nlerp_np(traj_quat: np.ndarray, phase: float) -> np.ndarray:
+    """Normalized lerp for unit quaternions (wxyz, hemisphere-corrected; matches env._nlerp)."""
+    T = traj_quat.shape[0]
+    p = float(np.clip(phase, 0.0, T - 1 - 1e-6))
+    i0 = int(np.floor(p))
+    i1 = min(i0 + 1, T - 1)
+    a = p - i0
+    q0 = traj_quat[i0].astype(np.float32)
+    q1 = traj_quat[i1].astype(np.float32)
+    if float((q0 * q1).sum()) < 0.0:
+        q1 = -q1
+    q = (1.0 - a) * q0 + a * q1
+    return (q / max(float(np.linalg.norm(q)), 1e-8)).astype(np.float32)
+
+
 IDENTITY_QUAT_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
 logger.info(
     f"Trajectory loaded ({'dual' if dual_arm else 'single'} arm). Total frames: {len(joints)}",
     extra={"step": -1}
 )
+
+
+# ---------------------------
+# Launch pose estimation subprocess + listener
+# ---------------------------
+pose_proc = None
+pose_listener = None
+if ENABLE_POSE_ESTIMATION:
+    logger.info(
+        f"Launching pose estimation subprocess: {POSE_ESTIMATION_SCRIPT} "
+        f"--config {POSE_ESTIMATION_CONFIG} (cwd={_TAG_POSE_DIR})",
+        extra={"step": -1},
+    )
+    _pose_env = os.environ.copy()
+    _pose_env["PYTHONPATH"] = (
+        str(_TAG_POSE_DIR) + os.pathsep + _pose_env.get("PYTHONPATH", "")
+    ).rstrip(os.pathsep)
+    pose_proc = subprocess.Popen(
+        [
+            sys.executable,
+            str(POSE_ESTIMATION_SCRIPT),
+            "--config",
+            POSE_ESTIMATION_CONFIG,
+        ],
+        cwd=str(_TAG_POSE_DIR),
+        env=_pose_env,
+        stdout=subprocess.DEVNULL,
+    )
+    pose_listener = BoardPoseListener(
+        box_pose_socket_address=f"tcp://localhost:{POSE_ESTIMATION_PORT}",
+        update_rate=0.01,
+    )
+    if not pose_listener.start():
+        logger.error("Failed to start BoardPoseListener", extra={"step": -1})
+        pose_proc.terminate()
+        pose_proc = None
+        pose_listener = None
 
 
 # ---------------------------
@@ -192,7 +277,8 @@ logger.info(f"Connecting to robot at {robot_ip}", extra={"step": -1})
 rtde_frequency = 500
 dt = 1 / rtde_frequency
 policy_decimation = 10
-max_steps = (len(joints) - 1) * policy_decimation
+max_steps = (len(joints) - 2) * policy_decimation
+max_wallclock_steps = max_steps * 2
 
 rtde_r = RTDEReceive(robot_ip, rtde_frequency)
 print("RTDE_r connected successfully")
@@ -214,32 +300,65 @@ np.set_printoptions(suppress=True, precision=8)
 # Per-timestep tracking data for analysis
 tracking_log = []  # list of (step, actual_q, expected_q, target_q, tracking_error)
 
-def log(i, target_q):
+
+def save_tracking_npz():
+    """Snapshot tracking_log and write the .npz. Safe to call multiple times — the
+    write is idempotent (overwrite). Used by both the normal-exit path and the
+    KeyboardInterrupt handler in main."""
+    snapshot = list(tracking_log)  # shallow snapshot in case threads still append
+    if not snapshot:
+        return
+    tracking_npz_path = os.path.join(log_dir, f"{run_tag}.npz")
+    np.savez(
+        tracking_npz_path,
+        steps=np.array([d["step"] for d in snapshot]),
+        phase=np.array([d["phase"] for d in snapshot]),
+        actual_q=np.array([d["actual_q"] for d in snapshot]),
+        expected_q=np.array([d["expected_q"] for d in snapshot]),
+        target_q=np.array([d["target_q"] for d in snapshot]),
+        actual_obj_pos=np.array([d["actual_obj_pos"] for d in snapshot]),
+        actual_obj_quat=np.array([d["actual_obj_quat"] for d in snapshot]),
+        gain=gain,
+        lookahead_time=lookahead_time,
+        action_scale=action_scale,
+    )
+    logger.info(f"Tracking data saved to {tracking_npz_path} ({len(snapshot)} steps)",
+                extra={"step": -1})
+
+def log(i, target_q, phase):
     actual_q = np.array(rtde_r.getActualQ())
 
-    if i < 0:
-        expected_q = joints[0]
-    else:
-        expected_i = i // policy_decimation
-        if expected_i == len(joints) - 1:
-            expected_q = joints[expected_i]
-        else:
-            expected_alpha = i / policy_decimation - expected_i
-            print(expected_i, expected_alpha)
-            expected_q = (1 - expected_alpha) * joints[expected_i] + expected_alpha * joints[expected_i+1]
+    # Reference is the trajectory interpolated at the exact phase the policy thread
+    # produced for this servo tick (control thread linearly blends previous→current).
+    expected_q = interp_np(joints, phase)
 
     tracking_error = np.linalg.norm(actual_q - expected_q)
+
+    # Latest estimated box pose from the pose-estimation stream, shifted into the robot
+    # frame. NaN-filled when the listener isn't running or hasn't received a pose yet.
+    box_pose = pose_listener.get_pose(BOX_BOARD_ID) if pose_listener is not None else None
+    if box_pose is None:
+        actual_obj_pos = np.full(3, np.nan, dtype=np.float32)
+        actual_obj_quat = np.full(4, np.nan, dtype=np.float32)
+    else:
+        actual_obj_pos = box_pose[:3].astype(np.float32) + WORLD_TO_ROBOT_TRANSLATION
+        actual_obj_quat = box_pose[3:].astype(np.float32)
 
     if i >= 0:
         tracking_log.append({
             "step": i,
+            "phase": float(phase),
             "actual_q": actual_q.copy(),
             "expected_q": expected_q.copy(),
             "target_q": np.array(target_q).copy(),
+            "actual_obj_pos": actual_obj_pos.copy(),
+            "actual_obj_quat": actual_obj_quat.copy(),
         })
 
     logger.info(
-        f"Tracking error {tracking_error:.6f}. Actual: {actual_q}. Expected: {expected_q}. Target: {target_q}",
+        f"phase={phase:.4f}. Tracking error {tracking_error:.6f}. "
+        f"Actual: {actual_q}. Expected: {expected_q}. Target: {target_q}. "
+        f"obj_pos={actual_obj_pos}, obj_quat_wxyz={actual_obj_quat}",
         extra={"step": i},
     )
 
@@ -292,8 +411,6 @@ gain = _gain
 # Safety limits
 # ---------------------------
 
-# Max allowed deviation of command from current position (rad)
-max_target_delta = 0.5
 # Max allowed tracking error before stopping (rad)
 max_tracking_error = 10.0
 # Max allowed joint velocity before stopping (rad/s)
@@ -325,7 +442,7 @@ try:
     last_time = time.perf_counter()
 
     while rtde_c.isSteady() == False:
-        log(-1, joints[0])
+        log(-1, joints[0], 0.0)
 
         # No need to be accurate
         time.sleep(dt)
@@ -334,7 +451,6 @@ try:
         f"moveJ finished to initial position {joints[0]}",
         extra={"step": -1},
     )
-    print(np.array(rtde_r.getActualQ()))
 except KeyboardInterrupt:
 
     logger.warning(
@@ -348,13 +464,46 @@ finally:
 data_lock = threading.Lock()
 current_target_q = np.array(rtde_r.getActualQ())
 previous_target_q = np.copy(current_target_q)
-current_target_i = 0
+# Float trajectory phase (matches the policy thread's `phase` variable). Updated under
+# data_lock by the policy thread; the control thread blends previous→current the same
+# way as target_q so we can compute the exact expected reference at any servo tick.
+current_phase = 0.0
+previous_phase = 0.0
 run_policy_event = threading.Event()  # Trigger for the policy
 new_data_event = threading.Event()
 
+# Wait for the first box pose to arrive before starting threads. This is the
+# point of the test — make sure the streaming pipeline is healthy.
+if pose_listener is not None:
+    logger.info(
+        f"Waiting up to {POSE_FIRST_POSE_TIMEOUT_S:.0f}s for first box pose...",
+        extra={"step": -1},
+    )
+    _start = time.perf_counter()
+    while pose_listener.get_pose(BOX_BOARD_ID) is None:
+        if pose_proc is not None and pose_proc.poll() is not None:
+            logger.error(
+                f"Pose-estimation subprocess exited early "
+                f"(returncode={pose_proc.returncode})",
+                extra={"step": -1},
+            )
+            break
+        if time.perf_counter() - _start > POSE_FIRST_POSE_TIMEOUT_S:
+            logger.warning(
+                "Timed out waiting for first box pose; continuing without it",
+                extra={"step": -1},
+            )
+            break
+        time.sleep(0.1)
+    else:
+        logger.info(
+            f"First box pose received: {pose_listener.get_pose(BOX_BOARD_ID)}",
+            extra={"step": -1},
+        )
+
 
 def policy_thread():
-    global current_target_q, previous_target_q, current_target_i
+    global current_target_q, previous_target_q, current_phase, previous_phase
     # Float phase to support enable_phase_slowdown. Indexed via floor() into trajectory
     # arrays. For legacy (no-slowdown) policies dphase=1 each step → phase increments by 1
     # → indexing matches the old integer trajectory_step behavior exactly.
@@ -381,46 +530,90 @@ def policy_thread():
     # Previous raw policy action (pre-scale), fed back into obs when include_prev_actions=True.
     prev_action = np.zeros(6, dtype=np.float32)
     max_traj_idx = len(joints) - 1
-    max_obj_idx = (len(obj_poses_ref) - 1) if obj_poses_ref is not None else None
     while True:
         run_policy_event.wait()
         run_policy_event.clear()
 
         actual_q = np.array(rtde_r.getActualQ())
         actual_qd = np.array(rtde_r.getActualQd())
-        traj_idx = min(int(np.floor(phase)), max_traj_idx)
+        traj_idx = min(int(np.floor(phase)), max_traj_idx)  # integer floor, used only for logging
         phase_obs = np.array([phase / max_traj_idx])
 
+        # Interpolate trajectory references at the current float phase, matching the env's
+        # _interp / _nlerp so the policy sees consistent conventions in sim and real.
+        joints_at_phase        = interp_np(joints,        phase)
+        joints_target_at_phase = interp_np(joints_target, phase)
+        joint_vel_at_phase     = interp_np(joint_vel_ref, phase)
+        obj_pos_at_phase       = interp_np(obj_poses_ref[:, :3], phase)
+        obj_quat_at_phase      = nlerp_np(obj_poses_ref[:, 3:], phase)
+
         if dual_arm:
-            relative_q_l = actual_q - joints[traj_idx]
+            relative_q_l = actual_q - joints_at_phase
             relative_q_r = np.zeros(6)
-            relative_qd_l = actual_qd - joint_vel_ref[traj_idx]
+            relative_qd_l = actual_qd - joint_vel_at_phase
             relative_qd_r = np.zeros(6)
             current_features = np.concatenate((relative_q_l, relative_q_r, relative_qd_l, relative_qd_r))
         else:
-            relative_q = actual_q - joints[traj_idx]
-            relative_qd = actual_qd - joint_vel_ref[traj_idx]
+            relative_q = actual_q - joints_at_phase
+            relative_qd = actual_qd - joint_vel_at_phase
             feature_parts = [relative_q, relative_qd]
+            # Latest box pose, shifted into the robot frame. None if listener is missing
+            # or hasn't received a pose yet. Only fetched when include_object_obs is on,
+            # since that's the only branch that consumes it (absolute obs reuses it too,
+            # but only when include_object_obs is also true).
+            actual_obj_pos = None
+            actual_obj_quat = None
             if include_object_obs:
-                # No object tracker on the real robot: assume actual == reference, so all
-                # relative quantities are identity/zero. Same trick as "right-arm zeroed".
-                feature_parts.append(np.zeros(3, dtype=np.float32))             # relative obj pos
-                feature_parts.append(IDENTITY_QUAT_WXYZ)                        # relative obj quat
+                box_pose = pose_listener.get_pose(BOX_BOARD_ID) if pose_listener is not None else None
+                if box_pose is not None:
+                    actual_obj_pos = box_pose[:3].astype(np.float32) + WORLD_TO_ROBOT_TRANSLATION
+                    actual_obj_pos[2] = obj_pos_at_phase[2]  # Hack: use correct z value for tasks that lie in xy-plane
+                    actual_obj_quat = box_pose[3:].astype(np.float32)
+
+                # On the real robot, feed measured pose into the policy. In sim (or if the
+                # pose stream is dead) fall back to zeros/identity (i.e. "actual == reference").
+                use_actual = args.real_robot and actual_obj_pos is not None
+                if actual_obj_pos is None:
+                    logger.warning("No box pose available from listener; falling back to zeros",
+                                   extra={"step": traj_idx})
+                if use_actual:
+                    rel_obj_pos = actual_obj_pos - obj_pos_at_phase
+                    rel_obj_quat = quat_mul_np(obj_quat_at_phase, quat_inv_np(actual_obj_quat))
+                    logger.info(
+                        f"Box obs: rel_pos={rel_obj_pos}, rel_quat_wxyz={rel_obj_quat} "
+                        f"(actual_pos={actual_obj_pos}, desired_pos={obj_pos_at_phase}, "
+                        f"actual_quat={actual_obj_quat}, desired_quat={obj_quat_at_phase})",
+                        extra={"step": traj_idx},
+                    )
+                    feature_parts.append(rel_obj_pos.astype(np.float32))
+                    feature_parts.append(rel_obj_quat.astype(np.float32))
+                else:
+                    feature_parts.append(np.zeros(3, dtype=np.float32))             # relative obj pos
+                    feature_parts.append(IDENTITY_QUAT_WXYZ)                        # relative obj quat
                 if include_obj_vel_obs:
-                    feature_parts.append(np.zeros(6, dtype=np.float32))         # relative obj vel
+                    # Pose listener doesn't expose velocity; keep zeros (no observable vel).
+                    feature_parts.append(np.zeros(6, dtype=np.float32))             # relative obj vel
             if include_absolute_obs:
                 # Absolute joint state is directly observable from the robot.
                 feature_parts.append(actual_q.astype(np.float32))
                 feature_parts.append(actual_qd.astype(np.float32))
                 if include_object_obs:
-                    # No object tracker: use the reference pose/vel at the current phase as our
-                    # best estimate of the absolute object state (consistent with "actual==ref").
-                    obj_idx = min(traj_idx, max_obj_idx)
-                    feature_parts.append(obj_poses_ref[obj_idx, :3].astype(np.float32))
-                    feature_parts.append(obj_poses_ref[obj_idx, 3:].astype(np.float32))
+                    use_actual = args.real_robot and actual_obj_pos is not None
+                    if use_actual:
+                        feature_parts.append(actual_obj_pos)
+                        feature_parts.append(actual_obj_quat)
+                    else:
+                        # Sim / no-tracker fallback: reference pose at current phase.
+                        feature_parts.append(obj_pos_at_phase)
+                        feature_parts.append(obj_quat_at_phase)
                     if include_obj_vel_obs:
-                        obj_vel_ref = traj["obj_vel"][obj_idx] if "obj_vel" in traj.files else np.zeros(6, dtype=np.float32)
-                        feature_parts.append(obj_vel_ref.astype(np.float32))
+                        # No velocity from pose estimation — use reference vel either way.
+                        obj_vel_ref = (
+                            interp_np(traj["obj_vel"], phase)
+                            if "obj_vel" in traj.files
+                            else np.zeros(6, dtype=np.float32)
+                        )
+                        feature_parts.append(obj_vel_ref)
             current_features = np.concatenate(feature_parts).astype(np.float32)
 
         # Shift history and append newest
@@ -432,16 +625,13 @@ def policy_thread():
         # Future reference obj pose look-ahead (pos delta + world-frame quat delta,
         # plus absolute future pos/quat if include_absolute_obs).
         if future_obs_steps:
-            cur_idx = min(traj_idx, max_obj_idx)
-            cur_pos = obj_poses_ref[cur_idx, :3]
-            cur_quat = obj_poses_ref[cur_idx, 3:]
-            inv_cur_quat = quat_inv_np(cur_quat)
+            inv_cur_quat = quat_inv_np(obj_quat_at_phase)
             futures = []
             for k in future_obs_steps:
-                fut_idx = min(traj_idx + int(k), max_obj_idx)
-                fut_pos = obj_poses_ref[fut_idx, :3]
-                fut_quat = obj_poses_ref[fut_idx, 3:]
-                futures.append(fut_pos - cur_pos)
+                fut_phase = phase + float(k)  # interp_np / nlerp_np clamp internally
+                fut_pos = interp_np(obj_poses_ref[:, :3], fut_phase)
+                fut_quat = nlerp_np(obj_poses_ref[:, 3:], fut_phase)
+                futures.append(fut_pos - obj_pos_at_phase)
                 futures.append(quat_mul_np(fut_quat, inv_cur_quat))
                 if include_absolute_obs:
                     futures.append(fut_pos)
@@ -468,15 +658,15 @@ def policy_thread():
         # eff_alpha is read from saved env.yaml (force_alpha if set, else 1.0). At α=1 mode D
         # collapses to mode C. For modes A/B/C the formulas are α-independent.
         if action_mode == "A":
-            new_joint_targets = joints_target[traj_idx] + action_scale * raw_action
+            new_joint_targets = joints_target_at_phase + action_scale * raw_action
         elif action_mode == "B":
-            new_joint_targets = joints[traj_idx] + action_scale * raw_action
+            new_joint_targets = joints_at_phase + action_scale * raw_action
         elif action_mode == "C":
             new_joint_targets = actual_q + action_scale * raw_action
         elif action_mode == "D":
             eps = action_alpha_floor
             action_gain = eff_alpha + eps * (1.0 - eff_alpha)
-            planner_pd_error = joints_target[traj_idx] - joints[traj_idx]
+            planner_pd_error = joints_target_at_phase - joints_at_phase
             new_joint_targets = (
                 actual_q
                 + (1.0 - eff_alpha) * planner_pd_error
@@ -487,12 +677,21 @@ def policy_thread():
 
         # Safety: clamp to joint limits, then clamp to be near current position
         new_joint_targets = np.clip(new_joint_targets, joint_limits_lower, joint_limits_upper)
-        new_joint_targets = np.clip(new_joint_targets, actual_q - max_target_delta, actual_q + max_target_delta)
+
+        # Stream box pose for logging only — not used in obs yet.
+        if pose_listener is not None:
+            box_pose = pose_listener.get_pose(BOX_BOARD_ID)
+            if box_pose is not None:
+                logger.debug(
+                    f"box_pose [pos={box_pose[:3]}, quat_wxyz={box_pose[3:]}]",
+                    extra={"step": traj_idx},
+                )
 
         with data_lock:
             previous_target_q = current_target_q
             current_target_q = new_joint_targets
-            current_target_i = traj_idx
+            previous_phase = current_phase
+            current_phase = phase
             new_data_event.set()
 
         prev_action = raw_action
@@ -519,6 +718,7 @@ def control_thread():
 
             with data_lock:
                 interp_q = (1 - alpha) * previous_target_q + alpha * current_target_q
+                interp_phase = (1 - alpha) * previous_phase + alpha * current_phase
 
                 # 4. Command the robot
                 rtde_c.servoJ(
@@ -533,9 +733,12 @@ def control_thread():
             alpha = min(alpha + 1.0 / policy_decimation, 1.0)
             step_counter += 1
 
-            log(step_counter, interp_q)
+            log(step_counter, interp_q, interp_phase)
 
-            if step_counter > max_steps:
+            if interp_phase * policy_decimation > max_steps:
+                break
+
+            if step_counter > max_wallclock_steps:
                 break
 
             # Should be at the end to ensure correct timing
@@ -556,21 +759,6 @@ def control_thread():
         rtde_c.servoStop()
         rtde_c.stopScript()
 
-        # Save per-timestep tracking data for analysis
-        if tracking_log:
-            tracking_npz_path = os.path.join(log_dir, f"{run_tag}.npz")
-            np.savez(
-                tracking_npz_path,
-                steps=np.array([d["step"] for d in tracking_log]),
-                actual_q=np.array([d["actual_q"] for d in tracking_log]),
-                expected_q=np.array([d["expected_q"] for d in tracking_log]),
-                target_q=np.array([d["target_q"] for d in tracking_log]),
-                gain=gain,
-                lookahead_time=lookahead_time,
-                action_scale=action_scale,
-            )
-            logger.info(f"Tracking data saved to {tracking_npz_path}", extra={"step": -1})
-
         logger.info(
             f"Execution finished. Log written to {log_path}",
             extra={"step": -1},
@@ -583,10 +771,33 @@ t2 = threading.Thread(target=control_thread, daemon=True)
 t1.start()
 t2.start()
 
-# Keep main thread alive and when either thread dies we stop and exit
-while t1.is_alive() and t2.is_alive():
-    time.sleep(0.02)
+try:
+    # Keep main thread alive and when either thread dies we stop and exit
+    while t1.is_alive() and t2.is_alive():
+        time.sleep(0.02)
+except KeyboardInterrupt:
+    logger.warning("KeyboardInterrupt — stopping robot and saving tracking data",
+                   extra={"step": -1})
+finally:
+    # Stop the robot first (safety priority), then save, then tear down pose streaming.
+    # Each step is wrapped so a failure in one doesn't prevent the others.
+    try:
+        rtde_c.stopJ()
+        rtde_c.servoStop()
+        rtde_c.stopScript()
+    except Exception as e:
+        logger.error(f"Error stopping robot: {e}", extra={"step": -1})
 
-rtde_c.stopJ()
-rtde_c.servoStop()
-rtde_c.stopScript()
+    try:
+        save_tracking_npz()
+    except Exception as e:
+        logger.error(f"Error saving tracking npz: {e}", extra={"step": -1})
+
+    if pose_listener is not None:
+        pose_listener.stop()
+    if pose_proc is not None and pose_proc.poll() is None:
+        pose_proc.terminate()
+        try:
+            pose_proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pose_proc.kill()
