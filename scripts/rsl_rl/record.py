@@ -54,7 +54,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
-import json
+import numpy as np
 import os
 import re
 import time
@@ -94,6 +94,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
     env_cfg.scene.num_envs = 1
+    env_cfg.max_episode_steps = -1
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -234,21 +235,45 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             return torch.cat((direct_env.ur5e_l.data.applied_torque[0], direct_env.ur5e_r.data.applied_torque[0])).cpu().tolist()
         return direct_env.ur5e.data.applied_torque[0].cpu().tolist()
 
-    output = {
-        "joint_targets": [],
-        "joint_positions": [_joint_positions()],
-        "joint_torques": [],
+    def _expected_q():
+        """Trajectory joints at the current phase. Boxpush uses float phase + _interp;
+        boxlift uses integer episode_length_buf with separate joints_l/joints_r."""
+        if dual_arm:
+            idx = int(direct_env.episode_length_buf[0].item())
+            idx = min(idx, direct_env.joints_l.shape[0] - 1)
+            return torch.cat([direct_env.joints_l[idx], direct_env.joints_r[idx]]).cpu().tolist()
+        return direct_env._interp(direct_env.joints)[0].cpu().tolist()
+
+    def _phase_value():
+        """Float phase index. Boxlift exposes only episode_length_buf (integer)."""
+        if hasattr(direct_env, "phase"):
+            return float(direct_env.phase[0].item())
+        return float(direct_env.episode_length_buf[0].item())
+
+    def _obj_pose():
+        """Box pose in env-frame. Returns (pos_xyz, quat_wxyz) as flat lists."""
+        pos = (direct_env.object.data.root_pos_w[0] - direct_env.scene.env_origins[0]).cpu().tolist()
+        quat = direct_env.object.data.root_quat_w[0].cpu().tolist()
+        return pos, quat
+
+    # Per-step rollout buffers. Schema matches ur_rtde_real_time.py's tracking_log so the
+    # same downstream tooling (visualize_traj.py, plot_rollout_rewards.py, analyze_*.ipynb,
+    # ur_rtde_test.py) works on both real and sim rollouts.
+    rollout = {
+        "steps": [],
+        "phase": [],
+        "actual_q": [],          # post-step joint position (matches real-rollout convention)
+        "expected_q": [],        # trajectory joints at current phase
+        "target_q": [],          # joint targets sent to the actuator (was joint_targets)
+        "actual_obj_pos": [],
+        "actual_obj_quat": [],
+        "joint_torques": [],     # not in real npz; kept for analyze_policy_residual.ipynb
         "rewards": [],
-        "extras": [],
-        "trajectory_path": str(env_cfg.trajectory_path),
-        "action_scale": float(getattr(env_cfg, "action_scale", 0.0)),
-        "action_mode": getattr(env_cfg, "action_mode", None),
-        "obs_history_steps": int(getattr(env_cfg, "obs_history_steps", 1)),
-        "dual_arm": dual_arm,
     }
+    extras_log = []  # list of dicts of {metric_key: float}
 
     def _to_py(v):
-        """Convert a torch tensor / numpy scalar / python scalar into a json-safe value."""
+        """Convert a torch tensor / numpy scalar / python scalar to a python float."""
         if hasattr(v, "detach"):
             v = v.detach()
         if hasattr(v, "cpu"):
@@ -256,12 +281,6 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if hasattr(v, "tolist"):
             return v.tolist()
         return v
-
-    if dual_arm:
-        output["arm_l_pose"] = direct_env.arm_l_pose.cpu().tolist()
-        output["arm_r_pose"] = direct_env.arm_r_pose.cpu().tolist()
-    else:
-        output["arm_pose"] = direct_env.arm_pose.cpu().tolist()
 
     # reset environment
     obs = env.get_observations()
@@ -273,38 +292,87 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         with torch.inference_mode():
             actions = policy(obs)
 
-            joint_targets = _flatten(direct_env.get_joint_targets())
-            output["joint_targets"].append(joint_targets)
+            target_q  = _flatten(direct_env.get_joint_targets())
+            expected  = _expected_q()
+            phase_val = _phase_value()
 
             obs, rewards, dones, extras = env.step(actions)
 
-            output["joint_positions"].append(_joint_positions())
-            output["joint_torques"].append(_applied_torques())
-            output["rewards"].append(float(rewards[0].item()))
+            obj_pos, obj_quat = _obj_pose()
+            rollout["steps"].append(timestep)
+            rollout["phase"].append(phase_val)
+            rollout["actual_q"].append(_joint_positions())
+            rollout["expected_q"].append(expected)
+            rollout["target_q"].append(target_q)
+            rollout["actual_obj_pos"].append(obj_pos)
+            rollout["actual_obj_quat"].append(obj_quat)
+            rollout["joint_torques"].append(_applied_torques())
+            rollout["rewards"].append(float(rewards[0].item()))
 
-            # Flatten extras["log"] (dict of scalar tensors) into a json-serializable dict
             log_entry = {}
             raw_log = extras.get("log", {}) if isinstance(extras, dict) else {}
             for k, v in raw_log.items():
                 log_entry[k] = _to_py(v)
-            output["extras"].append(log_entry)
+            extras_log.append(log_entry)
 
+            timestep += 1
             if torch.any(dones):
                 break
 
-        if args_cli.video:
-            timestep += 1
-            if timestep == args_cli.video_length:
-                break
+        if args_cli.video and timestep >= args_cli.video_length:
+            break
 
         sleep_time = dt - (time.time() - start_time)
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
-    rollout_path = os.path.join(log_dir, "rollout", "output.json")
+    rollout_path = os.path.join(log_dir, "rollout", "output.npz")
     os.makedirs(os.path.dirname(rollout_path), exist_ok=True)
-    with open(rollout_path, 'w') as fp:
-        json.dump(output, fp, indent=4)
+
+    # Per-step extras: collect every metric key seen, stack into (N,) arrays. NPZ keys can't
+    # contain '/', so encode "Rewards_task/obj_pos" → "extras__Rewards_task__obj_pos". The
+    # "extras__" prefix lets loaders enumerate them without false positives.
+    all_extras_keys = sorted({k for e in extras_log for k in e.keys()})
+    extras_arrays = {
+        f"extras__{k.replace('/', '__')}": np.asarray(
+            [e.get(k, float("nan")) for e in extras_log], dtype=np.float32
+        )
+        for k in all_extras_keys
+    }
+
+    arm_pose_kwargs = (
+        {"arm_l_pose": direct_env.arm_l_pose.cpu().numpy(),
+         "arm_r_pose": direct_env.arm_r_pose.cpu().numpy()}
+        if dual_arm else
+        {"arm_pose": direct_env.arm_pose.cpu().numpy()}
+    )
+
+    np.savez(
+        rollout_path,
+        steps=np.asarray(rollout["steps"], dtype=np.int64),
+        phase=np.asarray(rollout["phase"], dtype=np.float32),
+        actual_q=np.asarray(rollout["actual_q"], dtype=np.float32),
+        expected_q=np.asarray(rollout["expected_q"], dtype=np.float32),
+        target_q=np.asarray(rollout["target_q"], dtype=np.float32),
+        actual_obj_pos=np.asarray(rollout["actual_obj_pos"], dtype=np.float32),
+        actual_obj_quat=np.asarray(rollout["actual_obj_quat"], dtype=np.float32),
+        joint_torques=np.asarray(rollout["joint_torques"], dtype=np.float32),
+        rewards=np.asarray(rollout["rewards"], dtype=np.float32),
+        # Sample period of the rollout (env step). Real-rollout npz uses 1/500;
+        # consumers should read this rather than hardcode 500Hz.
+        src_dt=np.float64(dt),
+        # Real-rollout-only fields, NaN here so the schema matches.
+        gain=np.float64("nan"),
+        lookahead_time=np.float64("nan"),
+        # Metadata.
+        action_scale=np.asarray(getattr(env_cfg, "action_scale", 0.0)),
+        action_mode=np.asarray(str(getattr(env_cfg, "action_mode", ""))),
+        trajectory_path=np.asarray(str(env_cfg.trajectory_path)),
+        obs_history_steps=np.int64(getattr(env_cfg, "obs_history_steps", 1)),
+        dual_arm=np.bool_(dual_arm),
+        **arm_pose_kwargs,
+        **extras_arrays,
+    )
     print(f"[INFO] Rollout saved to: {rollout_path}")
 
     env.close()

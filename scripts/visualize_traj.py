@@ -1,8 +1,8 @@
 import numpy as np
 import os
 import argparse
-import json
 import time
+import yaml
 
 # ----------------------------
 # Parse input JSON file
@@ -13,49 +13,119 @@ parser.add_argument("--hz", type=int, default=50)
 parser.add_argument("--box_dims", type=str, default="0.357,0.259,0.277",
                     help="Box visual dimensions Lx,Ly,Lz in meters.")
 parser.add_argument("--show_ref", action="store_true",
-                    help="Also spawn a second (green) arm following the reference trajectory.")
+                    help="Also spawn a second (green) arm following the reference trajectory, "
+                         "and (if --ref_trajectory_path is provided) a green box marker tracking "
+                         "the reference object pose.")
+parser.add_argument("--ref_trajectory_path", type=str, default=None,
+                    help="Path to a reference trajectory .npz containing obj_poses (T, 7). "
+                         "Used to drive the reference box marker when --show_ref is set. "
+                         "If omitted, auto-discovers from <run_dir>/params/env.yaml when the "
+                         "input npz lives under <run_dir>/ur_rtde_logs/.")
 args = parser.parse_args()
+
+
+def _autodiscover_ref_trajectory(input_path: str) -> str | None:
+    """Look for the training run's env.yaml two dirs above the input npz (matching the layout
+    ur_rtde_real_time.py writes: <run_dir>/ur_rtde_logs/<run>.npz alongside <run_dir>/params/env.yaml)
+    and pull `trajectory_path` from it. Returns None if anything in the chain is missing."""
+    run_dir = os.path.dirname(os.path.dirname(os.path.abspath(input_path)))
+    env_yaml = os.path.join(run_dir, "params", "env.yaml")
+    if not os.path.isfile(env_yaml):
+        return None
+    try:
+        with open(env_yaml, "r") as f:
+            env_cfg = yaml.unsafe_load(f)
+        path = env_cfg.get("trajectory_path") if isinstance(env_cfg, dict) else None
+    except Exception as e:
+        print(f"[visualize_traj] failed to parse {env_yaml}: {e}")
+        return None
+    if not path:
+        return None
+    if not os.path.isfile(path):
+        print(f"[visualize_traj] env.yaml says trajectory_path={path!r} but it doesn't exist; ignoring")
+        return None
+    return path
+
+
+if args.show_ref and args.ref_trajectory_path is None:
+    args.ref_trajectory_path = _autodiscover_ref_trajectory(args.joint_target_file_1)
+    if args.ref_trajectory_path is not None:
+        print(f"[visualize_traj] auto-discovered ref trajectory: {args.ref_trajectory_path}")
 
 dt = 1 / args.hz
 box_dims = tuple(float(x) for x in args.box_dims.split(","))
 assert len(box_dims) == 3, "--box_dims must be 'Lx,Ly,Lz'"
 
-def read_json(file_path):
-    with open(file_path) as f:
-        data = json.load(f)
-
-    q_joints = np.array(data["joint_positions"])
-
-    return (
-        q_joints[:, :6], q_joints[:, 6:],
-        np.zeros_like(q_joints[:, :6]), np.zeros_like(q_joints[:, :6]),
-        None, None,
-    )
-
 def read_npz(file_path):
-    # Downsample 500Hz log to args.hz without interpolation
+    """Read rollout NPZ produced by either ur_rtde_real_time.py (500Hz real-robot log) or
+    record.py (50Hz sim rollout). Source rate is read from `src_dt` if present (record.py
+    writes it); otherwise defaults to 1/500 for the legacy real-rollout schema. For dual-arm
+    rollouts (actual_q has 12 cols) we split into left/right arm vectors."""
     d = np.load(file_path)
-    actual = d["actual_q"]      # (N, 6)
-    expected = d["expected_q"]  # (N, 6)
+    actual = d["actual_q"]      # (N, 6) single-arm, (N, 12) dual-arm
+    expected = d["expected_q"]  # same shape
 
-    # Source rate is 500Hz (1/dt = 500)
-    src_dt = 1 / 500.0
+    src_dt = float(d["src_dt"]) if "src_dt" in d.files else (1.0 / 500.0)
     stride = max(1, int(round(dt / src_dt)))
     actual_ds = actual[::stride]
     expected_ds = expected[::stride]
 
-    # Optional box pose stream (added to npz by ur_rtde_real_time.py).
+    # Split joints into left/right if dual-arm; otherwise put everything on the left and
+    # zero the right (visualize_traj only ever drives one robot from this output).
+    if actual_ds.shape[-1] == 12:
+        q_l, q_r = actual_ds[:, :6], actual_ds[:, 6:]
+        gt_l, gt_r = expected_ds[:, :6], expected_ds[:, 6:]
+    else:
+        q_l = actual_ds
+        q_r = np.zeros_like(actual_ds)
+        gt_l = expected_ds
+        gt_r = np.zeros_like(expected_ds)
+
+    # Optional box pose stream (present in both real and sim rollouts).
     obj_pos_ds = d["actual_obj_pos"][::stride] if "actual_obj_pos" in d.files else None
     obj_quat_ds = d["actual_obj_quat"][::stride] if "actual_obj_quat" in d.files else None
 
-    zeros = np.zeros_like(actual_ds)
-    return actual_ds, zeros, expected_ds, zeros, obj_pos_ds, obj_quat_ds
+    # Per-step trajectory phase. Used to drive the reference box marker.
+    phase_ds = d["phase"][::stride] if "phase" in d.files else None
+
+    return q_l, q_r, gt_l, gt_r, obj_pos_ds, obj_quat_ds, phase_ds
 
 extension = args.joint_target_file_1.split(".")[-1]
-if extension == "json":
-    q_joints_l, q_joints_r, q_joints_gt_l, q_joints_gt_r, obj_pos, obj_quat = read_json(args.joint_target_file_1)
-elif extension == "npz":
-    q_joints_l, q_joints_r, q_joints_gt_l, q_joints_gt_r, obj_pos, obj_quat = read_npz(args.joint_target_file_1)
+if extension != "npz":
+    raise SystemExit(f"Expected an .npz rollout file, got: {args.joint_target_file_1!r}")
+q_joints_l, q_joints_r, q_joints_gt_l, q_joints_gt_r, obj_pos, obj_quat, phase = read_npz(args.joint_target_file_1)
+
+# Reference object trajectory (driven by per-step phase). Loaded only if --show_ref AND a
+# reference trajectory file is provided. ref_obj_pos/ref_obj_quat are precomputed per step
+# by interpolating the ref obj_poses at the logged phase, so the main loop can index by `i`.
+ref_obj_pos = None
+ref_obj_quat = None
+if args.show_ref and args.ref_trajectory_path is not None:
+    ref_data = np.load(args.ref_trajectory_path)
+    ref_obj_poses = ref_data["obj_poses"]  # (T, 7) [pos_xyz, quat_wxyz]
+    T_ref = ref_obj_poses.shape[0]
+    if phase is not None:
+        # Linear interpolation along time axis. Phase saved by ur_rtde_real_time is the
+        # same float index used in the env's _interp.
+        idx = np.clip(phase, 0.0, T_ref - 1 - 1e-6)
+        i0 = np.floor(idx).astype(np.int64)
+        i1 = np.minimum(i0 + 1, T_ref - 1)
+        a = (idx - i0)[:, None]
+        ref_obj_pos = (1.0 - a) * ref_obj_poses[i0, :3] + a * ref_obj_poses[i1, :3]
+        # nlerp for quats with hemisphere correction.
+        q0 = ref_obj_poses[i0, 3:]
+        q1 = ref_obj_poses[i1, 3:]
+        dot = (q0 * q1).sum(axis=-1, keepdims=True)
+        q1 = np.where(dot < 0, -q1, q1)
+        q = (1.0 - a) * q0 + a * q1
+        ref_obj_quat = q / np.linalg.norm(q, axis=-1, keepdims=True).clip(min=1e-8)
+    else:
+        # No per-step phase (e.g. JSON input): fall back to step-index → trajectory-index
+        # 1:1 mapping, clamped to trajectory length.
+        N_log = len(q_joints_l)
+        idx = np.minimum(np.arange(N_log, dtype=np.int64), T_ref - 1)
+        ref_obj_pos = ref_obj_poses[idx, :3]
+        ref_obj_quat = ref_obj_poses[idx, 3:]
 
 
 np.set_printoptions(precision=5, suppress=True)
@@ -107,6 +177,19 @@ if obj_pos is not None and obj_quat is not None and not np.all(np.isnan(obj_pos)
         orientation=np.array([1.0, 0.0, 0.0, 0.0]),  # wxyz
         scale=np.array(box_dims, dtype=float),
         color=np.array([0.7, 0.7, 0.7]),
+    )
+
+# Reference box marker (green) driven by the loaded reference trajectory + phase.
+ref_box_visual = None
+if ref_obj_pos is not None and ref_obj_quat is not None:
+    from isaacsim.core.api.objects import VisualCuboid
+    ref_box_visual = VisualCuboid(
+        prim_path="/World/ref_box_visual",
+        name="ref_box_visual",
+        position=np.array([0.0, 0.0, 0.0]),
+        orientation=np.array([1.0, 0.0, 0.0, 0.0]),  # wxyz
+        scale=np.array(box_dims, dtype=float),
+        color=np.array([0.0, 1.0, 0.0]),
     )
 
 # Disable collisions between the robots
@@ -208,9 +291,27 @@ while simulation_app.is_running():
     arm_1.set_joint_positions(q_joints_1)
     arm_2.set_joint_positions(q_joints_2)
 
+    # TEMP: arm_1 wrist_3 (TCP) pose in world frame, in ur_rtde getTCPPose format (x,y,z,rx,ry,rz)
+    _w3_xf = UsdGeom.Xformable(world.stage.GetPrimAtPath(f"{prim_path_1}/wrist_3_link")).ComputeLocalToWorldTransform(0)
+    _w3_pos = _w3_xf.ExtractTranslation()
+    _w3_quat = _w3_xf.ExtractRotationQuat()  # (imag_xyz, real_w)
+    _qx, _qy, _qz, _qw = _w3_quat.imaginary[0], _w3_quat.imaginary[1], _w3_quat.imaginary[2], _w3_quat.real
+    _vnorm = np.sqrt(_qx * _qx + _qy * _qy + _qz * _qz)
+    _angle = 2.0 * np.arctan2(_vnorm, _qw)
+    if _vnorm < 1e-8:
+        _rx = _ry = _rz = 0.0
+    else:
+        _scale = _angle / _vnorm
+        _rx, _ry, _rz = _qx * _scale, _qy * _scale, _qz * _scale
+    print(f"arm_1 wrist_3 TCP=({_w3_pos[0]:.4f}, {_w3_pos[1]:.4f}, {_w3_pos[2]:.4f}, {_rx:.4f}, {_ry:.4f}, {_rz:.4f})")
+
     # Drive the box visual from recorded pose, skipping frames where pose was missing.
     if box_visual is not None and not np.isnan(obj_pos[i]).any():
         box_visual.set_world_pose(position=obj_pos[i], orientation=obj_quat[i])
+
+    # Drive the reference box marker from the loaded ref trajectory at this step's phase.
+    if ref_box_visual is not None:
+        ref_box_visual.set_world_pose(position=ref_obj_pos[i], orientation=ref_obj_quat[i])
 
     contact_readings = [sensor.get_current_frame() for sensor in robot_contact_sensors]
     in_contact = np.any([r["in_contact"] and r["force"] > 0.0 for r in contact_readings])

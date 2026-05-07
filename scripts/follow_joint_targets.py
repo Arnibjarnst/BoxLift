@@ -67,7 +67,11 @@ world = World(physics_dt=physics_dt)
 print(data.keys())
 
 z_position = 0 + 0.018 if args.simulate else -0.5
-world.scene.add_default_ground_plane(z_position=z_position)
+world.scene.add_default_ground_plane(
+    z_position=z_position,
+    static_friction=0.65,
+    dynamic_friction=0.65
+)
 
 
 normal_friction = PhysicsMaterial(

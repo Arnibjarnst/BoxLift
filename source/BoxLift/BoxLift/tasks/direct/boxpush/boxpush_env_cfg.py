@@ -104,8 +104,8 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("ur5e"),
-            "stiffness_distribution_params": (0.9, 1.1),
-            "damping_distribution_params": (0.9, 1.1),
+            "stiffness_distribution_params": (0.8, 1.2),
+            "damping_distribution_params": (0.8, 1.2),
             "operation": "scale",
             "distribution": "uniform",
         },
@@ -126,18 +126,15 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     # obs = stacked per-step features * obs_history_steps + phase (1)
     #       [+ (7 or 14) * len(future_obs_steps)  future ref obj pose deltas (+ absolute fut ref if include_absolute_obs)]
     #       [+ 6                                  previous raw action]
-    # per-step features = relative_q (6) + relative_qd (6)  [+ relative_obj_pos (3) + relative_obj_quat (4) + relative_obj_vel (6) if include_object_obs]
-    #                     [+ absolute_q (6) + absolute_qd (6)  [+ absolute_obj_pos (3) + absolute_obj_quat (4) + absolute_obj_vel (6) if include_object_obs] if include_absolute_obs]
+    # per-step features = relative_q (6) + relative_qd (6)  [+ relative_obj_pos (3) + relative_obj_quat (4) if include_object_obs]
+    #                     [+ absolute_q (6) + absolute_qd (6)  [+ absolute_obj_pos (3) + absolute_obj_quat (4) if include_object_obs] if include_absolute_obs]
     obs_history_steps = 3
-    # Toggle object (box) state in observation history. When True, adds the 7-dim pose
-    # block (pos 3 + quat 4) per history step, plus the 6-dim velocity block if
-    # include_obj_vel_obs is also True.
+    # Toggle object (box) state (pose only — pos 3 + quat 4 = 7 dims) in the observation
+    # history. The policy is expected to recover implicit velocity from the pose history;
+    # there is no longer a velocity-observation option (only the tracker exposes pose on
+    # the real robot). Reward path uses ground-truth velocity via _get_obj_vel and is
+    # unaffected.
     include_object_obs = True
-    # Include box velocity (lin 3 + ang 3 = 6 dims) in obj observations. Drop for sim2real
-    # deployments where only pose is observable from the tracker — the policy can recover
-    # implicit velocity from the position history. Reward path is unaffected; w_obj_lin_vel
-    # and w_obj_ang_vel still see ground-truth simulator velocity.
-    include_obj_vel_obs = False
     # Include absolute (world/env-frame) state alongside the relative (error) obs. Doubles the
     # per-step feature dim and adds (pos (3) + quat (4)) per future_obs_steps entry for the
     # absolute future reference obj pose.
@@ -170,6 +167,15 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     # traj_duration / dphase_min formula, which divides by zero at dphase_min=0).
     max_slowdown_multiplier = 3.0
 
+    # Hard cap on per-episode wall-clock length, in simulator steps. When set (>0), the
+    # episode terminates by time_out after this many steps regardless of phase progress,
+    # AND t0 sampling in _reset_idx is restricted to [0, T-1-L] so an episode at full
+    # speed can run for L steps without falling off the trajectory. The combination gives
+    # roughly uniform state visitation across the trajectory (each state t is visited
+    # with probability ~ min(L, t+1) / (T-L+1) instead of (t+1)/(T-1) under the default).
+    # -1 disables the cap (use full trajectory length, the behavior before this flag).
+    max_episode_steps: int = -1
+
     # Failure-aware phase resampling: biases episode start phases toward segments with
     # high historical failure rate. Credits are assigned to the segment each episode
     # STARTED in (not where it failed), which matches the RSI lever we actually control.
@@ -182,12 +188,9 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     @property
     def per_step_feature_dim(self) -> int:
         # 12: relative joint pos (6) + relative joint vel (6) — always present.
-        # If include_object_obs: + 7 (obj pos 3 + obj quat 4), + 6 if include_obj_vel_obs.
+        # If include_object_obs: + 7 (obj pos 3 + obj quat 4).
         # If include_absolute_obs: doubles the whole thing (joint and obj parts mirrored).
-        obj_dim = 0
-        if self.include_object_obs:
-            obj_dim = 7 + (6 if self.include_obj_vel_obs else 0)
-        dim = 12 + obj_dim
+        dim = 12 + (7 if self.include_object_obs else 0)
         if self.include_absolute_obs:
             dim *= 2
         return dim
@@ -211,17 +214,17 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     ur5e_prim_path = f"{ENV_REGEX}/ur5e"
 
     # Arm Actuator parameters
-    # kp = 150.0
-    # kd = 22.5
-    kp = {
-        "shoulder_pan_joint": 800.0,
-        "shoulder_lift_joint": 600.0,
-        "elbow_joint": 300.0,
-        "wrist_1_joint": 200.0,
-        "wrist_2_joint": 100.0,
-        "wrist_3_joint": 100.0,
-    }
-    kd = {joint_name: joint_kp * 0.15 for joint_name, joint_kp in kp.items()}
+    kp = 300.0
+    kd = 50
+    # kp = {
+    #     "shoulder_pan_joint": 800.0,
+    #     "shoulder_lift_joint": 600.0,
+    #     "elbow_joint": 300.0,
+    #     "wrist_1_joint": 200.0,
+    #     "wrist_2_joint": 100.0,
+    #     "wrist_3_joint": 100.0,
+    # }
+    # kd = {joint_name: joint_kp * 0.15 for joint_name, joint_kp in kp.items()}
     actuator_type = "Implicit"  # or "IdealPD"
     velocity_limit = 3.14
     effort_limit = {
@@ -258,35 +261,53 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     replicate_physics = bool(np.all([event["mode"] != "prestartup" and event["mode"] != "startup" for event in events.to_dict().values()])) # type: ignore
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=4.0, replicate_physics=replicate_physics)
 
-    # Reset noise (for sim-to-real robustness)
-    reset_joint_pos_noise = 0.05    # rad, std of Gaussian noise added to joint positions on reset
-    reset_joint_vel_noise = 0.05     # rad/s, std of Gaussian noise added to joint velocities on reset
+    # Reset noise (for sim-to-real robustness). Per-joint (length 6, ordered shoulder_pan,
+    # shoulder_lift, elbow, wrist_1, wrist_2, wrist_3). Wrist joints have small Jacobians on
+    # EE position, so they can absorb more noise without dragging the EE far from the
+    # trajectory. Scalar still works (broadcasts across all 6 joints).
+    reset_joint_pos_noise = [0.1, 0.1, 0.1, 0.2, 0.2, 0.2]  # rad, per-joint std on reset
+    reset_joint_vel_noise = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # rad/s, per-joint std on reset
 
     # Box reset noise: xy-plane for translation / linear vel; small 3-axis rotation + ang vel.
-    reset_obj_pos_xy_noise = 0.01        # m, std on box x,y position (z unchanged)
+    reset_obj_pos_xy_noise = 0.02        # m, std on box x,y position (z unchanged)
     reset_obj_lin_vel_xy_noise = 0.05    # m/s, std on box linear x,y velocity (z unchanged)
-    reset_obj_ori_noise = 0.05           # rad, axis-angle std for small orientation perturbation
-    reset_obj_ang_vel_noise = 0.1        # rad/s, std on box angular velocity (all axes)
+    reset_obj_ori_noise = 0.1            # rad, axis-angle std for small orientation perturbation
+    reset_obj_ang_vel_noise = 0.1        # rad/s, std on box angular velocity (z axis)
 
     # Box observation noise (sim2real). Sampled fresh each step, applied ONLY to the
     # observation path — rewards still see the clean ground-truth box state. Same noise
     # tensor is used for both the relative and absolute obj views in a given step so the
     # policy sees mutually consistent readings (a single noisy "sensor" produced both).
-    obs_obj_pos_noise = 0.005            # m, per-step Gaussian noise on box position
-    obs_obj_ori_noise = 0.02             # rad, axis-angle per-step noise on box orientation
-    obs_obj_lin_vel_noise = 0.02         # m/s, per-step Gaussian noise on box linear velocity
-    obs_obj_ang_vel_noise = 0.05         # rad/s, per-step Gaussian noise on box angular velocity
+    obs_obj_pos_noise = 0.01             # m, per-FRESH-SAMPLE Gaussian noise on box position
+    obs_obj_ori_noise = 0.02             # rad, axis-angle per-FRESH-SAMPLE noise on box orientation
+
+    # Box pose tracker model (sim2real). Approximates the UR5e vision tracker:
+    #   - Fixed latency: every fresh sample reads exactly `obs_obj_delay_steps` env steps
+    #     into the past. At env_dt = 20ms, 13 steps = 260ms (covers the typical ~250ms lag).
+    #     Fixed (not random) so consecutive measurements are time-ordered: a fire at step t
+    #     observes physical time (t-delay)*dt, the next fire at t+period observes
+    #     (t+period-delay)*dt — strictly increasing.
+    #   - Sub-50Hz update rate: a fresh tracker frame fires every `obs_obj_update_period`
+    #     env steps. Default 2 → 25Hz. Between fires the policy reuses the last sample
+    #     (real trackers hold the previous frame until a new one arrives).
+    # Per-fire noise (obs_obj_pos_noise / obs_obj_ori_noise) is applied only when a fresh
+    # sample fires; held samples don't re-jitter.
+    # Reference path (planner trajectory) is NOT affected. Reward path reads clean ground
+    # truth via _get_obj_pos / _get_obj_quat. To disable: set obs_obj_delay_steps=0 and
+    # obs_obj_update_period=1.
+    obs_obj_delay_steps = 13             # 260ms at 20ms env step
+    obs_obj_update_period = 2            # 25Hz
 
     # Perturbation forces (for sim-to-real robustness)
     perturbation_force_std = 10.0       # N, std of per-axis Gaussian force
     perturbation_torque_std = 2.0       # Nm, std of per-axis Gaussian torque
-    perturbation_probability = 0.05     # probability of applying a perturbation each step
+    perturbation_probability = 0.0      # probability of applying a perturbation each step
     perturbation_duration_steps = 5     # how many steps the perturbation lasts
 
     # Reward parameteres. Final (end-of-curriculum) values.
-    w_task = 0.8
+    w_task = 0.5
     w_track = 1 - w_task
-    w_regularization = 0.4
+    w_regularization = 0.1
 
     # Curriculum ("α schedule"). α ramps linearly from 0 to 1 over alpha_warmup_steps env
     # steps; 0 disables the curriculum (α=1 always). Drives three coupled shifts:
@@ -298,7 +319,7 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     #      (action_rate, action_norm) are scaled by (α + ε(1-α)) so the penalty
     #      tracks the action's actual effect on the env. Safety penalties (joint_limit,
     #      illegal_contact, flange_forearm, proximity, joint_acc, torque) stay unscaled.
-    alpha_warmup_steps = 24 * 1500
+    alpha_warmup_steps = 24 * 750
     w_task_start = 0.2
     w_track_start = 0.8
     action_alpha_floor = 0.1
@@ -310,14 +331,14 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     force_alpha: float = -1
 
     # Task reward parameteresr
-    w_obj_pos = 0.3
+    w_obj_pos = 0.2
     sigma_obj_pos = 0.05
     tol_obj_pos = 0.0
 
-    w_obj_quat = 0.4
+    w_obj_quat = 0.7
     # Multi-sigma: wide kernel (0.2) keeps gradient alive at moderate errors,
     # narrow kernel (0.05) pulls precision in close. Kernels are averaged in _reward_track.
-    sigma_obj_quat = (0.05, 0.2)
+    sigma_obj_quat = (0.05, 0.15)
     tol_obj_quat = 0.0
 
     # Object velocity tracking — split into linear (m/s) and angular (rad/s) to avoid
@@ -325,12 +346,12 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     # vs linear up to ~0.15 m/s, so the kernels have very different scales.
     # Instantaneous signal that catches "policy stopped pushing" before obj_pos_error
     # integrates up to the termination threshold.
-    w_obj_lin_vel = 0.15
+    w_obj_lin_vel = 0.05
     sigma_obj_lin_vel = 0.08      # m/s — covers reference vel range with decent gradient
     tol_obj_lin_vel = 0.0
 
-    w_obj_ang_vel = 0.15
-    sigma_obj_ang_vel = 0.4       # rad/s — wider to match ~10× larger magnitude
+    w_obj_ang_vel = 0.05
+    sigma_obj_ang_vel = 0.2       # rad/s
     tol_obj_ang_vel = 0.0
 
     # Track reward parameters
@@ -353,18 +374,28 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     # unachievable if the box is flipped from the reference. The gate is a precomputed
     # boolean mask derived from |obj_vel_ref| > eps, dilated by ±dilation_steps so it
     # captures brief pre-contact approach and post-release follow-through.
-    w_eef_box_rel_pos = 1.0
+    w_eef_box_rel_pos = 0.7
     sigma_eef_box_rel_pos = 0.05
     tol_eef_box_rel_pos = 0.0
 
-    w_eef_box_rel_quat = 0.0
-    sigma_eef_box_rel_quat = 0.3
+    w_eef_box_rel_quat = 0.3
+    sigma_eef_box_rel_quat = 0.5
     tol_eef_box_rel_quat = 0.0
 
     # Gate parameters: a reference step is "active" if ||obj_vel_lin|| + ||obj_vel_ang||
     # > eps, then dilated by ±dilation_steps (in policy steps).
     eef_box_gate_obj_vel_eps = 1e-3
-    eef_box_gate_dilation_steps = 50 # 1s of approach and leaving
+    eef_box_gate_dilation_steps = 1e7 # everything
+
+    # RSI (random start init) contact exclusion. The set of trajectory phases that count
+    # as "in contact" for RSI sampling is the raw |obj_vel_ref| > eef_box_gate_obj_vel_eps
+    # mask, dilated by this many integer steps in each direction. INDEPENDENT of
+    # eef_box_gate_dilation_steps — that one controls reward shaping, this one controls
+    # which start phases the env will reset to.
+    #
+    # Resetting mid-contact tends to put the EE inside the box (after joint reset noise)
+    # and snap-resolves into weird states, so we forbid it. 0 = use the raw boolean mask.
+    rsi_contact_dilation_steps = 5
 
     # Regularization reward parameters
     w_joint_acc = 1e-3
@@ -373,10 +404,10 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     w_joint_torque = 1e-3
     tol_joint_torque = 0.0
 
-    w_action_rate = 2e-1
+    w_action_rate = 1.0
     tol_action_rate = 0.0
 
-    w_action_norm = 1e-2
+    w_action_norm = 0.0
     tol_action_norm = 0.0
 
     # Cumulative-quadratic pause penalty for enable_phase_slowdown=True.
@@ -385,7 +416,7 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     # Episode-total: w_total_slowdown · (Σ(1-dphase))². Trades off "pause to recover from a
     # miss" against "don't pause forever": short pauses are cheap, sustained pauses scale
     # quadratically and eventually dominate any per-step reward gain.
-    w_total_slowdown = 0.05
+    w_total_slowdown = 0.025
 
     # Completion bonus — one-shot terminal reward when the episode times out (reached the
     # end of the trajectory without reset_terminated). Counters stall-dominance in the
@@ -396,7 +427,7 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     # TODO: is this even good to have?
     w_completion = 0.0
 
-    w_joint_limit = 500.0
+    w_joint_limit = 1e3
     joint_limit_eps = 0.05
 
     w_proximity_to_contact = 0.5

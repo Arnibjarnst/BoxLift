@@ -2,7 +2,6 @@ import argparse
 import os
 import sys
 from datetime import datetime
-import json
 import logging
 import csv
 import time
@@ -54,12 +53,11 @@ logger.addHandler(console_handler)
 
 logger.info("Loading joint trajectory file", extra={"step": -1})
 
-with open(args.joint_target_file) as f:
-    data = json.load(f)
-
-joint_targets = np.array(data["joint_targets"])
-joint_pos = np.array(data["joint_positions"])
-joint_torques = np.array(data["joint_torques"])
+# record.py now writes NPZ; the schema matches ur_rtde_real_time.py with extra fields.
+data = np.load(args.joint_target_file)
+joint_targets = np.asarray(data["target_q"])
+joint_pos = np.asarray(data["actual_q"])
+joint_torques = np.asarray(data["joint_torques"])
 
 assert np.all(joint_pos <= 2*np.pi) and np.all(joint_pos >= -2*np.pi)
 assert np.all(joint_targets <= 2*np.pi) and np.all(joint_targets >= -2*np.pi)

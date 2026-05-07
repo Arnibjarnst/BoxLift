@@ -66,10 +66,10 @@ action_mode = env_cfg.get("action_mode", "A")  # default A for backward compat w
 obs_history_steps = int(env_cfg.get("obs_history_steps", 1))
 # New observation flags (defaults match legacy runs that predate these features).
 include_object_obs = bool(env_cfg.get("include_object_obs", False))
-# Velocity-in-obs flag: legacy runs implicitly had it on (vel was always part of the
-# obj-obs block); new runs default it off for sim2real. Default True preserves backwards
-# compat with checkpoints from before the flag existed.
-include_obj_vel_obs = bool(env_cfg.get("include_obj_vel_obs", True))
+# Tracker delay used during training (env steps). Box obs are computed against the trajectory
+# reference from this many steps ago, matching the temporal alignment the policy was trained
+# on. Default 13 ≈ 260ms at 20ms env step.
+obs_obj_delay_steps = int(env_cfg.get("obs_obj_delay_steps", 13))
 future_obs_steps = tuple(env_cfg.get("future_obs_steps", ()) or ())
 include_prev_actions = bool(env_cfg.get("include_prev_actions", False))
 include_absolute_obs = bool(env_cfg.get("include_absolute_obs", False))
@@ -126,7 +126,6 @@ logger.addHandler(console_handler)
 logger.info(
     f"Run dir: {args.run_dir}, action_scale: {action_scale_cfg}, action_mode: {action_mode}, "
     f"obs_history_steps: {obs_history_steps}, include_object_obs: {include_object_obs}, "
-    f"include_obj_vel_obs: {include_obj_vel_obs}, "
     f"future_obs_steps: {future_obs_steps}, include_prev_actions: {include_prev_actions}, "
     f"include_absolute_obs: {include_absolute_obs}, "
     f"enable_phase_slowdown: {enable_phase_slowdown}, dphase_min: {dphase_min}, "
@@ -318,6 +317,8 @@ def save_tracking_npz():
         target_q=np.array([d["target_q"] for d in snapshot]),
         actual_obj_pos=np.array([d["actual_obj_pos"] for d in snapshot]),
         actual_obj_quat=np.array([d["actual_obj_quat"] for d in snapshot]),
+        # Source sample period (s) so downstream visualizers don't have to assume 500Hz.
+        src_dt=np.float64(dt),
         gain=gain,
         lookahead_time=lookahead_time,
         action_scale=action_scale,
@@ -519,9 +520,8 @@ def policy_thread():
             raise NotImplementedError("include_absolute_obs with dual-arm is not supported in the real-robot script yet.")
     else:
         # 12 = relative joint pos (6) + relative joint vel (6); always present.
-        # +7 (pos+quat) if include_object_obs, +6 more for vel if include_obj_vel_obs.
-        obj_block = (7 + (6 if include_obj_vel_obs else 0)) if include_object_obs else 0
-        per_step_features = 12 + obj_block
+        # +7 (pos+quat) if include_object_obs.
+        per_step_features = 12 + (7 if include_object_obs else 0)
         if include_absolute_obs:
             per_step_features *= 2
     # Observation history buffer: (history_steps, per_step_features). Zero-initialized to
@@ -530,6 +530,11 @@ def policy_thread():
     # Previous raw policy action (pre-scale), fed back into obs when include_prev_actions=True.
     prev_action = np.zeros(6, dtype=np.float32)
     max_traj_idx = len(joints) - 1
+    # Phase history (length delay+1), newest-last. Each policy iteration appends the current
+    # phase; the box obs uses index 0 (oldest) as the phase that was current `obs_obj_delay_steps`
+    # iterations ago — matching the env's obj_phase_delay_buf so the rel pose comparison is
+    # temporally aligned with the (already-delayed) tracker measurement.
+    phase_history = np.zeros(obs_obj_delay_steps + 1, dtype=np.float32)
     while True:
         run_policy_event.wait()
         run_policy_event.clear()
@@ -539,6 +544,12 @@ def policy_thread():
         traj_idx = min(int(np.floor(phase)), max_traj_idx)  # integer floor, used only for logging
         phase_obs = np.array([phase / max_traj_idx])
 
+        # Roll phase history newest-last and stash the current phase. We do this BEFORE
+        # building obs so phase_history[0] is the phase from delay_steps iterations ago.
+        phase_history = np.roll(phase_history, -1)
+        phase_history[-1] = phase
+        delayed_phase = float(phase_history[0])
+
         # Interpolate trajectory references at the current float phase, matching the env's
         # _interp / _nlerp so the policy sees consistent conventions in sim and real.
         joints_at_phase        = interp_np(joints,        phase)
@@ -546,6 +557,10 @@ def policy_thread():
         joint_vel_at_phase     = interp_np(joint_vel_ref, phase)
         obj_pos_at_phase       = interp_np(obj_poses_ref[:, :3], phase)
         obj_quat_at_phase      = nlerp_np(obj_poses_ref[:, 3:], phase)
+        # Reference at the *delayed* phase — temporally aligned with the (delayed) tracker
+        # measurement. Used to compute relative box obs in the same way the trained env did.
+        obj_pos_at_delayed     = interp_np(obj_poses_ref[:, :3], delayed_phase)
+        obj_quat_at_delayed    = nlerp_np(obj_poses_ref[:, 3:], delayed_phase)
 
         if dual_arm:
             relative_q_l = actual_q - joints_at_phase
@@ -577,12 +592,16 @@ def policy_thread():
                     logger.warning("No box pose available from listener; falling back to zeros",
                                    extra={"step": traj_idx})
                 if use_actual:
-                    rel_obj_pos = actual_obj_pos - obj_pos_at_phase
-                    rel_obj_quat = quat_mul_np(obj_quat_at_phase, quat_inv_np(actual_obj_quat))
+                    # Compare actual (already lagged by tracker latency) against the reference
+                    # at the same lag — matches sim training, where rel = delayed_actual minus
+                    # reference_at_delayed_phase.
+                    rel_obj_pos = actual_obj_pos - obj_pos_at_delayed
+                    rel_obj_quat = quat_mul_np(obj_quat_at_delayed, quat_inv_np(actual_obj_quat))
                     logger.info(
                         f"Box obs: rel_pos={rel_obj_pos}, rel_quat_wxyz={rel_obj_quat} "
-                        f"(actual_pos={actual_obj_pos}, desired_pos={obj_pos_at_phase}, "
-                        f"actual_quat={actual_obj_quat}, desired_quat={obj_quat_at_phase})",
+                        f"(actual_pos={actual_obj_pos}, ref_pos@delayed={obj_pos_at_delayed}, "
+                        f"actual_quat={actual_obj_quat}, ref_quat@delayed={obj_quat_at_delayed}, "
+                        f"delayed_phase={delayed_phase:.2f}, current_phase={phase:.2f})",
                         extra={"step": traj_idx},
                     )
                     feature_parts.append(rel_obj_pos.astype(np.float32))
@@ -590,9 +609,6 @@ def policy_thread():
                 else:
                     feature_parts.append(np.zeros(3, dtype=np.float32))             # relative obj pos
                     feature_parts.append(IDENTITY_QUAT_WXYZ)                        # relative obj quat
-                if include_obj_vel_obs:
-                    # Pose listener doesn't expose velocity; keep zeros (no observable vel).
-                    feature_parts.append(np.zeros(6, dtype=np.float32))             # relative obj vel
             if include_absolute_obs:
                 # Absolute joint state is directly observable from the robot.
                 feature_parts.append(actual_q.astype(np.float32))
@@ -606,14 +622,6 @@ def policy_thread():
                         # Sim / no-tracker fallback: reference pose at current phase.
                         feature_parts.append(obj_pos_at_phase)
                         feature_parts.append(obj_quat_at_phase)
-                    if include_obj_vel_obs:
-                        # No velocity from pose estimation — use reference vel either way.
-                        obj_vel_ref = (
-                            interp_np(traj["obj_vel"], phase)
-                            if "obj_vel" in traj.files
-                            else np.zeros(6, dtype=np.float32)
-                        )
-                        feature_parts.append(obj_vel_ref)
             current_features = np.concatenate(feature_parts).astype(np.float32)
 
         # Shift history and append newest
@@ -733,6 +741,7 @@ def control_thread():
             alpha = min(alpha + 1.0 / policy_decimation, 1.0)
             step_counter += 1
 
+            print(rtde_r.getActualTCPPose())
             log(step_counter, interp_q, interp_phase)
 
             if interp_phase * policy_decimation > max_steps:
