@@ -1,0 +1,3 @@
+[submodule "tag_pose_estimation"]
+	path = tag_pose_estimation
+	url = git@github.com:kirandoshi/tag_pose_estimation.git
