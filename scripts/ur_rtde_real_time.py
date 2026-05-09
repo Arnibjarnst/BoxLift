@@ -582,7 +582,6 @@ def policy_thread():
                 box_pose = pose_listener.get_pose(BOX_BOARD_ID) if pose_listener is not None else None
                 if box_pose is not None:
                     actual_obj_pos = box_pose[:3].astype(np.float32) + WORLD_TO_ROBOT_TRANSLATION
-                    actual_obj_pos[2] = obj_pos_at_phase[2]  # Hack: use correct z value for tasks that lie in xy-plane
                     actual_obj_quat = box_pose[3:].astype(np.float32)
 
                 # On the real robot, feed measured pose into the policy. In sim (or if the
