@@ -16,7 +16,12 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     experiment_name = "boxhinge"
     logger = "wandb"
     policy = RslRlPpoActorCriticCfg(
-        init_noise_std=1.0,
+        # Lowered from 1.0 (default) to give cleaner gradient signal during VOC training.
+        # With std=1.0 and small action_scale, exploration is dominated by per-step noise
+        # that doesn't reflect a meaningful policy direction; PPO's gradient gets buried
+        # under variance. Narrower init exploration helps PPO settle on what the rewards
+        # actually prefer rather than wandering during the first 100 iters.
+        init_noise_std=0.5,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
         actor_hidden_dims=[512, 256, 128],
@@ -27,10 +32,15 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        entropy_coef=0.005,
+        # entropy_coef = 0.01 — balanced setting. 0.015 was right for clean-obs VOC
+        # decay (kept std elevated as reward landscape shifted); with obs noise added,
+        # the gradient signal is noisier and 0.015 was pushing std too high (0.43→0.7+
+        # at iter 2k). 0.005 is too low — std collapses before VOC fully decays. 0.01
+        # is the middle ground.
+        entropy_coef=0.01,
         num_learning_epochs=5,
         num_mini_batches=4,
-        learning_rate=5.0e-4,
+        learning_rate=3.0e-4,
         schedule="adaptive",
         gamma=0.99,
         lam=0.95,

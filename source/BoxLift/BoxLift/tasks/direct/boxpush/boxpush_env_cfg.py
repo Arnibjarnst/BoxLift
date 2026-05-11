@@ -364,7 +364,10 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     tol_eef_quat = 0.1
 
     w_joint_pos = 0.0
-    sigma_joint_pos = 0.2
+    # Tuned for the per-joint averaged kernel (r_bc form). At σ=0.1, a single joint with
+    # 0.1 rad error gives kernel = exp(-0.01/0.01) ≈ 0.37; 0.2 rad gives ≈ 0.018. Was 0.2
+    # under the old sum-then-kernel form; not equivalent — this is the per-joint scale.
+    sigma_joint_pos = 0.1
     tol_joint_pos = 0.0
 
     # Relative EE-box tracking: rewards matching the reference's EE-position-in-box-frame

@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import os
 import torch
 import numpy as np
 import omni.usd
@@ -178,6 +179,43 @@ class BoxhingeEnv(DirectRLEnv):
         self.obj_obs_last_pose = torch.zeros(self.num_envs, 7, device=self.device)
         # Held relative pose (delayed_actual - reference_at_delayed_phase). pos (3) + quat (4).
         self.obj_obs_last_rel = torch.zeros(self.num_envs, 7, device=self.device)
+        # Per-episode constant bias on the box obs (sim2real calibration model). Sampled
+        # in _reset_idx, applied in _get_noisy_obj_obs's fire branch on top of per-fire jitter.
+        self.obj_obs_bias_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        # Stored as wxyz quat so we can apply directly via quat_mul. Initialized to identity.
+        self.obj_obs_bias_ori_quat = torch.zeros(self.num_envs, 4, device=self.device)
+        self.obj_obs_bias_ori_quat[:, 0] = 1.0
+
+        # === Virtual Object Controller (VOC) state ===
+        # Global gains (scalars; same for all envs). Decayed by `_voc_decay_check`.
+        # Critical damping defaults computed from box mass and a rough inertia estimate
+        # (uniform cube assumption: I ≈ m·d_max²/12 where d_max is the longest dimension).
+        # Mass and dims are sourced from cube_cfg.spawn (which is the authoritative source —
+        # it's already been overridden from the trajectory file above if those keys were
+        # present), so we don't rely on optional cfg attributes that may not be defined.
+        mass = float(self.cfg.cube_cfg.spawn.mass_props.mass)
+        d_max = float(max(self.cfg.cube_cfg.spawn.size))
+        inertia_est = mass * (d_max ** 2) / 12.0
+        self.voc_kp_pos = float(self.cfg.voc_kp_pos)
+        self.voc_kp_rot = float(self.cfg.voc_kp_rot)
+        self.voc_kv_pos = self.cfg.voc_kv_pos_scale * (self.voc_kp_pos * mass) ** 0.5
+        self.voc_kv_rot = self.cfg.voc_kv_rot_scale * (self.voc_kp_rot * inertia_est) ** 0.5
+        # Per-env episode-cumulative rewards for the categories used in the decay check.
+        # Reset each episode in `_reset_idx`; pushed (normalized by ep length) to the
+        # global ring buffer below.
+        self._voc_ep_rew_task = torch.zeros(self.num_envs, device=self.device)
+        self._voc_ep_rew_track = torch.zeros(self.num_envs, device=self.device)
+        self._voc_ep_steps = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        # Global ring buffer of recent completed-episode normalized means. Filled with
+        # NaN until enough episodes have completed; we ignore NaNs in the mean.
+        self._voc_buf_task = torch.full(
+            (self.cfg.voc_reward_window_size,), float("nan"), device=self.device
+        )
+        self._voc_buf_track = torch.full(
+            (self.cfg.voc_reward_window_size,), float("nan"), device=self.device
+        )
+        self._voc_buf_idx = 0  # next write position into the ring buffer
+        self._voc_decay_step_counter = 0  # counts env steps since last decay check
 
         # Perturbation state
         self.perturbation_counter = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
@@ -303,18 +341,26 @@ class BoxhingeEnv(DirectRLEnv):
         # _apply_action below still see the current step's reference.
         if self.cfg.enable_phase_slowdown:
             raw = self.actions[:, 6]
-            # Slowdown-only: tanh(raw) ∈ [-1, 1] → dphase ∈ [2*dphase_min - 1, 1] before
-            # the clamp, then clamped to [dphase_min, 1]. Net mapping:
-            #   raw <= 0: dphase ∈ [dphase_min, 1] (smooth slowdown)
-            #   raw >  0: dphase = 1 (deadzone — no speedup possible)
-            # raw=0 is the neutral point (dphase=1, no slowdown).
-            self.dphase = (1.0 + (1.0 - self.cfg.dphase_min) * torch.tanh(raw)).clamp(
-                min=self.cfg.dphase_min, max=1.0
-            )
+            if self.cfg.phase_mapping == "cubic_bidir":
+                # Bidirectional cubic: dphase = clamp(1 + scale·raw³, dphase_min, dphase_max).
+                # Cubic is flat near raw=0 (small actions → tiny phase change, encouraging
+                # default dphase=1) and grows fast near raw=±1. Allows speedup if
+                # dphase_max > 1. Scale chosen so raw=±1 hits the more distant bound.
+                scale = max(1.0 - self.cfg.dphase_min, self.cfg.dphase_max - 1.0)
+                self.dphase = (1.0 + scale * raw ** 3).clamp(
+                    min=self.cfg.dphase_min, max=self.cfg.dphase_max
+                )
+            else:
+                # tanh slowdown-only: tanh(raw) ∈ [-1, 1] → clamp to [dphase_min, 1].
+                # raw≤0 → smooth slowdown; raw>0 → clamped at 1 (deadzone).
+                self.dphase = (1.0 + (1.0 - self.cfg.dphase_min) * torch.tanh(raw)).clamp(
+                    min=self.cfg.dphase_min, max=1.0
+                )
         else:
             self.dphase = torch.ones_like(self.phase)
 
         self._apply_perturbations()
+        self._apply_voc()
 
         EE_pos = self._interp(self.EE_poses[:, :3]) + self.scene.env_origins
         self.ee_markers.visualize(translations=EE_pos)
@@ -322,6 +368,60 @@ class BoxhingeEnv(DirectRLEnv):
         obj_pos = self._interp(self.obj_poses[:, :3]) + self.scene.env_origins
         obj_quat = self._nlerp(self.obj_poses[:, 3:])
         self.cube_marker.visualize(translations=obj_pos, orientations=obj_quat)
+
+    def _apply_voc(self):
+        """Virtual Object Controller (DexMachina, Mandi et al. 2025).
+
+        Applies a 6-DoF PD wrench on the cube that drives it toward the reference
+        trajectory. Active during early training so the policy can learn the contact
+        pattern in a forgiving environment; gain decays exponentially in
+        `_voc_decay_check` as the policy meets reward thresholds.
+
+        - Translational: F = kp·(ref_pos - obj_pos) - kv·(obj_lin_vel - ref_lin_vel)
+        - Rotational:    T = kp·rot_err_axisangle - kv·(obj_ang_vel - ref_ang_vel)
+          rotation error is computed from quat_mul(ref, inv(obj)) as the small-angle
+          axis-angle vector (2·sign(w)·xyz). The PD pulls the box back continuously, so
+          this approximation stays in its valid regime under normal operation.
+
+        Forces/torques are applied in the world frame. The buffer is set every env step
+        (held across decimation substeps), matching how `_apply_perturbations` works.
+        """
+        if not self.cfg.voc_enabled or self.voc_kp_pos <= 0.0:
+            # Zero the wrench so a previously-set buffer doesn't keep firing after decay.
+            n = self.num_envs
+            self.object.set_external_force_and_torque(
+                torch.zeros(n, 1, 3, device=self.device),
+                torch.zeros(n, 1, 3, device=self.device),
+                is_global=True,
+            )
+            return
+
+        # Reference at current phase (env-frame for pos; vel is already env/world-aligned).
+        ref_pos = self._interp(self.obj_poses[:, :3])           # (N, 3) env-frame
+        ref_quat = self._nlerp(self.obj_poses[:, 3:])           # (N, 4) wxyz
+        ref_vel = self._interp(self.obj_vel)                    # (N, 6) lin+ang
+
+        obj_pos = self.object.data.root_pos_w - self.scene.env_origins  # (N, 3) env-frame
+        obj_quat = self.object.data.root_quat_w                          # (N, 4) wxyz
+        obj_vel = self.object.data.root_vel_w                            # (N, 6)
+
+        pos_err = ref_pos - obj_pos                                       # (N, 3)
+        lin_vel_err = obj_vel[:, :3] - ref_vel[:, :3]                     # (N, 3)
+        force = self.voc_kp_pos * pos_err - self.voc_kv_pos * lin_vel_err # (N, 3)
+
+        # Quaternion error → axis-angle (small-angle approx). q_err rotates obj → ref.
+        q_err = quat_mul(ref_quat, quat_inv(obj_quat))           # (N, 4) wxyz
+        sign_w = torch.where(q_err[:, 0:1] >= 0,
+                             torch.ones_like(q_err[:, 0:1]),
+                             -torch.ones_like(q_err[:, 0:1]))
+        rot_err = 2.0 * sign_w * q_err[:, 1:]                    # (N, 3) axis-angle vector
+        ang_vel_err = obj_vel[:, 3:] - ref_vel[:, 3:]             # (N, 3)
+        torque = self.voc_kp_rot * rot_err - self.voc_kv_rot * ang_vel_err
+
+        # IsaacLab expects (num_envs, num_bodies, 3); cube has one body.
+        self.object.set_external_force_and_torque(
+            force.unsqueeze(1), torque.unsqueeze(1), is_global=True,
+        )
 
 
     def get_joint_targets_A(self):
@@ -403,7 +503,12 @@ class BoxhingeEnv(DirectRLEnv):
             sampled_phase = self.obj_phase_delay_buf[fires_idx, 0]
             sampled_pos  = sampled[:, :3]
             sampled_quat = sampled[:, 3:]
-            # print(sampled)
+            # Per-episode constant bias (set on reset). Models systematic calibration error
+            # — the offset persists for the whole episode, so the policy can't average it
+            # out across frames. Applied BEFORE per-fire jitter so the bias is the dominant
+            # systematic component and per-fire noise is residual detection jitter on top.
+            sampled_pos = sampled_pos + self.obj_obs_bias_pos[fires_idx]
+            sampled_quat = quat_mul(self.obj_obs_bias_ori_quat[fires_idx], sampled_quat)
             # Per-fire noise: applied only on fresh samples so held readings don't re-jitter.
             sampled_pos += self.cfg.obs_obj_pos_noise * torch.randn(n_f, 3, device=self.device)
             if self.cfg.obs_obj_ori_noise > 0:
@@ -646,6 +751,44 @@ class BoxhingeEnv(DirectRLEnv):
         self.obj_obs_last_rel[env_ids, 3]  = 1.0  # identity quat (wxyz)
         self.obj_obs_counter[env_ids] = self.cfg.obs_obj_update_period
 
+        # Sample fresh per-episode constant bias for the box obs. Held for the entire
+        # episode, applied in _get_noisy_obj_obs's fire branch. Position bias is direct
+        # additive; orientation bias stored as a small-angle quat for direct quat_mul.
+        n_b = len(env_ids)
+        if self.cfg.obs_obj_pos_bias_std > 0:
+            self.obj_obs_bias_pos[env_ids] = (
+                self.cfg.obs_obj_pos_bias_std * torch.randn(n_b, 3, device=self.device)
+            )
+        else:
+            self.obj_obs_bias_pos[env_ids] = 0.0
+        if self.cfg.obs_obj_ori_bias_std > 0:
+            aa = self.cfg.obs_obj_ori_bias_std * torch.randn(n_b, 3, device=self.device)
+            bias_quat = torch.cat([torch.ones(n_b, 1, device=self.device), 0.5 * aa], dim=-1)
+            bias_quat = bias_quat / bias_quat.norm(dim=-1, keepdim=True)
+            self.obj_obs_bias_ori_quat[env_ids] = bias_quat
+        else:
+            self.obj_obs_bias_ori_quat[env_ids, 0] = 1.0
+            self.obj_obs_bias_ori_quat[env_ids, 1:] = 0.0
+
+        # === VOC: push completed-episode normalized rewards into the global ring buffer.
+        # Must run BEFORE we zero the per-env episode trackers below. Episodes with zero
+        # steps (shouldn't happen post-reset, but defensive) are skipped via clamp.
+        n = len(env_ids)
+        ep_steps = self._voc_ep_steps[env_ids].clamp(min=1).float()
+        norm_task = self._voc_ep_rew_task[env_ids] / ep_steps
+        norm_track = self._voc_ep_rew_track[env_ids] / ep_steps
+        # Vectorized ring-buffer write: place these n values at consecutive slots starting
+        # from _voc_buf_idx, wrapping mod window_size.
+        W = self.cfg.voc_reward_window_size
+        slots = (self._voc_buf_idx + torch.arange(n, device=self.device)) % W
+        self._voc_buf_task[slots] = norm_task
+        self._voc_buf_track[slots] = norm_track
+        self._voc_buf_idx = int((self._voc_buf_idx + n) % W)
+        # Reset per-env accumulators for the new episode.
+        self._voc_ep_rew_task[env_ids] = 0.0
+        self._voc_ep_rew_track[env_ids] = 0.0
+        self._voc_ep_steps[env_ids] = 0
+
         # Reset prev variables. prev_actions tracks the previous raw residual action
         # (units: policy output, ≈ [-1, 1]), NOT joint positions — reset to 0 so the
         # first-step action_rate penalty isn't a giant spike from the unit mismatch.
@@ -686,24 +829,38 @@ class BoxhingeEnv(DirectRLEnv):
         return torch.exp(-error / (sigma ** 2))
 
     def _get_rewards(self) -> torch.Tensor:
-        # Task Reward
+        # Task Reward — two aggregation forms:
+        #   "sum"     (legacy): w_pos·exp(-d²/σ²) + w_quat·exp(-d²/σ²) [+ vel terms]
+        #   "product" (DexMachina r_task = r_pos·r_rot): exp(-β_pos·d) · exp(-β_rot·d).
+        # In product form rew_obj_pos / rew_obj_quat hold the per-axis kernel values
+        # (used for logging); rew_task_unweighted is the actual product. Velocity terms
+        # are zeroed in product mode (DexMachina doesn't have them either).
         obj_pos_error = self._get_obj_pos_error()
-        rew_obj_pos = self.cfg.w_obj_pos * self._reward_track(obj_pos_error ** 2, self.cfg.sigma_obj_pos, self.cfg.tol_obj_pos)
-
         obj_quat_error = self._get_obj_quat_error()
-        rew_obj_quat = self.cfg.w_obj_quat * self._reward_track(obj_quat_error ** 2, self.cfg.sigma_obj_quat, self.cfg.tol_obj_quat)
 
-        # Object velocity tracking, split linear vs angular to keep kernel sigmas matched
-        # to each quantity's natural scale. Instantaneous signal that catches "policy
-        # stopped pushing" before obj_pos_error integrates up to termination threshold.
-        obj_vel_rel = self._get_obj_vel(relative=True)
-        obj_lin_vel_error = obj_vel_rel[:, :3].norm(dim=-1)
-        obj_ang_vel_error = obj_vel_rel[:, 3:].norm(dim=-1)
-        rew_obj_lin_vel = self.cfg.w_obj_lin_vel * self._reward_track(
-            obj_lin_vel_error ** 2, self.cfg.sigma_obj_lin_vel, self.cfg.tol_obj_lin_vel)
-        rew_obj_ang_vel = self.cfg.w_obj_ang_vel * self._reward_track(
-            obj_ang_vel_error ** 2, self.cfg.sigma_obj_ang_vel, self.cfg.tol_obj_ang_vel)
-        rew_obj_vel = rew_obj_lin_vel + rew_obj_ang_vel
+        if self.cfg.task_reward_form == "product":
+            r_pos = torch.exp(-self.cfg.task_beta_pos * obj_pos_error)
+            r_rot = torch.exp(-self.cfg.task_beta_rot * obj_quat_error)
+            rew_obj_pos = r_pos
+            rew_obj_quat = r_rot
+            rew_obj_lin_vel = torch.zeros_like(r_pos)
+            rew_obj_ang_vel = torch.zeros_like(r_pos)
+            rew_obj_vel = rew_obj_lin_vel + rew_obj_ang_vel
+            rew_task_unweighted = r_pos * r_rot
+        else:
+            rew_obj_pos = self.cfg.w_obj_pos * self._reward_track(
+                obj_pos_error ** 2, self.cfg.sigma_obj_pos, self.cfg.tol_obj_pos)
+            rew_obj_quat = self.cfg.w_obj_quat * self._reward_track(
+                obj_quat_error ** 2, self.cfg.sigma_obj_quat, self.cfg.tol_obj_quat)
+            obj_vel_rel = self._get_obj_vel(relative=True)
+            obj_lin_vel_error = obj_vel_rel[:, :3].norm(dim=-1)
+            obj_ang_vel_error = obj_vel_rel[:, 3:].norm(dim=-1)
+            rew_obj_lin_vel = self.cfg.w_obj_lin_vel * self._reward_track(
+                obj_lin_vel_error ** 2, self.cfg.sigma_obj_lin_vel, self.cfg.tol_obj_lin_vel)
+            rew_obj_ang_vel = self.cfg.w_obj_ang_vel * self._reward_track(
+                obj_ang_vel_error ** 2, self.cfg.sigma_obj_ang_vel, self.cfg.tol_obj_ang_vel)
+            rew_obj_vel = rew_obj_lin_vel + rew_obj_ang_vel
+            rew_task_unweighted = rew_obj_pos + rew_obj_quat + rew_obj_vel
 
         # Curriculum α drives (1) the reward-weight ramp, (2) the mode-D action blend, and
         # (3) the mode-D policy-regularization scaling. common_step_counter increments once
@@ -712,7 +869,11 @@ class BoxhingeEnv(DirectRLEnv):
         w_task_eff  = self.cfg.w_task_start  + (self.cfg.w_task  - self.cfg.w_task_start)  * alpha
         w_track_eff = self.cfg.w_track_start + (self.cfg.w_track - self.cfg.w_track_start) * alpha
 
-        rew_task = w_task_eff * (rew_obj_pos + rew_obj_quat + rew_obj_vel)
+        rew_task = w_task_eff * rew_task_unweighted
+        if self.cfg.task_scale_by_dphase:
+            # Per-step disincentive against pausing: at dphase=0 task → 0, so the policy
+            # doesn't get paid for pausing. Complementary to w_total_slowdown (cumulative).
+            rew_task = self.dphase * rew_task
 
         # Tracking Reward — phase-exclusive: relative EE-in-box-frame when the reference
         # expects contact (gate=1), absolute EE / joint tracking elsewhere (gate=0). One
@@ -729,8 +890,17 @@ class BoxhingeEnv(DirectRLEnv):
         eef_quat_error = self._get_EE_quat_error()
         rew_EE_quat = abs_gate * self.cfg.w_eef_quat * self._reward_track(eef_quat_error ** 2, self.cfg.sigma_eef_quat, self.cfg.tol_eef_quat)
 
-        joint_pos_error = (self._get_joint_pos(relative=True) ** 2).sum(dim=-1)
-        rew_joint_pos = abs_gate * self.cfg.w_joint_pos * self._reward_track(joint_pos_error, self.cfg.sigma_joint_pos, self.cfg.tol_joint_pos)
+        # Behavior-cloning-style joint tracking (DexMachina r_bc, Eq. in §4.2):
+        #   r = (1/J) Σ exp(-||q̂_i - q_i||² / σ²)
+        # Per-joint kernel evaluated independently, then averaged across joints. Different
+        # from the previous "sum-then-kernel" form, which let one bad joint be hidden by
+        # the others — here each joint's deviation enters its own exp and the mean is
+        # bounded in [0, 1] regardless of the number of joints.
+        joint_pos_err_per_joint = self._get_joint_pos(relative=True) ** 2  # (N, J)
+        joint_pos_kernels = self._reward_track(
+            joint_pos_err_per_joint, self.cfg.sigma_joint_pos, self.cfg.tol_joint_pos
+        )  # (N, J) — _reward_track broadcasts over the trailing axis
+        rew_joint_pos = abs_gate * self.cfg.w_joint_pos * joint_pos_kernels.mean(dim=-1)
 
         # Relative EE-in-box-frame tracking (gate=1). Mutually exclusive with the absolute
         # trackers above (which use abs_gate = 1 - gate).
@@ -741,6 +911,8 @@ class BoxhingeEnv(DirectRLEnv):
             eef_box_rel_quat_err ** 2, self.cfg.sigma_eef_box_rel_quat, self.cfg.tol_eef_box_rel_quat)
 
         rew_track = w_track_eff * (rew_EE_pos + rew_EE_quat + rew_joint_pos + rew_eef_box_rel_pos + rew_eef_box_rel_quat)
+        if self.cfg.track_scale_by_dphase:
+            rew_track = self.dphase * rew_track
 
         # Regularization Reward
         joint_acc = (self._get_joint_vel() - self.prev_joint_vel) / self.dt
@@ -890,11 +1062,102 @@ class BoxhingeEnv(DirectRLEnv):
         # keeps short pause-to-recover strategies positive-EV while bounding total pause cost.
         total_reward = rew_task + rew_track + rew_completion - rew_regularization
 
+        # === VOC: accumulate per-env episode rewards for the decay check ===
+        # We track the *unweighted* task and tracking signals so thresholds correspond
+        # directly to per-step kernel values (in [0, 1]) rather than to weighted sums whose
+        # scale would shift with α / w_task etc.
+        rew_track_unweighted_per_step = (
+            rew_EE_pos + rew_EE_quat + rew_joint_pos + rew_eef_box_rel_pos + rew_eef_box_rel_quat
+        )
+        self._voc_ep_rew_task += rew_task_unweighted
+        self._voc_ep_rew_track += rew_track_unweighted_per_step
+        self._voc_ep_steps += 1
+        # Decay check is rate-limited to avoid hammering it every step.
+        self._voc_decay_step_counter += 1
+        if (self.cfg.voc_enabled
+                and self.voc_kp_pos > 0.0
+                and self._voc_decay_step_counter >= self.cfg.voc_decay_check_interval):
+            self._voc_decay_step_counter = 0
+            self._voc_decay_check()
+
+        # Logs (extras["log"] was assigned by the block above; just append VOC entries)
+        self.extras["log"]["VOC/kp_pos"] = torch.tensor(self.voc_kp_pos, device=self.device)
+        self.extras["log"]["VOC/kp_rot"] = torch.tensor(self.voc_kp_rot, device=self.device)
+        self.extras["log"]["VOC/kv_pos"] = torch.tensor(self.voc_kv_pos, device=self.device)
+        self.extras["log"]["VOC/kv_rot"] = torch.tensor(self.voc_kv_rot, device=self.device)
+        # Recent-episode means used by the threshold check (NaN if buffer is empty).
+        valid_t = self._voc_buf_task[~torch.isnan(self._voc_buf_task)]
+        valid_k = self._voc_buf_track[~torch.isnan(self._voc_buf_track)]
+        self.extras["log"]["VOC/recent_task_mean"] = (
+            valid_t.mean() if valid_t.numel() else torch.tensor(float("nan"), device=self.device)
+        )
+        self.extras["log"]["VOC/recent_track_mean"] = (
+            valid_k.mean() if valid_k.numel() else torch.tensor(float("nan"), device=self.device)
+        )
+
         # Update prev residual action / joint vel (first 6 dims of self.actions are residuals).
         self.prev_actions[:] = self.actions[:, :6]
         self.prev_joint_vel[:] = self._get_joint_vel()
 
         return total_reward
+
+    def _voc_decay_check(self):
+        """Decay VOC gains if all tracked reward-category trailing means exceed thresholds.
+
+        Mirrors DexMachina Algorithm 1: deque-based mean of normalized cumulative rewards;
+        decay only when ALL tracked categories pass their thresholds; below `voc_kp_min`
+        the controller is fully zeroed out. Buffer is filled in `_reset_idx` whenever an
+        env's episode ends.
+
+        Warmup gate: no decay during the first `voc_decay_warmup_steps` env steps. Without
+        this gate, the trailing-mean buffer fills with high values quickly (because
+        VOC + controller tracking together produce high task/track reward even when the
+        policy has done nothing), and decay starts firing every check interval — driving
+        kp to a small fraction of initial before the policy has learned to compensate.
+        """
+        if self.common_step_counter < self.cfg.voc_decay_warmup_steps:
+            return
+        valid_task = self._voc_buf_task[~torch.isnan(self._voc_buf_task)]
+        valid_track = self._voc_buf_track[~torch.isnan(self._voc_buf_track)]
+        # Need at least half the window filled before trusting the mean.
+        min_samples = self.cfg.voc_reward_window_size // 2
+        if valid_task.numel() < min_samples or valid_track.numel() < min_samples:
+            return
+        if (valid_task.mean() < self.cfg.voc_threshold_task or
+                valid_track.mean() < self.cfg.voc_threshold_track):
+            return
+        # All categories pass — decay.
+        self.voc_kp_pos *= self.cfg.voc_decay_phi_p
+        self.voc_kp_rot *= self.cfg.voc_decay_phi_p
+        self.voc_kv_pos *= self.cfg.voc_decay_phi_v
+        self.voc_kv_rot *= self.cfg.voc_decay_phi_v
+        if self.voc_kp_pos < self.cfg.voc_kp_min:
+            # Snap to zero so `_apply_voc` short-circuits cleanly.
+            self.voc_kp_pos = 0.0
+            self.voc_kp_rot = 0.0
+            self.voc_kv_pos = 0.0
+            self.voc_kv_rot = 0.0
+        self._save_voc_state()
+
+    def _save_voc_state(self):
+        """Persist the current VOC runtime gains to <log_dir>/voc_state.npz so play.py /
+        record.py can resume eval at the trained-end VOC level (via --keep_voc) instead
+        of the cfg's initial values. Called only on decay events (so during play, when
+        VOC is overridden to 0, no decay fires and no overwrite happens). Best-effort —
+        a write failure shouldn't crash training."""
+        log_dir = getattr(self.cfg, "log_dir", None)
+        if not log_dir:
+            return
+        try:
+            np.savez(
+                os.path.join(log_dir, "voc_state.npz"),
+                voc_kp_pos=self.voc_kp_pos,
+                voc_kp_rot=self.voc_kp_rot,
+                voc_kv_pos=self.voc_kv_pos,
+                voc_kv_rot=self.voc_kv_rot,
+            )
+        except OSError:
+            pass
 
     def _get_joint_pos(self, relative=False):
         joint_pos = self.ur5e.data.joint_pos.clone()

@@ -58,6 +58,11 @@ TABLE_CFG = RigidObjectCfg(
 
 @configclass
 class EventCfg:
+    # Step 2 of sim2real: re-widened DR ranges. Actuator gains widened MORE than the
+    # other fields (0.7-1.3 vs ±20% on others) because the real UR5e's internal
+    # controller is impossible to match in sim — wide gain DR forces the policy to
+    # work across closed-loop dynamics it can't predict, which is what deployment
+    # actually looks like.
     object_physics_material = EventTermCfg(
         func=mdp.randomize_rigid_body_material,
         mode="reset",
@@ -85,9 +90,28 @@ class EventCfg:
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("object"),
-            "mass_distribution_params": (0.9, 1.1),
+            "mass_distribution_params": (0.85, 1.15),
             "operation": "scale",
             "distribution": "uniform"
+        },
+    )
+    # CoM offset randomization (sim2real). com_range values are absolute meters added
+    # to the geometric-center CoM. For a 0.235x0.34x0.27m box, ±4cm in xy is ~25-34% of
+    # the half-dimension — captures meaningful asymmetric content / hollow interior,
+    # while staying inside the box geometry (so the contact point is still physically
+    # reasonable). ±2cm in z because the box is shortest in that dim.
+    #
+    # IMPORTANT: mode="startup" (NOT "reset"). The IsaacLab implementation does
+    # `coms += rand_samples`, not `coms = baseline + rand_samples`, so calling on every
+    # reset accumulates the offset (random walk with variance growing in N). The official
+    # docstring recommends one-shot use — startup-mode samples once per env at training
+    # start and holds it. Diversity comes from the many envs, not per-episode resampling.
+    object_com = EventTermCfg(
+        func=mdp.randomize_rigid_body_com,
+        mode="startup",
+        params={
+            "asset_cfg": SceneEntityCfg("object"),
+            "com_range": {"x": (-0.02, 0.02), "y": (-0.02, 0.02), "z": (-0.02, 0.02)},
         },
     )
     reset_gravity = EventTermCfg(
@@ -99,13 +123,15 @@ class EventCfg:
             "distribution": "gaussian",
         },
     )
+    # Wider than the other fields (±30% vs ±20%) because real UR5e closed-loop
+    # dynamics don't match sim's PD; this is the dominant sim2real mismatch.
     actuator_gains = EventTermCfg(
         func=mdp.randomize_actuator_gains,
         mode="reset",
         params={
             "asset_cfg": SceneEntityCfg("ur5e"),
-            "stiffness_distribution_params": (0.8, 1.2),
-            "damping_distribution_params": (0.8, 1.2),
+            "stiffness_distribution_params": (0.7, 1.3),
+            "damping_distribution_params": (0.7, 1.3),
             "operation": "scale",
             "distribution": "uniform",
         },
@@ -158,14 +184,40 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # pauses are discouraged by a cumulative-quadratic penalty — `w_total_slowdown` times
     # the running sum of (1 - dphase), gated by (1 - dphase) so running (dphase=1) is free.
     # Total episode pause cost ≈ w_total_slowdown · (total_slowdown)².
-    enable_phase_slowdown = True
-    # Lower bound on dphase. dphase = (1 + (1 - dphase_min) * tanh(action[6])).clamp(dphase_min, 1).
-    # raw=0 → dphase=1 (no slowdown, neutral); raw<0 → progressive slowdown to dphase_min;
-    # raw>0 → clamped at 1 (deadzone). dphase_min=0.0 is allowed (full pause).
+    # Kept disabled — prioritizing CoM/size DR over phase slowdown for the sim2real
+    # push because CoM is empirically unknown for the real box (concrete sim2real gap)
+    # while phase slowdown is a speculative hedge against unknown timing issues. Add
+    # phase slowdown later if completion rate is still wobbly under wider physical DR.
+    enable_phase_slowdown = False
+    # Lower bound on dphase. With phase_mapping="tanh" (default):
+    #   dphase = (1 + (1 - dphase_min) * tanh(action[6])).clamp(dphase_min, 1)
+    #   raw=0 → dphase=1 (no slowdown, neutral); raw<0 → progressive slowdown;
+    #   raw>0 → clamped at 1 (deadzone). dphase_min=0.0 is allowed (full pause).
     dphase_min = 0.0
+    # Upper bound on dphase. Only meaningful for phase_mapping="cubic_bidir" (which can
+    # exceed 1). Ignored by tanh mapping (which clamps to 1).
+    dphase_max = 1.0
+    # Phase-action mapping. "tanh" = slowdown only via the original tanh+clamp formula.
+    # "cubic_bidir" = bidirectional cubic: dphase = clamp(1 + scale * raw**3, dphase_min, dphase_max)
+    # where scale = max(1-dphase_min, dphase_max-1). Cubic is flat near raw=0 (deadzone-
+    # like behavior), and saturates near the bounds — so the policy stays at dphase=1 by
+    # default and has to commit to slow/fast deviations.
+    phase_mapping: str = "tanh"
     # Wall-clock cap as multiple of nominal trajectory duration (replaces the old
     # traj_duration / dphase_min formula, which divides by zero at dphase_min=0).
     max_slowdown_multiplier = 3.0
+    # If True, multiply task reward by dphase. Per-step incentive against pausing:
+    # at dphase=0 task reward → 0, so the policy doesn't get paid for pausing while
+    # tracking a frozen reference. Complementary to w_total_slowdown (which is a
+    # cumulative-quadratic episode-level penalty); both should typically be on together
+    # — task scaling discourages pausing immediately, the cumulative penalty discourages
+    # sustained pauses.
+    task_scale_by_dphase: bool = False
+    # If True, also multiply track reward by dphase. With both task and track scaled,
+    # all per-step rewards vanish at dphase=0, so the only thing remaining is the small
+    # negative reg — pausing becomes strictly costly. Pair with the cumulative penalty
+    # for robustness against gaming.
+    track_scale_by_dphase: bool = False
 
     # Hard cap on per-episode wall-clock length, in simulator steps. When set (>0), the
     # episode terminates by time_out after this many steps regardless of phase progress,
@@ -237,7 +289,7 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     }
 
     # Action scale
-    action_scale: float | list = 0.0
+    action_scale: float | list = 0.05
 
     # Action formulation. One of:
     #   "A" — joints_target[t] + action_scale * action
@@ -249,7 +301,15 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     #   "D" — curr_joints + (joints_target[t] - joints[t]) + action_scale * action
     #         Planner's intended PD error (force direction) applied from current position,
     #         plus learned residual. Effective PD error is independent of tracking state.
-    action_mode = "D"
+    # Mode A chosen after observing mode B + VOC (kp=1000) struggle to learn: tracking
+    # peaked at 0.72 then regressed below the action_scale=0 baseline (0.65). Mode B's
+    # learning problem is "discover FF from scratch under weak gradient signal", which
+    # PPO didn't solve in this setup. Mode A's planner FF gives good baseline tracking
+    # at residual=0; the policy only needs small corrections on top — a friendlier RL
+    # problem. The earlier mode A + VOC failure (erratic motion) was driven by the
+    # combination of high reset noise + VOC yanking the cube; with reset_joint_pos_noise
+    # halved that interaction is much milder.
+    action_mode = "B"
 
     # object (cube)
     cube_cfg = CUBE_CFG
@@ -265,8 +325,16 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # shoulder_lift, elbow, wrist_1, wrist_2, wrist_3). Wrist joints have small Jacobians on
     # EE position, so they can absorb more noise without dragging the EE far from the
     # trajectory. Scalar still works (broadcasts across all 6 joints).
-    reset_joint_pos_noise = [0.1, 0.1, 0.1, 0.2, 0.2, 0.2]  # rad, per-joint std on reset
-    reset_joint_vel_noise = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # rad/s, per-joint std on reset
+    # Halved for VOC training. Mode B without FF needs the controller (kp=300) to recover
+    # from initial offset before the trajectory diverges; large initial noise compounds
+    # with the FF-lag problem. Re-widen once the policy is reliably tracking.
+    # Restored to original values (Step 2 sim2real). Halved during VOC-curriculum
+    # bring-up because mode B without FF couldn't recover from large initial joint
+    # offsets fast enough; with the policy now trained and VOC mostly decayed, the
+    # original spread (which simulates a wider band of real-robot startup states) is
+    # appropriate.
+    reset_joint_pos_noise = [0.1, 0.1, 0.1, 0.2, 0.2, 0.2]
+    reset_joint_vel_noise = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 
     # Box reset noise: xy-plane for translation / linear vel; small 3-axis rotation + ang vel.
     reset_obj_pos_xy_noise = 0.02        # m, std on box x,y position (z unchanged)
@@ -278,8 +346,21 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # observation path — rewards still see the clean ground-truth box state. Same noise
     # tensor is used for both the relative and absolute obj views in a given step so the
     # policy sees mutually consistent readings (a single noisy "sensor" produced both).
-    obs_obj_pos_noise = 0.01             # m, per-FRESH-SAMPLE Gaussian noise on box position
-    obs_obj_ori_noise = 0.02             # rad, axis-angle per-FRESH-SAMPLE noise on box orientation
+    # Per-fire noise: small per-tracker-frame jitter on top of the per-episode bias below.
+    # Magnitudes reduced from 0.005 / 0.01 since the bias term now provides the dominant
+    # systematic offset; per-fire noise just adds residual detection jitter.
+    obs_obj_pos_noise = 0.001            # m, per-FRESH-SAMPLE Gaussian noise on box position
+    obs_obj_ori_noise = 0.002            # rad, axis-angle per-FRESH-SAMPLE noise on box orientation
+
+    # Per-episode bias on the box obs (sim2real). Sampled fresh on each reset, then held
+    # constant for the entire episode. Models systematic calibration error in the
+    # camera-to-robot transform — the kind of offset that doesn't average out across
+    # frames and forces the policy to learn behaviors robust to a constant displacement.
+    # Total effective noise per step ≈ sqrt(bias_std² + per_fire_noise²) ≈ 0.01m / 0.02rad,
+    # matching the previous magnitudes but redistributing weight to the temporally-
+    # correlated component (which is more realistic for ArUco-style trackers).
+    obs_obj_pos_bias_std = 0.01          # m, per-EPISODE Gaussian std on constant box-position offset
+    obs_obj_ori_bias_std = 0.02          # rad, per-EPISODE Gaussian std on constant box-orientation offset
 
     # Box pose tracker model (sim2real). Approximates the UR5e vision tracker:
     #   - Fixed latency: every fresh sample reads exactly `obs_obj_delay_steps` env steps
@@ -295,6 +376,7 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # Reference path (planner trajectory) is NOT affected. Reward path reads clean ground
     # truth via _get_obj_pos / _get_obj_quat. To disable: set obs_obj_delay_steps=0 and
     # obs_obj_update_period=1.
+    # Re-enabled (Step 1 of sim2real) — matches the real tracker: ~260ms latency, 25Hz update.
     obs_obj_delay_steps = 13             # 260ms at 20ms env step
     obs_obj_update_period = 2            # 25Hz
 
@@ -305,7 +387,12 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     perturbation_duration_steps = 5     # how many steps the perturbation lasts
 
     # Reward parameteres. Final (end-of-curriculum) values.
-    w_task = 0.5
+    # Inverted from 0.2 / 0.8 (track-dominated) to 0.7 / 0.3 (task-dominated). Following
+    # DexMachina §4.2: "λ_task is the largest weight" — box-state reward should dominate;
+    # tracking exists as guidance. Under the old weighting, the policy maxed track (cheap
+    # kinematic following) at the expense of task, and VOC could decay past the policy's
+    # actual contact-mechanics capability because the threshold check still saw high track.
+    w_task = 0.7
     w_track = 1 - w_task
     w_regularization = 0.1
 
@@ -319,9 +406,9 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     #      (action_rate, action_norm) are scaled by (α + ε(1-α)) so the penalty
     #      tracks the action's actual effect on the env. Safety penalties (joint_limit,
     #      illegal_contact, flange_forearm, proximity, joint_acc, torque) stay unscaled.
-    alpha_warmup_steps = 24 * 750
-    w_task_start = 0.2
-    w_track_start = 0.8
+    alpha_warmup_steps = 24 * 0
+    w_task_start = 0.7
+    w_track_start = 0.3
     action_alpha_floor = 0.1
     # Optional fixed-α override. When set (≥ 0), bypasses the schedule and uses this value
     # everywhere _curriculum_alpha() is consulted. Intended for eval: play.py / record.py
@@ -330,41 +417,53 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # action blend between planner feedforward and learned residual).
     force_alpha: float = -1
 
-    # Task reward parameteresr
-    w_obj_pos = 0.2
+    # === Task reward aggregation form ===
+    # "sum"     — legacy: rew_task = w_pos·exp(-d²/σ²) + w_quat·exp(-d²/σ²) + vel terms.
+    #             Policy can compensate one bad axis with another good one.
+    # "product" — DexMachina: rew_task = exp(-β_pos·d_pos) · exp(-β_rot·d_rot). All axes
+    #             must be small for high reward; matches the paper's r_task = r_pos·r_rot.
+    #             Distances (not squared errors) — different falloff than sum form.
+    task_reward_form: str = "sum"
+    task_beta_pos: float = 50.0   # 1/m; ~2cm error → exp(-1)
+    task_beta_rot: float = 3.0    # 1/rad; ~20° error → exp(-1)
+
+    # Task reward parameters (used by sum form; still computed in product form for logging).
+    w_obj_pos = 0.3
     sigma_obj_pos = 0.05
     tol_obj_pos = 0.0
 
     w_obj_quat = 0.7
-    # Multi-sigma: wide kernel (0.2) keeps gradient alive at moderate errors,
-    # narrow kernel (0.05) pulls precision in close. Kernels are averaged in _reward_track.
-    sigma_obj_quat = (0.05, 0.15)
+    sigma_obj_quat = 0.15
     tol_obj_quat = 0.0
 
-    # Object velocity tracking — split into linear (m/s) and angular (rad/s) to avoid
-    # unit-mixing in the norm. The rotation task has reference ang-vel up to ~1.2 rad/s
-    # vs linear up to ~0.15 m/s, so the kernels have very different scales.
-    # Instantaneous signal that catches "policy stopped pushing" before obj_pos_error
-    # integrates up to the termination threshold.
-    w_obj_lin_vel = 0.05
-    sigma_obj_lin_vel = 0.08      # m/s — covers reference vel range with decent gradient
+    # Object velocity tracking left disabled — the policy reached a working solution
+    # without this signal in the prior runs, and obj_pos + obj_quat already capture
+    # trajectory matching. Adds reward-balance complexity without clear benefit.
+    w_obj_lin_vel = 0.0
+    sigma_obj_lin_vel = 0.08
     tol_obj_lin_vel = 0.0
 
-    w_obj_ang_vel = 0.05
-    sigma_obj_ang_vel = 0.2       # rad/s
+    w_obj_ang_vel = 0.0
+    sigma_obj_ang_vel = 0.2
     tol_obj_ang_vel = 0.0
 
-    # Track reward parameters
+    # Track reward parameters. Sigmas tightened (was 0.1 / 0.5) so the gradient between
+    # "rough tracking" and "precise tracking" is steep enough to overcome PPO's entropy
+    # noise. With the previous wide kernels, going from 5cm error → 1cm gave only 0.21
+    # additional reward, which gets buried under per-sample noise.
     w_eef_pos = 1.0
-    sigma_eef_pos = 0.1
+    sigma_eef_pos = 0.03    # 1cm err: 0.89; 3cm err: 0.37
     tol_eef_pos = 0.0
 
     w_eef_quat = 0.0
-    sigma_eef_quat = 0.5
+    sigma_eef_quat = 0.2    # 10° err: 0.79; 25° err: 0.20
     tol_eef_quat = 0.1
 
     w_joint_pos = 0.0
-    sigma_joint_pos = 0.2
+    # Tuned for the per-joint averaged kernel (r_bc form). At σ=0.1, a single joint with
+    # 0.1 rad error gives kernel = exp(-0.01/0.01) ≈ 0.37; 0.2 rad gives ≈ 0.018. Was 0.2
+    # under the old sum-then-kernel form; not equivalent — this is the per-joint scale.
+    sigma_joint_pos = 0.1
     tol_joint_pos = 0.0
 
     # Relative EE-box tracking: rewards matching the reference's EE-position-in-box-frame
@@ -404,7 +503,13 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     w_joint_torque = 1e-3
     tol_joint_torque = 0.0
 
-    w_action_rate = 1.0
+    # Reduced from 1e-1 (default) to 1e-2 for VOC + mode B. At 0.0 the policy was free
+    # to output wildly different residuals on consecutive steps, jittering the joint
+    # command faster than kp=300 could track (track ↓, reg ↑ from torque/contact spikes).
+    # At 0.1 the rate penalty dominated and pushed the policy toward useless-constant.
+    # 0.01 keeps the command coherent across steps without preventing the time-varying
+    # residuals that mode B needs for FF compensation during the lift.
+    w_action_rate = 5e-2  # Step 2 sim2real: bumped from 1e-2 → 5e-2 for smoother deployable actions.
     tol_action_rate = 0.0
 
     w_action_norm = 0.0
@@ -425,6 +530,13 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # this bonus, completing the trajectory is a dedicated positive terminal state.
     # TODO (follow-up): scale by final obj_pos/quat reward so quality of completion matters.
     # TODO: is this even good to have?
+    # Lowered from 50.0 → 5.0. The previous value was ~70× a single step's per-step
+    # reward, creating a sparse +50 spike that the value function has to back-propagate
+    # via GAE. Once the policy started making some episodes terminate early (causing
+    # bimodal returns: full episode +50 vs failed +0), the critic couldn't fit the
+    # distribution — value loss exploded from ~70 to ~4000, advantages became noise,
+    # policy updates became random walks. 5.0 keeps a small completion incentive
+    # without dominating the per-step reward signal.
     w_completion = 0.0
 
     w_joint_limit = 1e3
@@ -477,9 +589,59 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
         ),
     }
 
-    # - reset conditions
-    max_obj_dist_from_traj = 0.1
-    max_obj_angle_from_traj = 1.0
+    # - reset conditions. Loosened (was 0.1m / 1.0rad) for VOC training: with the virtual
+    # controller active the policy may briefly diverge before the controller pulls the box
+    # back; tight thresholds would terminate episodes before that recovery completes.
+    max_obj_dist_from_traj = 0.2
+    max_obj_angle_from_traj = 1.5
+
+    # === Virtual Object Controller (VOC) curriculum ===
+    # DexMachina-style assist: a virtual PD controller drives the cube along its reference
+    # trajectory while the policy learns the contact pattern; gain decays exponentially as
+    # the policy meets reward thresholds, eventually handing off full control. See
+    # `_apply_voc` and `_voc_decay_check` in boxhinge_env.py for the runtime logic.
+    voc_enabled: bool = True
+    # Translational stiffness chosen so the controller can overpower gravity at typical
+    # tracking offsets. For a 4.4 kg box, gravity ≈ 43 N; at 1000 N/m a 5 cm error gives
+    # 50 N — comfortably above gravity, so the VOC dominates object dynamics during the
+    # high-gain phase. Tune up if the box still droops; tune down if the controller
+    # overshoots / oscillates against contact.
+    voc_kp_pos: float = 1000.0    # N/m, initial translational stiffness
+    voc_kp_rot: float = 100.0     # Nm/rad, initial rotational stiffness
+    voc_kp_min: float = 10        # absolute floor; below this kp/kv set to zero
+    # Critical-damping multipliers: kv = scale · sqrt(kp · effective_inertia).
+    voc_kv_pos_scale: float = 2.0
+    voc_kv_rot_scale: float = 2.0
+    voc_decay_phi_p: float = 0.99  # multiplicative decay factor on kp per decay event
+    voc_decay_phi_v: float = 0.99  # multiplicative decay factor on kv per decay event
+    # How often (in env steps) to check the decay condition. Decay only fires when ALL
+    # tracked reward means exceed their thresholds. Increased from 24 → 100 so decay
+    # can fire at most every ~4 iters (vs every iter); combined with phi=0.99 this gives
+    # a smooth, slow decay that doesn't outpace the policy's ability to adapt.
+    voc_decay_check_interval: int = 100
+    # Trailing window of completed-episode normalized rewards. Smaller window = decay
+    # reacts faster to current performance (less lag behind reality), at the cost of
+    # noisier mean estimates.
+    voc_reward_window_size: int = 100
+    # Per-category normalized-reward thresholds. Decay triggers only when the trailing
+    # mean of every listed category exceeds its threshold. Higher thresholds = decay
+    # only fires once the policy is genuinely tracking well, not just when VOC alone
+    # produces high reward.
+    # Raised from 0.5 → 0.65 (Step 2 sim2real): with wider DR the trailing means stay
+    # comfortably above 0.5 even when 5–10% of episodes terminate early (the successful
+    # majority dominate the mean). 0.65 is calibrated so a small completion-rate dip
+    # (≈95%) brings the mean below threshold and pauses decay, giving the policy time
+    # to adapt to the kp level before VOC weakens further.
+    voc_threshold_task: float = 0.6     # task reward (obj_pos · obj_quat or sum form)
+    voc_threshold_track: float = 0.5    # tracking reward (eef_box_rel + eef_pos + ...)
+    # Warmup period (in env steps via common_step_counter) before any decay can fire.
+    # common_step_counter increments by 1 per env step (not per env*step), so this
+    # divides by num_steps_per_env=24 to get "iterations": 5000 / 24 ≈ 208 iters.
+    # Chosen so decay starts while the policy still has meaningful exploration
+    # (mean_noise_std > 0.3 for the boxhinge run), not after it has frozen at ~0.08.
+    # If decay starts when the policy is already deterministic, it can't adapt to
+    # each kp level — adaptation requires exploring new residual patterns.
+    voc_decay_warmup_steps: int = 0
 
 
 def get_ur5e_cfg(
