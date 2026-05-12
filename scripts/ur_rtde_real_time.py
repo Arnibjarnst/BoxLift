@@ -36,11 +36,6 @@ POSE_ESTIMATION_PORT = 5555
 BOX_BOARD_ID = "0"
 POSE_FIRST_POSE_TIMEOUT_S = 30.0
 
-# Fixed transform from the pose-estimation world frame into the robot's frame.
-# The policy was trained with the robot base at (0,0,0), so we shift box-pose readings
-# by this translation. Rotation is identity, so quaternions pass through unchanged.
-WORLD_TO_ROBOT_TRANSLATION = np.array([0.02, 0.508, 0.018], dtype=np.float32)
-
 
 # ---------------------------
 # Argument parsing
@@ -342,7 +337,7 @@ def log(i, target_q, phase):
         actual_obj_pos = np.full(3, np.nan, dtype=np.float32)
         actual_obj_quat = np.full(4, np.nan, dtype=np.float32)
     else:
-        actual_obj_pos = box_pose[:3].astype(np.float32) + WORLD_TO_ROBOT_TRANSLATION
+        actual_obj_pos = box_pose[:3].astype(np.float32)
         actual_obj_quat = box_pose[3:].astype(np.float32)
 
     if i >= 0:
@@ -581,7 +576,7 @@ def policy_thread():
             if include_object_obs:
                 box_pose = pose_listener.get_pose(BOX_BOARD_ID) if pose_listener is not None else None
                 if box_pose is not None:
-                    actual_obj_pos = box_pose[:3].astype(np.float32) + WORLD_TO_ROBOT_TRANSLATION
+                    actual_obj_pos = box_pose[:3].astype(np.float32)
                     actual_obj_quat = box_pose[3:].astype(np.float32)
 
                 # On the real robot, feed measured pose into the policy. In sim (or if the
