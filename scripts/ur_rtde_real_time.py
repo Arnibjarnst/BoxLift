@@ -47,7 +47,29 @@ parser.add_argument("--real_robot", action=argparse.BooleanOptionalAction)
 parser.add_argument("--gain", type=float, default=None, help="servoJ gain (overrides default)")
 parser.add_argument("--lookahead", type=float, default=None, help="servoJ lookahead_time (overrides default)")
 parser.add_argument("--action_scale", type=float, default=None, help="Override action scale (use 0 for pure trajectory)")
+parser.add_argument("--isaacsim", action="store_true",
+                    help="Run the policy against IsaacSim instead of URSim/RTDE. Used to diagnose "
+                         "whether oscillation observed on URSim is caused by deployment-script bugs "
+                         "(would persist in IsaacSim too) or URSim-specific behavior (would not). "
+                         "Skips RTDE/pose-listener setup; runs single-threaded.")
+# Lazy import of AppLauncher only if we may need it — keeps the rtde-only path light.
+import sys as _sys
+if any(a == "--isaacsim" for a in _sys.argv):
+    from isaaclab.app import AppLauncher
+    AppLauncher.add_app_launcher_args(parser)
 args = parser.parse_args()
+
+# If running in IsaacSim mode, launch the omniverse app immediately so subsequent
+# IsaacLab imports work. Disable pose estimation (the cube
+# state comes from sim, not a tracker).
+_isaacsim_app = None
+if args.isaacsim:
+    # Respect user's --headless choice (defaults to False so the viewer opens). Pass
+    # --headless explicitly for batch / headless runs.
+    _isaacsim_app = AppLauncher(args).app
+    ENABLE_POSE_ESTIMATION = False
+    print(f"[INFO] --isaacsim: running policy against IsaacSim backend "
+          f"(headless={getattr(args, 'headless', False)}, no RTDE, no tracker, single-threaded).")
 
 # Load training config
 with open(os.path.join(args.run_dir, "params", "env.yaml"), "r") as f:
@@ -266,28 +288,31 @@ else:
         robot_ip = "192.168.56.1"
 
 
-logger.info(f"Connecting to robot at {robot_ip}", extra={"step": -1})
-
 rtde_frequency = 500
 dt = 1 / rtde_frequency
 policy_decimation = 10
 max_steps = (len(joints) - 2) * policy_decimation
 max_wallclock_steps = max_steps * 2
 
-rtde_r = RTDEReceive(robot_ip, rtde_frequency)
-print("RTDE_r connected successfully")
-rtde_c = RTDEControl(robot_ip, rtde_frequency, RTDEControl.FLAG_VERBOSE | RTDEControl.FLAG_UPLOAD_SCRIPT)
+if not args.isaacsim:
+    logger.info(f"Connecting to robot at {robot_ip}", extra={"step": -1})
+    rtde_r = RTDEReceive(robot_ip, rtde_frequency)
+    print("RTDE_r connected successfully")
+    rtde_c = RTDEControl(robot_ip, rtde_frequency, RTDEControl.FLAG_VERBOSE | RTDEControl.FLAG_UPLOAD_SCRIPT)
+else:
+    rtde_r = None
+    rtde_c = None
 
 # UR5e max torques
 max_torque = np.array([150.0, 150.0, 150.0, 28.0, 28.0, 28.0])
 
 logger.info("Connection established", extra={"step": -1})
 
-# Attempt to clear errors and reset robot state
-logger.info("Resetting robot state", extra={"step": -1})
-rtde_c.reuploadScript()
-
-rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
+if not args.isaacsim:
+    # Attempt to clear errors and reset robot state
+    logger.info("Resetting robot state", extra={"step": -1})
+    rtde_c.reuploadScript()
+    rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
 
 np.set_printoptions(suppress=True, precision=8)
 
@@ -416,49 +441,53 @@ joint_limits_lower = np.array([-2*np.pi, -2*np.pi, -np.pi, -2*np.pi, -2*np.pi, -
 joint_limits_upper = np.array([ 2*np.pi,  2*np.pi,  np.pi,  2*np.pi,  2*np.pi,  2*np.pi])
 
 # ---------------------------
-# Move To Start
+# Move To Start (RTDE-only; IsaacSim mode starts at phase 0 via env reset)
 # ---------------------------
-try:
-    logger.info(
-        f"moveJ to initial position {joints[0]}",
-        extra={"step": -1},
-    )
+if not args.isaacsim:
+    try:
+        logger.info(
+            f"moveJ to initial position {joints[0]}",
+            extra={"step": -1},
+        )
 
-    last_time = time.perf_counter()
+        last_time = time.perf_counter()
 
-    success = rtde_c.moveJ(joints[0], 0.5, 1.0, True)
-    while not success:
-        curr_time = time.perf_counter()
         success = rtde_c.moveJ(joints[0], 0.5, 1.0, True)
-        if curr_time - last_time > 5:
-            raise TimeoutError("Ran out of time getting to initial position")
-        
-        time.sleep(dt)
+        while not success:
+            curr_time = time.perf_counter()
+            success = rtde_c.moveJ(joints[0], 0.5, 1.0, True)
+            if curr_time - last_time > 5:
+                raise TimeoutError("Ran out of time getting to initial position")
 
-    last_time = time.perf_counter()
+            time.sleep(dt)
 
-    while rtde_c.isSteady() == False:
-        log(-1, joints[0], 0.0)
+        last_time = time.perf_counter()
 
-        # No need to be accurate
-        time.sleep(dt)
+        while rtde_c.isSteady() == False:
+            log(-1, joints[0], 0.0)
 
-    logger.info(
-        f"moveJ finished to initial position {joints[0]}",
-        extra={"step": -1},
-    )
-except KeyboardInterrupt:
+            # No need to be accurate
+            time.sleep(dt)
 
-    logger.warning(
-        "Execution interrupted by user",
-        extra={"step": -1},
-    )
+        logger.info(
+            f"moveJ finished to initial position {joints[0]}",
+            extra={"step": -1},
+        )
+    except KeyboardInterrupt:
 
-finally:
-    rtde_c.stopJ()
+        logger.warning(
+            "Execution interrupted by user",
+            extra={"step": -1},
+        )
+
+    finally:
+        rtde_c.stopJ()
 
 data_lock = threading.Lock()
-current_target_q = np.array(rtde_r.getActualQ())
+if not args.isaacsim:
+    current_target_q = np.array(rtde_r.getActualQ())
+else:
+    current_target_q = np.asarray(joints[0], dtype=np.float64)
 previous_target_q = np.copy(current_target_q)
 # Float trajectory phase (matches the policy thread's `phase` variable). Updated under
 # data_lock by the policy thread; the control thread blends previous→current the same
@@ -704,7 +733,6 @@ def policy_thread():
 
 def control_thread():
     step_counter = 0
-    alpha = 0
     try:
         while True:
             t_start = rtde_c.initPeriod()
@@ -715,12 +743,13 @@ def control_thread():
             if new_data_event.is_set():
                 new_data_event.clear()
 
-                # Reset interpolation alpha
-                alpha = 1.0 / policy_decimation
-
             with data_lock:
-                interp_q = (1 - alpha) * previous_target_q + alpha * current_target_q
-                interp_phase = (1 - alpha) * previous_phase + alpha * current_phase
+                # ZOH: send the policy-thread-computed target unchanged. Training now
+                # caches the target once per policy step (see _pre_physics_step in
+                # boxhinge/boxpush envs) — so a single fixed target per 20ms window with
+                # the low-level controller chasing it at 500Hz is a clean 1:1 match.
+                interp_q = np.copy(current_target_q)
+                interp_phase = current_phase
 
                 # 4. Command the robot
                 rtde_c.servoJ(
@@ -732,7 +761,6 @@ def control_thread():
                     gain,
                 )
 
-            alpha = min(alpha + 1.0 / policy_decimation, 1.0)
             step_counter += 1
 
             print(rtde_r.getActualTCPPose())
@@ -766,6 +794,233 @@ def control_thread():
             f"Execution finished. Log written to {log_path}",
             extra={"step": -1},
         )
+
+
+if args.isaacsim:
+    # =====================================================================
+    # IsaacSim backend: single-threaded loop that reuses the same obs
+    # construction logic as policy_thread but reads/writes IsaacSim state.
+    # =====================================================================
+    import gymnasium as gym
+    import torch
+    import BoxLift.tasks  # noqa: F401, registers env
+    from BoxLift.tasks.direct.boxhinge.boxhinge_env_cfg import BoxhingeEnvCfg
+
+    # Build env cfg using the same saved env.yaml fields that play.py / record.py restore.
+    isaac_cfg = BoxhingeEnvCfg()
+    isaac_cfg.scene.num_envs = 1
+    isaac_cfg.episode_length_s = 1e6  # let us run as long as we want
+    isaac_cfg.trajectory_path = env_cfg["trajectory_path"]
+    # Restore obs/action layout
+    for _f in ("obs_history_steps", "action_mode", "action_scale", "include_object_obs",
+               "include_absolute_obs", "future_obs_steps", "include_prev_actions",
+               "enable_phase_slowdown", "dphase_min", "dphase_max", "phase_mapping",
+               "observation_space", "kp", "kd", "effort_limit", "velocity_limit",
+               "actuator_type"):
+        if _f in env_cfg and hasattr(isaac_cfg, _f):
+            setattr(isaac_cfg, _f, env_cfg[_f])
+    # Physics at 500Hz (matching URSim/real RTDE rate). Target is computed once per
+    # policy step (before the substep loop) — matching the env's new behavior where
+    # _pre_physics_step caches the target and _apply_action just re-sends it. Same
+    # target held across all 10 substeps, low-level PD chases it.
+    isaac_cfg.physics_dt = dt
+    isaac_cfg.decimation = policy_decimation
+
+    # Clean test: disable all noise / DR / perturbations / VOC / reset noise.
+    isaac_cfg.obs_obj_pos_noise = 0.0
+    isaac_cfg.obs_obj_ori_noise = 0.0
+    isaac_cfg.obs_obj_pos_bias_std = 0.0
+    isaac_cfg.obs_obj_ori_bias_std = 0.0
+    isaac_cfg.obs_obj_delay_steps = 0
+    isaac_cfg.obs_obj_update_period = 1
+    isaac_cfg.voc_enabled = False
+    isaac_cfg.perturbation_probability = 0.0
+    isaac_cfg.reset_joint_pos_noise = [0.0] * 6
+    isaac_cfg.reset_joint_vel_noise = [0.0] * 6
+    isaac_cfg.reset_obj_pos_xy_noise = 0.0
+    isaac_cfg.reset_obj_ori_noise = 0.0
+    isaac_cfg.reset_obj_lin_vel_xy_noise = 0.0
+    isaac_cfg.reset_obj_ang_vel_noise = 0.0
+    isaac_cfg.events.actuator_gains = None
+    isaac_cfg.events.object_physics_material = None
+    isaac_cfg.events.table_physics_material = None
+    isaac_cfg.events.object_mass = None
+    if hasattr(isaac_cfg.events, "object_com"):
+        isaac_cfg.events.object_com = None
+    if hasattr(isaac_cfg.events, "reset_gravity"):
+        isaac_cfg.events.reset_gravity = None
+
+    isaac_env = gym.make("Template-Boxhinge-Direct-v0", cfg=isaac_cfg)
+    _direct_env = isaac_env.unwrapped
+    ur5e_art = _direct_env.ur5e
+    isaac_sim = _direct_env.sim
+    isaac_device = _direct_env.device
+    # Force VOC off (matches play.py default)
+    if hasattr(_direct_env, "voc_kp_pos"):
+        _direct_env.voc_kp_pos = 0.0
+        _direct_env.voc_kp_rot = 0.0
+        _direct_env.voc_kv_pos = 0.0
+        _direct_env.voc_kv_rot = 0.0
+    # Hide visualization markers (cube_marker, ee_markers). They're normally driven by
+    # _pre_physics_step which we bypass — so they'd sit at their default origin pose
+    # (visible as a phantom "white box" inside the robot). The actual physics cube is
+    # still drawn correctly.
+    if hasattr(_direct_env, "cube_marker"):
+        _direct_env.cube_marker.set_visibility(False)
+    if hasattr(_direct_env, "ee_markers"):
+        _direct_env.ee_markers.set_visibility(False)
+    # Force start at phase 0. Match play.py / record.py: just call _reset_idx — calling
+    # env.reset() after this would re-randomize and undo the phase=0 override.
+    _direct_env._reset_idx(None, 0)
+
+    # State for the loop (mirrors policy_thread's locals)
+    isaac_phase = 0.0
+    isaac_prev_action = np.zeros(6, dtype=np.float32)
+    isaac_obs_history = np.zeros((obs_history_steps, per_step_features), dtype=np.float32) \
+        if "per_step_features" in globals() else None
+    # If per_step_features wasn't set yet (it's defined inside policy_thread), compute here.
+    if isaac_obs_history is None:
+        _psf = 12 + (7 if include_object_obs else 0)
+        if include_absolute_obs:
+            _psf *= 2
+        isaac_obs_history = np.zeros((obs_history_steps, _psf), dtype=np.float32)
+
+    _max_traj_idx = len(joints) - 1
+    _isaac_step = 0
+    _isaac_max_steps = (len(joints) - 2) * policy_decimation
+
+    print("[INFO] IsaacSim loop starting...")
+    try:
+        while _isaac_step < _isaac_max_steps and isaac_phase < _max_traj_idx - 1e-3:
+            actual_q  = ur5e_art.data.joint_pos[0].detach().cpu().numpy().astype(np.float64)
+            actual_qd = ur5e_art.data.joint_vel[0].detach().cpu().numpy().astype(np.float64)
+
+            joints_at_phase_l        = interp_np(joints,         isaac_phase)
+            joints_target_at_phase_l = interp_np(joints_target,  isaac_phase)
+            joint_vel_at_phase_l     = interp_np(joint_vel_ref,  isaac_phase)
+            obj_pos_at_phase_l       = interp_np(obj_poses_ref[:, :3], isaac_phase)
+            obj_quat_at_phase_l      = nlerp_np(obj_poses_ref[:, 3:], isaac_phase)
+
+            phase_obs_l = np.array([isaac_phase / _max_traj_idx])
+
+            relative_q_l  = (actual_q  - joints_at_phase_l).astype(np.float32)
+            relative_qd_l = (actual_qd - joint_vel_at_phase_l).astype(np.float32)
+            feature_parts_l = [relative_q_l, relative_qd_l]
+
+            # Match URSim mode's no-tracker fallback: feed the policy "perfect tracking"
+            # obs (rel = zeros/identity, abs = reference pose at current phase). Identical
+            # obs construction to URSim mode, so this is a pure dynamics-only swap. Reading
+            # the live cube pose here would be OOD — training used a delayed/noisy obj obs
+            # path, not a clean instantaneous one.
+            if include_object_obs:
+                feature_parts_l.append(np.zeros(3, dtype=np.float32))
+                feature_parts_l.append(IDENTITY_QUAT_WXYZ)
+
+            if include_absolute_obs:
+                feature_parts_l.append(actual_q.astype(np.float32))
+                feature_parts_l.append(actual_qd.astype(np.float32))
+                if include_object_obs:
+                    feature_parts_l.append(obj_pos_at_phase_l.astype(np.float32))
+                    feature_parts_l.append(obj_quat_at_phase_l.astype(np.float32))
+
+            curr_features = np.concatenate(feature_parts_l).astype(np.float32)
+            isaac_obs_history = np.roll(isaac_obs_history, shift=-1, axis=0)
+            isaac_obs_history[-1] = curr_features
+
+            obs_parts_l = [isaac_obs_history.flatten().astype(np.float32), phase_obs_l.astype(np.float32)]
+            if future_obs_steps:
+                inv_cur_q = quat_inv_np(obj_quat_at_phase_l)
+                fl = []
+                for k in future_obs_steps:
+                    fp = isaac_phase + float(k)
+                    fpos = interp_np(obj_poses_ref[:, :3], fp)
+                    fquat = nlerp_np(obj_poses_ref[:, 3:], fp)
+                    fl.append((fpos - obj_pos_at_phase_l).astype(np.float32))
+                    fl.append(quat_mul_np(fquat, inv_cur_q).astype(np.float32))
+                    if include_absolute_obs:
+                        fl.append(fpos.astype(np.float32))
+                        fl.append(fquat.astype(np.float32))
+                obs_parts_l.append(np.concatenate(fl).astype(np.float32))
+            if include_prev_actions:
+                obs_parts_l.append(isaac_prev_action)
+
+            obs_l = np.concatenate(obs_parts_l)[None, ...].astype(np.float32)
+            out_l = session.run([output_name], {input_name: obs_l})[0][0]
+            raw_action_l = out_l[:6].astype(np.float32)
+
+            if enable_phase_slowdown and len(out_l) >= 7:
+                raw_dp = float(out_l[6])
+                if getattr(isaac_cfg, "phase_mapping", "tanh") == "cubic_bidir":
+                    scale_d = max(1.0 - dphase_min, isaac_cfg.dphase_max - 1.0)
+                    dphase_l = float(np.clip(1.0 + scale_d * raw_dp ** 3, dphase_min, isaac_cfg.dphase_max))
+                else:
+                    dphase_l = float(np.clip(1.0 + (1.0 - dphase_min) * np.tanh(raw_dp), dphase_min, 1.0))
+            else:
+                dphase_l = 1.0
+
+            # Compute the target once per policy step using q at the start of the step,
+            # matching the env's _pre_physics_step caching behavior. Held fixed for all
+            # decimation substeps.
+            if action_mode == "A":
+                policy_target = joints_target_at_phase_l + action_scale * raw_action_l
+            elif action_mode == "B":
+                policy_target = joints_at_phase_l + action_scale * raw_action_l
+            elif action_mode == "C":
+                policy_target = actual_q + action_scale * raw_action_l
+            elif action_mode == "D":
+                _eps = action_alpha_floor
+                _gain = eff_alpha + _eps * (1.0 - eff_alpha)
+                planner_pd = joints_target_at_phase_l - joints_at_phase_l
+                policy_target = (
+                    actual_q
+                    + (1.0 - eff_alpha) * planner_pd
+                    + _gain * action_scale * raw_action_l
+                )
+            else:
+                raise ValueError(f"Unknown action_mode: {action_mode!r}")
+            policy_target = np.clip(policy_target, joint_limits_lower, joint_limits_upper)
+            target_t = torch.from_numpy(policy_target.astype(np.float32)).unsqueeze(0).to(isaac_device)
+            ur5e_art.set_joint_position_target(target_t)
+            ur5e_art.write_data_to_sim()
+
+            _render_substep = not getattr(args, "headless", True)
+            for _i in range(isaac_cfg.decimation):
+                isaac_sim.step(render=(_render_substep and _i == isaac_cfg.decimation - 1))
+                ur5e_art.update(isaac_cfg.physics_dt)
+                if hasattr(_direct_env, "object"):
+                    _direct_env.object.update(isaac_cfg.physics_dt)
+                # Read fresh state AFTER the physics step for logging.
+                substep_actual_q = ur5e_art.data.joint_pos[0].detach().cpu().numpy().astype(np.float64)
+                substep_actual_obj_pos = (
+                    _direct_env.object.data.root_pos_w[0] - _direct_env.scene.env_origins[0]
+                ).detach().cpu().numpy().astype(np.float32)
+                substep_actual_obj_quat = _direct_env.object.data.root_quat_w[0].detach().cpu().numpy().astype(np.float32)
+                substep_expected_q = joints_at_phase_l.copy()
+                tracking_log.append({
+                    "step": _isaac_step * isaac_cfg.decimation + _i,
+                    "phase": float(isaac_phase),
+                    "actual_q": substep_actual_q,
+                    "expected_q": substep_expected_q,
+                    "target_q": policy_target.copy(),
+                    "actual_obj_pos": substep_actual_obj_pos,
+                    "actual_obj_quat": substep_actual_obj_quat,
+                })
+
+            isaac_phase = float(min(isaac_phase + dphase_l, _max_traj_idx))
+            isaac_prev_action = raw_action_l
+            _isaac_step += 1
+            if _isaac_step % 100 == 0:
+                print(f"  step={_isaac_step}, phase={isaac_phase:.2f}, "
+                      f"joint_err={np.linalg.norm(actual_q - joints_at_phase_l):.4f}")
+    finally:
+        save_tracking_npz()
+        try:
+            isaac_env.close()
+        except Exception:
+            pass
+        if _isaacsim_app is not None:
+            _isaacsim_app.close()
+    sys.exit(0)
 
 
 t1 = threading.Thread(target=policy_thread, daemon=True)

@@ -729,8 +729,17 @@ class BoxpushEnv(DirectRLEnv):
         eef_quat_error = self._get_EE_quat_error()
         rew_EE_quat = abs_gate * self.cfg.w_eef_quat * self._reward_track(eef_quat_error ** 2, self.cfg.sigma_eef_quat, self.cfg.tol_eef_quat)
 
-        joint_pos_error = (self._get_joint_pos(relative=True) ** 2).sum(dim=-1)
-        rew_joint_pos = abs_gate * self.cfg.w_joint_pos * self._reward_track(joint_pos_error, self.cfg.sigma_joint_pos, self.cfg.tol_joint_pos)
+        # Behavior-cloning-style joint tracking (DexMachina r_bc, Eq. in §4.2):
+        #   r = (1/J) Σ exp(-||q̂_i - q_i||² / σ²)
+        # Per-joint kernel evaluated independently, then averaged across joints. Different
+        # from the previous "sum-then-kernel" form, which let one bad joint be hidden by
+        # the others — here each joint's deviation enters its own exp and the mean is
+        # bounded in [0, 1] regardless of the number of joints.
+        joint_pos_err_per_joint = self._get_joint_pos(relative=True) ** 2  # (N, J)
+        joint_pos_kernels = self._reward_track(
+            joint_pos_err_per_joint, self.cfg.sigma_joint_pos, self.cfg.tol_joint_pos
+        )  # (N, J) — _reward_track broadcasts over the trailing axis
+        rew_joint_pos = abs_gate * self.cfg.w_joint_pos * joint_pos_kernels.mean(dim=-1)
 
         # Relative EE-in-box-frame tracking (gate=1). Mutually exclusive with the absolute
         # trackers above (which use abs_gate = 1 - gate).

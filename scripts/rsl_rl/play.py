@@ -35,6 +35,9 @@ parser.add_argument(
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
 parser.add_argument("--trajectory_path", type=str, default=None, help="Override trajectory path (default: read from run's env.yaml)")
+parser.add_argument("--keep_voc", action="store_true", default=False,
+                    help="Eval with the VOC gains saved at the end of training (loaded from <log_dir>/voc_state.npz). "
+                         "If unset (default), VOC is forcibly disabled so eval matches deployment (kp=kv=0).")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -55,6 +58,7 @@ simulation_app = app_launcher.app
 """Rest everything follows."""
 
 import gymnasium as gym
+import numpy as np
 import os
 import re
 import time
@@ -134,9 +138,22 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.action_mode = saved_env_cfg["action_mode"]
     if "observation_space" in saved_env_cfg:
         env_cfg.observation_space = int(saved_env_cfg["observation_space"])
+    # Phase slowdown determines action_space (7 if enabled, 6 otherwise) — must be set
+    # before env creation so __post_init__ allocates the correct action head shape, or
+    # checkpoint loading will fail with a size mismatch on actor.6.weight/bias.
+    if "enable_phase_slowdown" in saved_env_cfg:
+        env_cfg.enable_phase_slowdown = bool(saved_env_cfg["enable_phase_slowdown"])
+    # Phase-mapping variants (only meaningful if enable_phase_slowdown is True). These
+    # control how action[6] is interpreted; mismatch between train and eval would make
+    # the policy's commanded dphase wrong even if shapes match.
+    for _phase_field in ("phase_mapping", "dphase_max", "dphase_min",
+                         "task_scale_by_dphase", "track_scale_by_dphase"):
+        if _phase_field in saved_env_cfg and hasattr(env_cfg, _phase_field):
+            setattr(env_cfg, _phase_field, saved_env_cfg[_phase_field])
     print(f"[INFO] obs_history_steps={getattr(env_cfg, 'obs_history_steps', None)}, "
           f"action_mode={getattr(env_cfg, 'action_mode', None)}, "
-          f"observation_space={env_cfg.observation_space}")
+          f"observation_space={env_cfg.observation_space}, "
+          f"enable_phase_slowdown={getattr(env_cfg, 'enable_phase_slowdown', None)}")
 
     # Pin curriculum α to the value the policy was trained at. The frozen policy was only
     # ever rolled out at α(ckpt_iter), and during eval the env's common_step_counter resets
@@ -162,6 +179,34 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # convert to single-agent instance if required by the RL algorithm
     if isinstance(env.unwrapped, DirectMARLEnv):
         env = multi_agent_to_single_agent(env)
+
+    # === Virtual Object Controller override at eval time ===
+    # The runtime VOC gains decayed during training are NOT in the checkpoint or env.yaml
+    # — they're saved separately to <log_dir>/voc_state.npz. By default, eval runs with
+    # VOC fully OFF so the policy is tested under deployment conditions. With --keep_voc
+    # we restore the training-end VOC gains from voc_state.npz.
+    _direct_env = env.unwrapped
+    if hasattr(_direct_env, "voc_kp_pos"):
+        if args_cli.keep_voc:
+            _voc_state_path = os.path.join(log_dir, "voc_state.npz")
+            if os.path.exists(_voc_state_path):
+                _voc_state = np.load(_voc_state_path)
+                _direct_env.voc_kp_pos = float(_voc_state["voc_kp_pos"])
+                _direct_env.voc_kp_rot = float(_voc_state["voc_kp_rot"])
+                _direct_env.voc_kv_pos = float(_voc_state["voc_kv_pos"])
+                _direct_env.voc_kv_rot = float(_voc_state["voc_kv_rot"])
+                print(f"[INFO] --keep_voc: loaded VOC state from {_voc_state_path} "
+                      f"(kp_pos={_direct_env.voc_kp_pos:.3f}, kp_rot={_direct_env.voc_kp_rot:.3f})")
+            else:
+                print(f"[WARN] --keep_voc requested but {_voc_state_path} not found; "
+                      f"VOC will use the cfg's initial values (kp_pos={_direct_env.voc_kp_pos}). "
+                      f"This is likely wrong — re-train with VOC state saving, or omit --keep_voc.")
+        else:
+            _direct_env.voc_kp_pos = 0.0
+            _direct_env.voc_kp_rot = 0.0
+            _direct_env.voc_kv_pos = 0.0
+            _direct_env.voc_kv_rot = 0.0
+            print("[INFO] VOC disabled for eval (kp=kv=0). Use --keep_voc to load training-end gains.")
 
     # wrap for video recording
     if args_cli.video:
