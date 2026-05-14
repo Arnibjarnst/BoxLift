@@ -95,6 +95,17 @@ obs_obj_delay_steps = int(env_cfg.get("obs_obj_delay_steps", 13))
 future_obs_steps = tuple(env_cfg.get("future_obs_steps", ()) or ())
 include_prev_actions = bool(env_cfg.get("include_prev_actions", False))
 include_absolute_obs = bool(env_cfg.get("include_absolute_obs", False))
+# Thresholded EE↔cube contact bool. Real-side: derive from getActualTCPForce() with a
+# baseline-offset model (the raw force has gripper-gravity bias that varies with pose
+# but is roughly constant at the trajectory start, so we capture a baseline once at
+# the rest pose and threshold ||delta|| each step). Sim-side (--isaacsim): read from
+# the env's ee_contact_sensor directly.
+include_contact_obs = bool(env_cfg.get("include_contact_obs", False))
+contact_threshold = float(env_cfg.get("contact_threshold", 0.5))
+contact_obs_delay_steps = int(env_cfg.get("contact_obs_delay_steps", 0))
+# Bit-flip noise from training — not applied at deployment (we want clean readings) but
+# kept here so the obs schema is identical. flip_prob is read but not used.
+contact_obs_flip_prob = float(env_cfg.get("contact_obs_flip_prob", 0.0))
 enable_phase_slowdown = bool(env_cfg.get("enable_phase_slowdown", False))
 # Phase-slowdown / mode-D curriculum settings. Sentinel <0 on force_alpha disables the
 # override; 1.0 ≈ "training completed warmup" which is what we usually want at deploy.
@@ -494,6 +505,21 @@ if not args.isaacsim:
 else:
     current_target_q = np.asarray(joints[0], dtype=np.float64)
 previous_target_q = np.copy(current_target_q)
+
+# Capture a baseline TCP wrench while the robot is at rest at the trajectory start
+# pose. The raw getActualTCPForce() has a static gripper-gravity bias that varies with
+# arm pose but is roughly constant at this initial pose; subtracting this baseline
+# leaves ||delta|| as a usable proxy for external contact force.
+# Only meaningful when include_contact_obs is set and RTDE is connected.
+tcp_force_baseline = np.zeros(6, dtype=np.float64)
+if include_contact_obs and not args.isaacsim and rtde_r is not None:
+    logger.info("Sampling TCP force baseline (50 readings)...", extra={"step": -1})
+    samples = np.array([rtde_r.getActualTCPForce() for _ in range(50)])
+    tcp_force_baseline = samples.mean(axis=0)
+    logger.info(
+        f"TCP force baseline (Fxyz, Txyz) = {tcp_force_baseline.round(3).tolist()}",
+        extra={"step": -1},
+    )
 # Float trajectory phase (matches the policy thread's `phase` variable). Updated under
 # data_lock by the policy thread; the control thread blends previous→current the same
 # way as target_q so we can compute the exact expected reference at any servo tick.
@@ -553,6 +579,8 @@ def policy_thread():
         per_step_features = 12 + (7 if include_object_obs else 0)
         if include_absolute_obs:
             per_step_features *= 2
+        if include_contact_obs:
+            per_step_features += 1
     # Observation history buffer: (history_steps, per_step_features). Zero-initialized to
     # match sim reset behavior.
     obs_history = np.zeros((obs_history_steps, per_step_features), dtype=np.float32)
@@ -564,6 +592,11 @@ def policy_thread():
     # iterations ago — matching the env's obj_phase_delay_buf so the rel pose comparison is
     # temporally aligned with the (already-delayed) tracker measurement.
     phase_history = np.zeros(obs_obj_delay_steps + 1, dtype=np.float32)
+    # Note: no software contact-delay buffer here. The training-side
+    # contact_obs_delay_steps exists to simulate the real TCP force sensor's intrinsic
+    # latency (~10-30ms) — at deployment that latency is already physically present in
+    # getActualTCPForce(), so applying additional software delay would double-shift it.
+    # The --isaacsim path (which has no physical delay) does apply the buffer.
     while True:
         run_policy_event.wait()
         run_policy_event.clear()
@@ -650,6 +683,23 @@ def policy_thread():
                         # Sim / no-tracker fallback: reference pose at current phase.
                         feature_parts.append(obj_pos_at_phase)
                         feature_parts.append(obj_quat_at_phase)
+            if include_contact_obs:
+                # Real-side contact bool: thresholded ||current_tcp_force - baseline||.
+                # Force-only magnitude (first 3 dims); torque component is ignored —
+                # contact with the cube manifests primarily as a translational push.
+                # The sensor's intrinsic latency (~10-30ms) is what training's
+                # contact_obs_delay_steps was modeling, so we don't add software delay
+                # here — that would double-shift the signal.
+                current_tcp_wrench = np.array(rtde_r.getActualTCPForce())
+                delta_force = current_tcp_wrench[:3] - tcp_force_baseline[:3]
+                force_mag = float(np.linalg.norm(delta_force))
+                in_contact = 1.0 if force_mag > contact_threshold else 0.0
+                feature_parts.append(np.array([in_contact], dtype=np.float32))
+                logger.debug(
+                    f"contact: force_mag={force_mag:.3f} N (thr={contact_threshold:.2f}), "
+                    f"in_contact={in_contact}",
+                    extra={"step": traj_idx},
+                )
             current_features = np.concatenate(feature_parts).astype(np.float32)
 
         # Shift history and append newest
@@ -881,6 +931,7 @@ if args.isaacsim:
     # State for the loop (mirrors policy_thread's locals)
     isaac_phase = 0.0
     isaac_prev_action = np.zeros(6, dtype=np.float32)
+    isaac_contact_history = np.zeros(contact_obs_delay_steps + 1, dtype=np.float32)
     isaac_obs_history = np.zeros((obs_history_steps, per_step_features), dtype=np.float32) \
         if "per_step_features" in globals() else None
     # If per_step_features wasn't set yet (it's defined inside policy_thread), compute here.
@@ -888,6 +939,8 @@ if args.isaacsim:
         _psf = 12 + (7 if include_object_obs else 0)
         if include_absolute_obs:
             _psf *= 2
+        if include_contact_obs:
+            _psf += 1
         isaac_obs_history = np.zeros((obs_history_steps, _psf), dtype=np.float32)
 
     _max_traj_idx = len(joints) - 1
@@ -927,6 +980,20 @@ if args.isaacsim:
                 if include_object_obs:
                     feature_parts_l.append(obj_pos_at_phase_l.astype(np.float32))
                     feature_parts_l.append(obj_quat_at_phase_l.astype(np.float32))
+
+            if include_contact_obs:
+                # Read the env's ee_contact_sensor directly — same code path as the env
+                # uses in _get_observations. force_matrix_w shape (1, n_bodies, n_filt, 3);
+                # sum magnitudes across body/filter pairs to get total contact force.
+                if hasattr(_direct_env, "ee_contact_sensor"):
+                    fmw = _direct_env.ee_contact_sensor.data.force_matrix_w
+                    isaac_force_mag = float(fmw.norm(dim=-1).sum().item())
+                else:
+                    isaac_force_mag = 0.0
+                isaac_in_contact = 1.0 if isaac_force_mag > contact_threshold else 0.0
+                isaac_contact_history = np.roll(isaac_contact_history, -1)
+                isaac_contact_history[-1] = isaac_in_contact
+                feature_parts_l.append(np.array([isaac_contact_history[0]], dtype=np.float32))
 
             curr_features = np.concatenate(feature_parts_l).astype(np.float32)
             isaac_obs_history = np.roll(isaac_obs_history, shift=-1, axis=0)
