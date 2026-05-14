@@ -369,12 +369,19 @@ if not args.isaacsim:
     # Attempt to clear errors and reset robot state
     logger.info("Resetting robot state", extra={"step": -1})
     rtde_c.reuploadScript()
-    rtde_c.setPayload(0.025, [0.0, 0.0, 0.0])
 
 np.set_printoptions(suppress=True, precision=8)
 
-# Per-timestep tracking data for analysis
-tracking_log = []  # list of (step, actual_q, expected_q, target_q, tracking_error)
+# Per-timestep tracking data for analysis. Two parallel logs:
+#   - tracking_log: one entry per 500 Hz control tick (RTDE-side state, includes
+#     actual_q, actual_qd, target_q, box pose snapshot, tcp_force).
+#   - policy_log: one entry per 50 Hz policy iteration (obs vector fed to ONNX,
+#     raw policy output, dphase). Saved with `policy_` prefix so users don't
+#     confuse the two rates during analysis. Each list is appended from a single
+#     thread (control / policy respectively) so no extra lock is needed beyond
+#     CPython's GIL — same pattern save_tracking_npz already uses.
+tracking_log = []
+policy_log = []
 
 # Shared between the 50 Hz policy thread and the 500 Hz control thread. The policy
 # thread caches the latest box pose here so log() can reuse it instead of polling
@@ -385,38 +392,82 @@ current_actual_obj_quat = np.full(4, np.nan, dtype=np.float32)
 
 
 def save_tracking_npz():
-    """Snapshot tracking_log and write the .npz. Safe to call multiple times — the
-    write is idempotent (overwrite). Used by both the normal-exit path and the
-    KeyboardInterrupt handler in main."""
-    snapshot = list(tracking_log)  # shallow snapshot in case threads still append
-    if not snapshot:
+    """Snapshot tracking_log + policy_log and write the .npz. Safe to call multiple
+    times — the write is idempotent (overwrite). Used by both the normal-exit path
+    and the KeyboardInterrupt handler in main.
+
+    Schema (different first-dim lengths are fine in np.savez; the prefix tells the
+    consumer which rate the array is at):
+      - 500 Hz keys (no prefix): steps, phase, actual_q, actual_qd, expected_q,
+        target_q, actual_obj_pos, actual_obj_quat, tcp_force.
+      - 50 Hz keys (`policy_` prefix): policy_iter, policy_phase, policy_obs,
+        policy_raw_output (6 or 7 dims), policy_dphase.
+      - Scalar metadata: src_dt, gain, lookahead_time, action_scale,
+        policy_decimation (so consumers can map iter → control-step index).
+    """
+    # Shallow snapshots — CPython list.append + list(...) are GIL-atomic, so we
+    # don't need the data_lock here.
+    snapshot = list(tracking_log)
+    policy_snapshot = list(policy_log)
+    if not snapshot and not policy_snapshot:
         return
     tracking_npz_path = os.path.join(log_dir, f"{run_tag}.npz")
+
+    arrays = {}
+    if snapshot:
+        arrays.update(
+            steps=np.array([d["step"] for d in snapshot]),
+            phase=np.array([d["phase"] for d in snapshot]),
+            actual_q=np.array([d["actual_q"] for d in snapshot]),
+            actual_qd=np.array([
+                d.get("actual_qd", np.full(6, np.nan, dtype=np.float32)) for d in snapshot
+            ]),
+            expected_q=np.array([d["expected_q"] for d in snapshot]),
+            target_q=np.array([d["target_q"] for d in snapshot]),
+            actual_obj_pos=np.array([d["actual_obj_pos"] for d in snapshot]),
+            actual_obj_quat=np.array([d["actual_obj_quat"] for d in snapshot]),
+            # External TCP wrench [Fx, Fy, Fz, Tx, Ty, Tz] in UR base frame.
+            # NaN-filled for ticks that didn't capture it (e.g. IsaacSim backend).
+            tcp_force=np.array([
+                d.get("tcp_force", np.full(6, np.nan, dtype=np.float32)) for d in snapshot
+            ]),
+        )
+    if policy_snapshot:
+        arrays.update(
+            policy_iter=np.array([d["iter"] for d in policy_snapshot]),
+            policy_phase=np.array([d["phase"] for d in policy_snapshot]),
+            # Stack obs vectors into a (N_policy, obs_dim) array; all rows share the
+            # same dim since obs construction is deterministic for a given env.yaml.
+            policy_obs=np.stack([d["obs"] for d in policy_snapshot]),
+            policy_raw_output=np.stack([d["raw_output"] for d in policy_snapshot]),
+            policy_dphase=np.array([d["dphase"] for d in policy_snapshot]),
+        )
+
     np.savez(
         tracking_npz_path,
-        steps=np.array([d["step"] for d in snapshot]),
-        phase=np.array([d["phase"] for d in snapshot]),
-        actual_q=np.array([d["actual_q"] for d in snapshot]),
-        expected_q=np.array([d["expected_q"] for d in snapshot]),
-        target_q=np.array([d["target_q"] for d in snapshot]),
-        actual_obj_pos=np.array([d["actual_obj_pos"] for d in snapshot]),
-        actual_obj_quat=np.array([d["actual_obj_quat"] for d in snapshot]),
-        # External TCP wrench [Fx, Fy, Fz, Tx, Ty, Tz] in UR base frame. NaN-filled
-        # for ticks that didn't capture it (e.g. IsaacSim backend).
-        tcp_force=np.array([
-            d.get("tcp_force", np.full(6, np.nan, dtype=np.float32)) for d in snapshot
-        ]),
-        # Source sample period (s) so downstream visualizers don't have to assume 500Hz.
+        # Source sample period (s) for the 500 Hz arrays so downstream visualizers
+        # don't have to assume 500Hz.
         src_dt=np.float64(dt),
+        # Control ticks per policy step — multiply by this to map policy_iter to
+        # the corresponding control step index.
+        policy_decimation=np.int32(policy_decimation),
         gain=gain,
         lookahead_time=lookahead_time,
         action_scale=action_scale,
+        **arrays,
     )
-    logger.info(f"Tracking data saved to {tracking_npz_path} ({len(snapshot)} steps)",
-                extra={"step": -1})
+    logger.info(
+        f"Tracking data saved to {tracking_npz_path} "
+        f"({len(snapshot)} ctrl steps, {len(policy_snapshot)} policy steps)",
+        extra={"step": -1},
+    )
 
 def log(i, target_q, phase):
     actual_q = np.array(rtde_r.getActualQ())
+    # Joint velocities at 500 Hz — used both for the velocity safety check below
+    # and stored in tracking_log so analysis can recover the velocity at the
+    # exact moment the policy thread sampled state (decimate to 50 Hz).
+    actual_qd = np.array(rtde_r.getActualQd())
 
     # External wrench at the TCP in the UR base frame: [Fx, Fy, Fz, Tx, Ty, Tz].
     # The UR controller computes this from joint-torque sensing — useful for
@@ -440,6 +491,7 @@ def log(i, target_q, phase):
             "step": i,
             "phase": float(phase),
             "actual_q": actual_q.copy(),
+            "actual_qd": actual_qd.copy(),
             "expected_q": expected_q.copy(),
             "target_q": np.array(target_q).copy(),
             "actual_obj_pos": actual_obj_pos.copy(),
@@ -478,8 +530,7 @@ def log(i, target_q, phase):
         )
         raise RuntimeError("Tracking error too large")
 
-    # Safety: check joint velocities
-    actual_qd = np.array(rtde_r.getActualQd())
+    # Safety: check joint velocities (actual_qd was read at the top of log())
     max_vel = np.max(np.abs(actual_qd))
     if max_vel > max_joint_velocity:
         logger.error(
@@ -687,6 +738,7 @@ def policy_thread():
     # latency (~10-30ms) — at deployment that latency is already physically present in
     # getActualTCPForce(), so applying additional software delay would double-shift it.
     # The --isaacsim path (which has no physical delay) does apply the buffer.
+    policy_iter = 0  # row index in policy_log; aligns 50 Hz obs/action data to the 500 Hz tracking_log
     while True:
         run_policy_event.wait()
         run_policy_event.clear()
@@ -703,6 +755,7 @@ def policy_thread():
         actual_obj_quat = None
         if pose_listener is not None:
             box_pose = real_to_sim_pose(pose_listener.get_pose(BOX_BOARD_ID))
+            print(box_pose)
             if box_pose is not None:
                 actual_obj_pos = box_pose[:3].astype(np.float32)
                 actual_obj_quat = box_pose[3:].astype(np.float32)
@@ -872,6 +925,21 @@ def policy_thread():
             new_data_event.set()
 
         prev_action = raw_action
+
+        # Snapshot the 50 Hz policy I/O for analysis. obs is the exact float32 vector
+        # fed to ONNX (already includes history, future-obs lookups, prev_action,
+        # contact bool, etc. depending on flags). `output` is the full raw ONNX
+        # output (6 dims, or 7 dims under phase-slowdown). Phase/iter let the user
+        # align with the 500 Hz tracking_log by phase or by iter * policy_decimation.
+        policy_log.append({
+            "iter": policy_iter,
+            "phase": float(phase),
+            "obs": obs[0].copy(),               # drop the batch axis added before session.run
+            "raw_output": np.array(output, dtype=np.float32),
+            "dphase": float(dphase),
+        })
+        policy_iter += 1
+
         # Advance phase by dphase (≤ 1; deepens slowdown when policy commands a pause).
         # Clamp at max_traj_idx so we don't index past the end of the trajectory.
         phase = min(phase + dphase, float(max_traj_idx))
