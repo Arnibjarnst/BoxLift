@@ -126,7 +126,7 @@ os.makedirs(log_dir, exist_ok=True)
 _gain = args.gain if args.gain is not None else 100
 _lookahead = args.lookahead if args.lookahead is not None else 0.05
 date_t = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-robot_name = "real" if args.real_robot else "sim"
+robot_name = "real" if args.real_robot else "isaac" if args.isaacsim else "ursim"
 run_tag = (
     f"{date_t}_gain{_gain}_la{_lookahead}_{robot_name}"
     + (f"_as{action_scale}" if args.action_scale is not None else "")
@@ -359,9 +359,6 @@ if not args.isaacsim:
 else:
     rtde_r = None
     rtde_c = None
-
-# UR5e max torques
-max_torque = np.array([150.0, 150.0, 150.0, 28.0, 28.0, 28.0])
 
 logger.info("Connection established", extra={"step": -1})
 
@@ -664,9 +661,12 @@ if pose_listener is not None:
 
     if _first_pose is not None:
         logger.info(f"First box pose received: {_first_pose}", extra={"step": -1})
-    elif include_object_obs:
+    elif include_object_obs and args.real_robot:
+        # Real-robot path: the tracker is the only source of box pose, so we can't
+        # continue without it.
         logger.error(
-            f"{_failure_reason}; include_object_obs=True requires a live tracker, aborting.",
+            f"{_failure_reason}; include_object_obs=True on the real robot requires a "
+            f"live tracker, aborting.",
             extra={"step": -1},
         )
         # Tear down anything we already brought up so we don't leave the RTDE
@@ -690,6 +690,30 @@ if pose_listener is not None:
             except Exception:
                 pass
         sys.exit(1)
+    elif include_object_obs:
+        # URSim (or IsaacSim if it reached this branch) — fall back to the "no tracker"
+        # path that policy_thread already handles: rel = zeros/identity, abs = reference
+        # pose at current phase. Clear pose_listener / pose_proc so the obs path takes
+        # that fallback branch and we don't keep a dead subprocess around.
+        logger.warning(
+            f"{_failure_reason}; include_object_obs=True but not on a real robot — "
+            f"falling back to perfect tracking (rel=0/identity, abs=reference at phase).",
+            extra={"step": -1},
+        )
+        try:
+            pose_listener.stop()
+        except Exception:
+            pass
+        pose_listener = None
+        if pose_proc is not None and pose_proc.poll() is None:
+            try:
+                pose_proc.terminate()
+                pose_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pose_proc.kill()
+            except Exception:
+                pass
+            pose_proc = None
     else:
         logger.warning(
             f"{_failure_reason}; include_object_obs=False so continuing without it "
@@ -947,7 +971,18 @@ def policy_thread():
 
 def control_thread():
     step_counter = 0
+    # Linear-ramp interpolation between previous_target_q and current_target_q over the
+    # policy_decimation servoJ ticks that span one policy step. alpha goes from 1/N to 1
+    # across those N ticks; resets to 1/N each time the policy publishes a new target.
+    alpha = 1.0 / policy_decimation
     try:
+        # Wait for first target
+        run_policy_event.set()
+        while not new_data_event.is_set():
+            pass
+        
+        # First target arrived
+        new_data_event.clear()
         while True:
             t_start = rtde_c.initPeriod()
 
@@ -956,14 +991,17 @@ def control_thread():
 
             if new_data_event.is_set():
                 new_data_event.clear()
+                # Fresh target arrived — restart the ramp from the start of the window.
+                alpha = 1.0 / policy_decimation
 
             with data_lock:
-                # ZOH: send the policy-thread-computed target unchanged. Training now
-                # caches the target once per policy step (see _pre_physics_step in
-                # boxhinge/boxpush envs) — so a single fixed target per 20ms window with
-                # the low-level controller chasing it at 500Hz is a clean 1:1 match.
-                interp_q = np.copy(current_target_q)
-                interp_phase = current_phase
+                # FOH: linearly interpolate between the previous target and the latest one
+                # across the decimation window so the joint target the robot sees evolves
+                # smoothly at 500Hz instead of stepping every 20ms.
+                alpha = 1.0 # ZOH override
+
+                interp_q = (1.0 - alpha) * previous_target_q + alpha * current_target_q
+                interp_phase = (1.0 - alpha) * previous_phase + alpha * current_phase
 
                 # 4. Command the robot
                 rtde_c.servoJ(
@@ -975,9 +1013,10 @@ def control_thread():
                     gain,
                 )
 
-            step_counter += 1
-
             log(step_counter, interp_q, interp_phase)
+
+            alpha = min(alpha + 1.0 / policy_decimation, 1.0)
+            step_counter += 1
 
             if interp_phase * policy_decimation > max_steps:
                 break
@@ -1019,6 +1058,9 @@ if args.isaacsim:
     import BoxLift.tasks  # noqa: F401, registers env
     from BoxLift.tasks.direct.boxhinge.boxhinge_env_cfg import BoxhingeEnvCfg
 
+    kp_override = 30.0
+    kd_override = None
+
     # Build env cfg using the same saved env.yaml fields that play.py / record.py restore.
     isaac_cfg = BoxhingeEnvCfg()
     isaac_cfg.scene.num_envs = 1
@@ -1038,6 +1080,11 @@ if args.isaacsim:
     # target held across all 10 substeps, low-level PD chases it.
     isaac_cfg.physics_dt = dt
     isaac_cfg.decimation = policy_decimation
+    
+    if kp_override is not None:
+        setattr(isaac_cfg, "kp", kp_override)
+    if kd_override is not None:
+        setattr(isaac_cfg, "kd", kd_override)
 
     # Clean test: disable all noise / DR / perturbations / VOC / reset noise.
     isaac_cfg.obs_obj_pos_noise = 0.0

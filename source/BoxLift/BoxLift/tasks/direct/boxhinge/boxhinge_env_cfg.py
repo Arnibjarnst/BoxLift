@@ -172,6 +172,22 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     future_obs_steps = (1,2,3,4,5)
     # Include previous raw residual action (6 dims) in the observation.
     include_prev_actions = True
+    # Include a single thresholded contact bool (EE ↔ cube) in the per-step observation.
+    # 1.0 when the EE contact sensor reports |force| > contact_threshold, else 0.0.
+    # Real-side analog: thresholded delta of getActualTCPForce() vs a baseline.
+    include_contact_obs = False
+    # Force magnitude threshold (N) for the contact bool. ~0.5–2N is reasonable for the
+    # sphere EE on the cube; tune by inspecting force-magnitude histograms in obvious
+    # contact vs free motion.
+    contact_threshold = 0.5
+    # DR on the contact bool (default off — start with a clean threshold, add these only
+    # if sim2real shows the policy is brittle to real-side flakiness):
+    # - delay_steps: shift the bool through a rolling buffer so the obs sees a value from
+    #   N steps ago. Models the ~10–30ms estimator latency of getActualTCPForce.
+    # - flip_prob: per-step Bernoulli bit-flip rate. Models false positives (inertia
+    #   spikes) and false negatives (transient drops below threshold).
+    contact_obs_delay_steps = 0
+    contact_obs_flip_prob = 0.0
     observation_space = 13  # recomputed in __post_init__
     state_space = 0
 
@@ -180,10 +196,13 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # down but never speed up); reference values are interpolated at fractional phase indices.
     # When False, the env behaves as before: integer indexing, dphase=1.
     #
-    # Reward accounting: task/track rewards are NOT scaled by dphase. Instead, sustained
-    # pauses are discouraged by a cumulative-quadratic penalty — `w_total_slowdown` times
-    # the running sum of (1 - dphase), gated by (1 - dphase) so running (dphase=1) is free.
-    # Total episode pause cost ≈ w_total_slowdown · (total_slowdown)².
+    # Reward accounting: sustained pauses are discouraged by a per-step gated penalty
+    # `w_slowdown_gated · (1 - dphase) · min(r_task_norm, r_track_norm)` — slowdowns
+    # are licensed when either channel is suffering (cheap recovery), expensive when
+    # both are healthy. Optionally `task_scale_by_dphase` / `track_scale_by_dphase`
+    # also multiply those rewards by dphase. The legacy cumulative-quadratic penalty
+    # (`w_total_slowdown`) is off by default — re-enable as a safety net if the gated
+    # penalty alone lets the policy park at a high-reward phase.
     # Kept disabled — prioritizing CoM/size DR over phase slowdown for the sim2real
     # push because CoM is empirically unknown for the real box (concrete sim2real gap)
     # while phase slowdown is a speculative hedge against unknown timing issues. Add
@@ -208,16 +227,14 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     max_slowdown_multiplier = 3.0
     # If True, multiply task reward by dphase. Per-step incentive against pausing:
     # at dphase=0 task reward → 0, so the policy doesn't get paid for pausing while
-    # tracking a frozen reference. Complementary to w_total_slowdown (which is a
-    # cumulative-quadratic episode-level penalty); both should typically be on together
-    # — task scaling discourages pausing immediately, the cumulative penalty discourages
-    # sustained pauses.
-    task_scale_by_dphase: bool = False
+    # tracking a frozen reference. Complementary to w_slowdown_gated (which adds a
+    # negative penalty for slowing down when reward is high); task scaling removes
+    # the positive incentive to stall, the gated penalty makes stalling actively costly.
+    task_scale_by_dphase: bool = True
     # If True, also multiply track reward by dphase. With both task and track scaled,
-    # all per-step rewards vanish at dphase=0, so the only thing remaining is the small
-    # negative reg — pausing becomes strictly costly. Pair with the cumulative penalty
-    # for robustness against gaming.
-    track_scale_by_dphase: bool = False
+    # all per-step rewards vanish at dphase=0, so the only thing remaining is the
+    # negative reg — pausing becomes strictly costly even before w_slowdown_gated fires.
+    track_scale_by_dphase: bool = True
 
     # Hard cap on per-episode wall-clock length, in simulator steps. When set (>0), the
     # episode terminates by time_out after this many steps regardless of phase progress,
@@ -227,6 +244,23 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # with probability ~ min(L, t+1) / (T-L+1) instead of (t+1)/(T-1) under the default).
     # -1 disables the cap (use full trajectory length, the behavior before this flag).
     max_episode_steps: int = -1
+
+    # Continue the episode for this many seconds after the trajectory phase reaches its
+    # end. During the hold, phase stays clamped at max so the reference targets stay at
+    # the trajectory's final pose, and the policy keeps receiving rewards for maintaining
+    # that final pose. Increases the training signal for endpoint stability — particularly
+    # useful for box-lift / box-hinge tasks where the final pose must be held (otherwise
+    # the policy can succeed at the end and let the box drop the next step without
+    # penalty). 0.0 disables the hold (legacy behavior — terminate as soon as phase ends).
+    post_traj_hold_s: float = 5.0
+
+    # Probability that a reset overrides RSI/failure-resampling and starts at phase=0
+    # instead. Pure RSI samples phase=0 with probability ~1/T (where T is trajectory
+    # length, often <1%), but deployment ALWAYS starts at 0 — so the start of the
+    # trajectory is heavily under-trained. Setting this to 0.05 gives the start ~5×
+    # the training exposure it would otherwise get. Useful when the policy oscillates
+    # on the real robot during initial-approach motion. 0.0 disables the override.
+    reset_to_zero_prob: float = 0.05
 
     # Failure-aware phase resampling: biases episode start phases toward segments with
     # high historical failure rate. Credits are assigned to the segment each episode
@@ -242,9 +276,12 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
         # 12: relative joint pos (6) + relative joint vel (6) — always present.
         # If include_object_obs: + 7 (obj pos 3 + obj quat 4).
         # If include_absolute_obs: doubles the whole thing (joint and obj parts mirrored).
+        # If include_contact_obs: + 1 (EE-cube thresholded contact bool, not mirrored).
         dim = 12 + (7 if self.include_object_obs else 0)
         if self.include_absolute_obs:
             dim *= 2
+        if self.include_contact_obs:
+            dim += 1
         return dim
 
     def __post_init__(self):
@@ -266,17 +303,17 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     ur5e_prim_path = f"{ENV_REGEX}/ur5e"
 
     # Arm Actuator parameters
-    kp = 300.0
-    kd = 50
-    # kp = {
-    #     "shoulder_pan_joint": 800.0,
-    #     "shoulder_lift_joint": 600.0,
-    #     "elbow_joint": 300.0,
-    #     "wrist_1_joint": 200.0,
-    #     "wrist_2_joint": 100.0,
-    #     "wrist_3_joint": 100.0,
-    # }
-    # kd = {joint_name: joint_kp * 0.15 for joint_name, joint_kp in kp.items()}
+    # kp = 150.0
+    # kd = 22.5
+    kp = {
+        "shoulder_pan_joint": 150.0,
+        "shoulder_lift_joint": 150.0,
+        "elbow_joint": 150.0,
+        "wrist_1_joint": 28.0,
+        "wrist_2_joint": 28.0,
+        "wrist_3_joint": 28.0,
+    }
+    kd = {joint_name: joint_kp * 0.15 for joint_name, joint_kp in kp.items()}
     actuator_type = "Implicit"  # or "IdealPD"
     velocity_limit = 3.14
     effort_limit = {
@@ -287,9 +324,6 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
         "wrist_2_joint": 28.0,
         "wrist_3_joint": 28.0,
     }
-
-    # Action scale
-    action_scale: float | list = 0.05
 
     # Action formulation. One of:
     #   "A" — joints_target[t] + action_scale * action
@@ -309,7 +343,10 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # problem. The earlier mode A + VOC failure (erratic motion) was driven by the
     # combination of high reset noise + VOC yanking the cube; with reset_joint_pos_noise
     # halved that interaction is much milder.
-    action_mode = "B"
+    action_mode = "C"
+
+    # Action scale
+    action_scale: float | list = 0.05
 
     # object (cube)
     cube_cfg = CUBE_CFG
@@ -359,8 +396,8 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # Total effective noise per step ≈ sqrt(bias_std² + per_fire_noise²) ≈ 0.01m / 0.02rad,
     # matching the previous magnitudes but redistributing weight to the temporally-
     # correlated component (which is more realistic for ArUco-style trackers).
-    obs_obj_pos_bias_std = 0.01          # m, per-EPISODE Gaussian std on constant box-position offset
-    obs_obj_ori_bias_std = 0.02          # rad, per-EPISODE Gaussian std on constant box-orientation offset
+    obs_obj_pos_bias_std = 0.005          # m, per-EPISODE Gaussian std on constant box-position offset
+    obs_obj_ori_bias_std = 0.01           # rad, per-EPISODE Gaussian std on constant box-orientation offset
 
     # Box pose tracker model (sim2real). Approximates the UR5e vision tracker:
     #   - Fixed latency: every fresh sample reads exactly `obs_obj_delay_steps` env steps
@@ -383,7 +420,7 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # Perturbation forces (for sim-to-real robustness)
     perturbation_force_std = 10.0       # N, std of per-axis Gaussian force
     perturbation_torque_std = 2.0       # Nm, std of per-axis Gaussian torque
-    perturbation_probability = 0.0      # probability of applying a perturbation each step
+    perturbation_probability = 0.05     # probability of applying a perturbation each step
     perturbation_duration_steps = 5     # how many steps the perturbation lasts
 
     # Reward parameteres. Final (end-of-curriculum) values.
@@ -394,7 +431,7 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # actual contact-mechanics capability because the threshold check still saw high track.
     w_task = 0.7
     w_track = 1 - w_task
-    w_regularization = 0.1
+    w_regularization = 0.4
 
     # Curriculum ("α schedule"). α ramps linearly from 0 to 1 over alpha_warmup_steps env
     # steps; 0 disables the curriculum (α=1 always). Drives three coupled shifts:
@@ -509,19 +546,93 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # At 0.1 the rate penalty dominated and pushed the policy toward useless-constant.
     # 0.01 keeps the command coherent across steps without preventing the time-varying
     # residuals that mode B needs for FF compensation during the lift.
-    w_action_rate = 5e-2  # Step 2 sim2real: bumped from 1e-2 → 5e-2 for smoother deployable actions.
+    w_action_rate = 5e-1
     tol_action_rate = 0.0
 
-    w_action_norm = 0.0
+    w_action_norm = 1e-1
     tol_action_norm = 0.0
 
-    # Cumulative-quadratic pause penalty for enable_phase_slowdown=True.
-    # Per-step: w_total_slowdown · cumulative_slowdown · (1 - dphase), which is zero
-    # while running (dphase=1) and grows with accumulated pause time while paused.
-    # Episode-total: w_total_slowdown · (Σ(1-dphase))². Trades off "pause to recover from a
-    # miss" against "don't pause forever": short pauses are cheap, sustained pauses scale
-    # quadratically and eventually dominate any per-step reward gain.
-    w_total_slowdown = 0.025
+    # === Slowdown penalties (require enable_phase_slowdown=True) ===
+    #
+    # Gated per-step slowdown penalty (default, preferred over cumulative quadratic):
+    #     penalty = w_slowdown_gated · (1 - dphase) · min(r_task_norm, r_track_norm)
+    # r_*_norm are the per-step task / tracking signals normalized to [0, 1] (the
+    # gate divides by the active sum of weights for tracking, which is phase-gated).
+    # Slowdowns are "earned" — cheap when either channel is suffering and the policy
+    # needs the time to recover, expensive when both channels are healthy (no excuse
+    # to stall). Sizing: at perfect tracking (min_r=1) and full pause (1-dphase=1)
+    # the per-step penalty inside w_regularization=0.25 is 0.25·w; this competes
+    # against the (possibly dphase-scaled) task+track reward ≈ 1.0 at perfect tracking.
+    # Default 2.0 makes a full pause at perfect tracking net-negative when at least
+    # task_scale_by_dphase=True.
+    w_slowdown_gated: float = 0.0 # Note: w_reg * w_slowdown_gate can not be higher than w_task or w_track
+
+    # Linear shaping subtracted from each Gaussian kernel reward to fix the
+    # "kernel saturates to 0 far from reference" problem (no signal for recovery
+    # at distance). Per-component linear term:
+    #     linear = w_linear_shaping · |err| / σ_component
+    # At |err|=σ the linear contribution is exactly w_linear_shaping regardless
+    # of which kernel — single knob, comparable across components. At |err|<σ
+    # the kernel dominates (reward stays positive); at |err|>σ the linear term
+    # dominates and the reward goes monotonically negative — providing the
+    # gradient the policy needs to climb back toward the reference.
+    #
+    # Interacts with the unclamped min-gate slowdown: in the negative-reward
+    # regime the gate flips sign and gives a small "patience bonus" for pausing,
+    # which encourages the policy to take time to fix things rather than give up.
+    # Recovery is still strictly incentivized as long as
+    #     w_reg · w_slowdown_gated < w_task + w_track   (K > 0 constraint)
+    # With defaults (w_reg=0.25, w_slowdown_gated≤2, w_task+w_track=1.0):
+    #     K ≥ 0.5 > 0 ✓
+    # Don't set w_slowdown_gated > (w_task + w_track)/w_reg = 4.0.
+    #
+    # Applied to all sum-form kernels (obj_pos / obj_quat / obj_vel / EE_pos /
+    # EE_quat / eef_box_rel_pos / eef_box_rel_quat). Skipped for joint_pos
+    # (per-joint averaged) and for product-form task reward (multiplicative
+    # structure doesn't compose cleanly with a subtracted linear term).
+    #
+    # Default 0.4: at |err|=σ the linear term equals 0.4, vs kernel value e⁻¹≈0.37
+    # — so at 1σ the reward is roughly zero (kernel and linear cancel). At 2σ
+    # the kernel is ≈0.02 and linear is 0.8, so reward ≈ −0.78. Set to 0 to
+    # recover pure Gaussian behavior; raise for steeper signal at distance.
+    w_linear_shaping: float = 0.0
+
+    # Improvement-based slowdown penalty (parallel term to w_slowdown_gated):
+    #     penalty = w_slowdown_improvement · (1 - dphase) · exp(-β · improvement)
+    # where improvement = max(0, Δerr_task) + max(0, Δerr_track) — per-step
+    # reduction in sigma-normalized position+orientation error.
+    #
+    # Why raw error and not Δreward: the Gaussian-kernel reward saturates to ≈0
+    # when err >> σ (and so does its gradient), so Δr ≈ 0 even when err is
+    # genuinely shrinking from, e.g., 0.30m → 0.25m. The improvement gate would
+    # therefore fire at full strength precisely in the failure regime (box dropped,
+    # policy trying to recover) where we want it to license the slowdown. Raw
+    # error responds everywhere — 5cm or 10° of recovery looks the same in-band
+    # and far out-of-band.
+    #
+    # Combining pos (m) and quat (rad): each component is divided by its kernel's
+    # sigma, giving a dimensionless "how many sigmas of error" signal. Components
+    # are then summed. Task uses obj pos+quat; track uses the phase-active EE-frame
+    # (abs gate) or EE-in-box-frame (rel gate), matching the reward shape. The
+    # rare gate transitions can produce a one-step glitch in the signal; not enough
+    # to matter in practice given how infrequent transitions are.
+    #
+    # β is dimensionless ("per sigma of error"). Default 2.0:
+    #   Δerr=0.5σ → exp(-1) = 0.37 (63% discount)
+    #   Δerr=1.0σ → exp(-2) = 0.14 (86% discount)
+    # Raise β if you want smaller per-step improvements to earn meaningful
+    # discount; lower it if the discount is too easily acquired by noise. Set
+    # w=0 to disable.
+    w_slowdown_improvement: float = 0.0
+    slowdown_improvement_beta: float = 2.0
+
+    # Cumulative-quadratic pause penalty (legacy safety net for w_slowdown_gated).
+    # Per-step: w_total_slowdown · cumulative_slowdown · (1 - dphase) — zero while
+    # running (dphase=1) and grows with accumulated pause time. Episode-total ≈
+    # w_total_slowdown · (Σ(1-dphase))². Disabled by default — re-enable only if
+    # the gated penalty above is insufficient (e.g. the policy parks at a locally-
+    # high-reward phase without completing the trajectory).
+    w_total_slowdown = 0.0
 
     # Completion bonus — one-shot terminal reward when the episode times out (reached the
     # end of the trajectory without reset_terminated). Counters stall-dominance in the
@@ -589,11 +700,26 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
         ),
     }
 
+    # EE↔cube contact sensor. Reports forces on the cube filtered to the EE link
+    # (wrist_3_link, since this is the ur5e.usd asset with no separate sphere). Used by
+    # _get_observations to produce a thresholded contact bool when include_contact_obs
+    # is set. Lightweight (max_contact_data_count_per_prim=4) since we only consume the
+    # net magnitude, not per-contact data.
+    ee_contact_sensor_cfg = ContactSensorCfg(
+        prim_path=cube_cfg.prim_path,
+        update_period=0.0,
+        history_length=0,
+        debug_vis=False,
+        force_threshold=min_contact_force,
+        max_contact_data_count_per_prim=4,
+        filter_prim_paths_expr=[f"{ur5e_prim_path}/wrist_3_link/"],
+    )
+
     # - reset conditions. Loosened (was 0.1m / 1.0rad) for VOC training: with the virtual
     # controller active the policy may briefly diverge before the controller pulls the box
     # back; tight thresholds would terminate episodes before that recovery completes.
     max_obj_dist_from_traj = 0.2
-    max_obj_angle_from_traj = 1.5
+    max_obj_angle_from_traj = 10000 # just continue if we fail lifting until end
 
     # === Virtual Object Controller (VOC) curriculum ===
     # DexMachina-style assist: a virtual PD controller drives the cube along its reference
