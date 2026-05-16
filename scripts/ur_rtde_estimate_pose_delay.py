@@ -43,12 +43,8 @@ POSE_ESTIMATION_PORT = 5555
 BOX_BOARD_ID = "0"
 POSE_FIRST_POSE_TIMEOUT_S = 30.0
 
-# Same world→robot offset used by ur_rtde_real_time.py.
-WORLD_TO_ROBOT_TRANSLATION = np.array([0.02, 0.508, 0.018], dtype=np.float32)
 
 AXIS_MAP = {"x": (1, 0), "-x": (-1, 0), "y": (0, 1), "-y": (0, -1)}
-
-WORLD_TO_TCP = np.array([[-1,0,0],[0,-1,0],[0,0,1]])
 
 
 def start_pose_estimation():
@@ -74,19 +70,8 @@ def start_pose_estimation():
 
 
 def get_box_pos(listener):
-    """Box position in the UR controller's native base frame.
-
-    The camera world frame is calibrated to match the IsaacLab/sim base frame
-    (box at +y). The real robot's native base frame (the one getActualTCPPose
-    and moveL/moveJ_IK use) is rotated 180° about z relative to that. The
-    policy doesn't expose this because joint trajectories are intrinsic, but
-    any script that turns a camera-frame position into a Cartesian TCP target
-    must apply the rotation here."""
     p = listener.get_pose(BOX_BOARD_ID)
-    if p is None:
-        return None
-    sim_xyz = np.asarray(p[:3], dtype=np.float64) + WORLD_TO_ROBOT_TRANSLATION
-    return np.array([sim_xyz[0], sim_xyz[1], sim_xyz[2]], dtype=np.float64)
+    return np.asarray(p[:3], dtype=np.float64)
 
 
 def prompt_axis():
@@ -230,9 +215,9 @@ def orientation_for_axis(ax_dir):
     direction so the sphere EE leads the contact. Picks TCP +x = world -z (flange
     hangs down); the user is expected to place the box consistent with this convention."""
     z_tcp = np.array([ax_dir[0], ax_dir[1], 0.0], dtype=np.float64)
-    x_tcp = np.array([0.0, 0.0, -1.0], dtype=np.float64)
+    x_tcp = np.array([0.0, 0.0, 1.0], dtype=np.float64)
     y_tcp = np.cross(z_tcp, x_tcp)
-    R = WORLD_TO_TCP @ np.column_stack([x_tcp, y_tcp, z_tcp])
+    R = np.column_stack([x_tcp, y_tcp, z_tcp])
     return Rotation.from_matrix(R).as_rotvec()
 
 
@@ -249,9 +234,6 @@ def compute_targets(box_pos, ax_dir, args):
     push_xyz = approach_xyz.copy()
     push_xyz[0] += ax_dir[0] * (args.push_distance)
     push_xyz[1] += ax_dir[1] * (args.push_distance)
-
-    approach_xyz = WORLD_TO_TCP @ approach_xyz
-    push_xyz = WORLD_TO_TCP @ push_xyz
 
     return list(approach_xyz) + list(orientation), list(push_xyz) + list(orientation)
 
