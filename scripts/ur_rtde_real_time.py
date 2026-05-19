@@ -52,6 +52,15 @@ parser.add_argument("--use_ref", action="store_true",
                          "directly. Use this for baseline / pure-planner runs instead of "
                          "--action_scale 0, which only zeros the policy in action modes A/B and "
                          "leaves modes C/D still tied to actual_q.")
+parser.add_argument("--guard_max_obj_dist", type=float, default=None,
+                    help="OOD guard: abort the run if ||box_pos - reference|| exceeds this (m). "
+                         "Default: env.yaml max_obj_dist_from_traj (the training envelope).")
+parser.add_argument("--guard_max_obj_angle", type=float, default=None,
+                    help="OOD guard: abort if box orientation error exceeds this (rad). "
+                         "Default: env.yaml max_obj_angle_from_traj, or 1.0 rad if that is "
+                         "a disabled-in-training sentinel (>10).")
+parser.add_argument("--no_guard", action="store_true",
+                    help="Disable the OOD protective guard entirely.")
 parser.add_argument("--isaacsim", action="store_true",
                     help="Run the policy against IsaacSim instead of URSim/RTDE. Used to diagnose "
                          "whether oscillation observed on URSim is caused by deployment-script bugs "
@@ -113,6 +122,31 @@ dphase_min = float(env_cfg.get("dphase_min", 0.5))
 action_alpha_floor = float(env_cfg.get("action_alpha_floor", 0.1))
 force_alpha = float(env_cfg.get("force_alpha", -1.0))
 eff_alpha = float(force_alpha) if 0.0 <= force_alpha <= 1.0 else 1.0
+
+# OOD protective guard thresholds. The training envelope (env's task-failure thresholds)
+# is the principled OOD boundary: the policy was never trained on box states beyond it,
+# so beyond it its output is meaningless. Default to the env.yaml values; the angle
+# threshold is often a disabled-in-training sentinel (e.g. 10000), which is not a useful
+# bound, so fall back to 1.0 rad in that case (a 180° box flip — the failure mode this
+# guards against — is ~π rad, well past 1.0).
+_env_guard_dist = float(env_cfg.get("max_obj_dist_from_traj", 0.2))
+_env_guard_angle = float(env_cfg.get("max_obj_angle_from_traj", 1.0))
+guard_max_obj_dist = (args.guard_max_obj_dist
+                      if args.guard_max_obj_dist is not None else _env_guard_dist)
+if args.guard_max_obj_angle is not None:
+    guard_max_obj_angle = args.guard_max_obj_angle
+elif _env_guard_angle <= 10.0:
+    guard_max_obj_angle = _env_guard_angle
+else:
+    guard_max_obj_angle = 1.0
+# Guard is only meaningful when we actually have a measured box pose to check.
+guard_enabled = (not args.no_guard) and include_object_obs
+if guard_enabled:
+    print(f"[INFO] OOD guard: |box_pos-ref| > {guard_max_obj_dist:.3f} m OR "
+          f"box angle error > {guard_max_obj_angle:.3f} rad → abort (servoStop via "
+          f"control-thread teardown).")
+else:
+    print("[INFO] OOD guard disabled.")
 
 export_dir = os.path.join(args.run_dir, "exported")
 onnx_model_path = os.path.join(export_dir, "policy.onnx")
@@ -628,6 +662,12 @@ current_phase = 0.0
 previous_phase = 0.0
 run_policy_event = threading.Event()  # Trigger for the policy
 new_data_event = threading.Event()
+# OOD protective guard: the policy thread sets ood_reason then ood_event when the
+# measured box pose leaves the training envelope. The control thread checks the event
+# each tick and raises, so its except/finally (servoStop + stopScript) and the main
+# teardown (stopJ) run — a controlled halt with no further policy commands.
+ood_event = threading.Event()
+ood_reason = ""
 
 # Wait for the first box pose to arrive before starting threads. With
 # include_object_obs the tracker is a hard requirement (the policy consumes it),
@@ -725,6 +765,7 @@ if pose_listener is not None:
 def policy_thread():
     global current_target_q, previous_target_q, current_phase, previous_phase
     global current_actual_obj_pos, current_actual_obj_quat
+    global ood_reason
     # Float phase to support enable_phase_slowdown. Indexed via floor() into trajectory
     # arrays. For legacy (no-slowdown) policies dphase=1 each step → phase increments by 1
     # → indexing matches the old integer trajectory_step behavior exactly.
@@ -830,6 +871,25 @@ def policy_thread():
                     rel_obj_quat = quat_mul_np(obj_quat_at_delayed, quat_inv_np(actual_obj_quat))
                     feature_parts.append(rel_obj_pos.astype(np.float32))
                     feature_parts.append(rel_obj_quat.astype(np.float32))
+
+                    # OOD protective guard. Same relative box error the env's _get_dones
+                    # uses to terminate training episodes — beyond it the policy is
+                    # extrapolating. Signal the control thread to raise (its teardown
+                    # does servoStop, the main teardown does stopJ). |w| handles the
+                    # quaternion double cover so a 180° flip reads as ~π, not ~0.
+                    if guard_enabled and not ood_event.is_set():
+                        _pos_err = float(np.linalg.norm(rel_obj_pos))
+                        _w = min(1.0, abs(float(rel_obj_quat[0])))
+                        _ang_err = 2.0 * float(np.arccos(_w))
+                        if _pos_err > guard_max_obj_dist or _ang_err > guard_max_obj_angle:
+                            ood_reason = (
+                                f"box OOD: pos_err={_pos_err:.4f}m "
+                                f"(limit {guard_max_obj_dist:.3f}), "
+                                f"ang_err={_ang_err:.4f}rad "
+                                f"(limit {guard_max_obj_angle:.3f}) at phase={phase:.1f}"
+                            )
+                            logger.error(ood_reason, extra={"step": traj_idx})
+                            ood_event.set()
                 else:
                     feature_parts.append(np.zeros(3, dtype=np.float32))             # relative obj pos
                     feature_parts.append(IDENTITY_QUAT_WXYZ)                        # relative obj quat
@@ -985,6 +1045,12 @@ def control_thread():
         new_data_event.clear()
         while True:
             t_start = rtde_c.initPeriod()
+
+            # OOD guard tripped by the policy thread — raise before sending any further
+            # command. except→raise runs this thread's finally (servoStop, stopScript);
+            # the thread dying drops the main keep-alive loop, whose finally runs stopJ.
+            if ood_event.is_set():
+                raise RuntimeError(f"OOD guard breached: {ood_reason}")
 
             if step_counter % policy_decimation == 0:
                 run_policy_event.set()
