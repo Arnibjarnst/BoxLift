@@ -34,7 +34,7 @@ POSE_ESTIMATION_CONFIG = (
 )
 POSE_ESTIMATION_PORT = 5555
 BOX_BOARD_ID = "0"
-POSE_FIRST_POSE_TIMEOUT_S = 30.0
+POSE_FIRST_POSE_TIMEOUT_S = 5.0
 
 
 # ---------------------------
@@ -430,7 +430,8 @@ def save_tracking_npz():
     Schema (different first-dim lengths are fine in np.savez; the prefix tells the
     consumer which rate the array is at):
       - 500 Hz keys (no prefix): steps, phase, actual_q, actual_qd, expected_q,
-        target_q, actual_obj_pos, actual_obj_quat, tcp_force.
+        target_q, actual_obj_pos, actual_obj_quat, tcp_force, target_moment,
+        current_as_torque.
       - 50 Hz keys (`policy_` prefix): policy_iter, policy_phase, policy_obs,
         policy_raw_output (6 or 7 dims), policy_dphase.
       - Scalar metadata: src_dt, gain, lookahead_time, action_scale,
@@ -461,6 +462,15 @@ def save_tracking_npz():
             # NaN-filled for ticks that didn't capture it (e.g. IsaacSim backend).
             tcp_force=np.array([
                 d.get("tcp_force", np.full(6, np.nan, dtype=np.float32)) for d in snapshot
+            ]),
+            # Controller's commanded per-joint torque [Nm] and the motor-current-
+            # derived torque, both from the receive interface. NaN-filled when
+            # unavailable.
+            target_moment=np.array([
+                d.get("target_moment", np.full(6, np.nan, dtype=np.float32)) for d in snapshot
+            ]),
+            current_as_torque=np.array([
+                d.get("current_as_torque", np.full(6, np.nan, dtype=np.float32)) for d in snapshot
             ]),
         )
     if policy_snapshot:
@@ -505,11 +515,26 @@ def log(i, target_q, phase):
     # detecting contact events and correlating force spikes with policy actions.
     tcp_force = np.array(rtde_r.getActualTCPForce(), dtype=np.float32)
 
+    # Per-joint torque proxy for the directTorque comparison. MUST come from the
+    # RECEIVE interface (rtde_r), never the control interface. rtde_c.getJointTorques()
+    # is a blocking round-trip over the same control channel servoJ() uses — calling
+    # it every 500 Hz tick contends with the servo stream and jitters the reference.
+    # waitPeriod() hides this from the loop-time check because it normalizes the
+    # *period*, not the servoJ send *phase*. rtde_r.* getters are free local reads of
+    # the streamed RTDE packet, so they don't perturb the control timing.
+    # target_moment = controller's commanded joint torque [Nm] (core RTDE register).
+    # getActualCurrentAsTorque is firmware-dependent, so guard it and NaN-fill.
+    target_moment = np.array(rtde_r.getTargetMoment(), dtype=np.float32)
+    try:
+        current_as_torque = np.array(
+            rtde_r.getActualCurrentAsTorque(), dtype=np.float32
+        )
+    except Exception:
+        current_as_torque = np.full(6, np.nan, dtype=np.float32)
+
     # Reference is the trajectory interpolated at the exact phase the policy thread
     # produced for this servo tick (control thread linearly blends previous→current).
     expected_q = interp_np(joints, phase)
-
-    tracking_error = np.linalg.norm(actual_q - expected_q)
 
     # Reuse the box pose the policy thread last fetched, instead of polling the
     # listener again on every 500 Hz servoJ tick.
@@ -528,13 +553,11 @@ def log(i, target_q, phase):
             "actual_obj_pos": actual_obj_pos.copy(),
             "actual_obj_quat": actual_obj_quat.copy(),
             "tcp_force": tcp_force.copy(),
+            "target_moment": target_moment.copy(),
+            "current_as_torque": current_as_torque.copy(),
         })
 
-    logger.info(
-        f"Tracking error {tracking_error:.6f}. "
-        f"Actual: {actual_q}. Expected: {expected_q}.",
-        extra={"step": i},
-    )
+    tracking_error = np.linalg.norm(actual_q - expected_q)
 
     robot_mode = rtde_r.getRobotMode()
     safety_mode = rtde_r.getSafetyMode()
@@ -820,7 +843,6 @@ def policy_thread():
         actual_obj_quat = None
         if pose_listener is not None:
             box_pose = real_to_sim_pose(pose_listener.get_pose(BOX_BOARD_ID))
-            print(box_pose)
             if box_pose is not None:
                 actual_obj_pos = box_pose[:3].astype(np.float32)
                 actual_obj_quat = box_pose[3:].astype(np.float32)
@@ -1045,6 +1067,7 @@ def control_thread():
         new_data_event.clear()
         while True:
             t_start = rtde_c.initPeriod()
+            t1 = time.perf_counter()
 
             # OOD guard tripped by the policy thread — raise before sending any further
             # command. except→raise runs this thread's finally (servoStop, stopScript);
@@ -1064,7 +1087,7 @@ def control_thread():
                 # FOH: linearly interpolate between the previous target and the latest one
                 # across the decimation window so the joint target the robot sees evolves
                 # smoothly at 500Hz instead of stepping every 20ms.
-                alpha = 1.0 # ZOH override
+                # alpha = 1.0 # ZOH override
 
                 interp_q = (1.0 - alpha) * previous_target_q + alpha * current_target_q
                 interp_phase = (1.0 - alpha) * previous_phase + alpha * current_phase
@@ -1091,6 +1114,9 @@ def control_thread():
                 break
 
             # Should be at the end to ensure correct timing
+            t2 = time.perf_counter()
+            if (t2 - t1) > (1 / rtde_frequency):
+                raise Exception(f"too slow: {t2-t1}")
             rtde_c.waitPeriod(t_start)
 
     except Exception as e:
