@@ -10,7 +10,7 @@ import yaml
 parser = argparse.ArgumentParser()
 parser.add_argument("joint_target_file_1", type=str)
 parser.add_argument("--hz", type=int, default=50)
-parser.add_argument("--box_dims", type=str, default="0.357,0.259,0.277",
+parser.add_argument("--box_dims", type=str, default="0.34,0.235,0.27",
                     help="Box visual dimensions Lx,Ly,Lz in meters.")
 parser.add_argument("--env_idx", type=int, default=0,
                     help="For multi-env record.py rollouts ((T, N, ...) schema), which env to "
