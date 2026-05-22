@@ -131,6 +131,10 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         env_cfg.trajectory_path = saved_env_cfg["trajectory_path"]
     print(f"[INFO] Using trajectory: {env_cfg.trajectory_path}")
 
+    if "dataset_path" in saved_env_cfg:
+        env_cfg.dataset_path = saved_env_cfg["dataset_path"]
+        print(f"[INFO] Using dataset: {env_cfg.dataset_path}")
+
     # Restore fields that affect obs/action layout from the trained run
     if "obs_history_steps" in saved_env_cfg:
         env_cfg.obs_history_steps = int(saved_env_cfg["obs_history_steps"])
@@ -191,10 +195,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _voc_state_path = os.path.join(log_dir, "voc_state.npz")
             if os.path.exists(_voc_state_path):
                 _voc_state = np.load(_voc_state_path)
-                _direct_env.voc_kp_pos = float(_voc_state["voc_kp_pos"])
-                _direct_env.voc_kp_rot = float(_voc_state["voc_kp_rot"])
-                _direct_env.voc_kv_pos = float(_voc_state["voc_kv_pos"])
-                _direct_env.voc_kv_rot = float(_voc_state["voc_kv_rot"])
+                # Per-segment training saves (S,) arrays; single-VOC saves scalars.
+                # apply_voc_state handles both transparently (broadcasts scalar across
+                # the per-seg tensor, or assigns array element-wise).
+                if hasattr(_direct_env, "apply_voc_state"):
+                    _direct_env.apply_voc_state(_voc_state)
+                else:
+                    # Legacy fallback for envs without the helper (scalar-only).
+                    _direct_env.voc_kp_pos = float(_voc_state["voc_kp_pos"])
+                    _direct_env.voc_kp_rot = float(_voc_state["voc_kp_rot"])
+                    _direct_env.voc_kv_pos = float(_voc_state["voc_kv_pos"])
+                    _direct_env.voc_kv_rot = float(_voc_state["voc_kv_rot"])
                 print(f"[INFO] --keep_voc: loaded VOC state from {_voc_state_path} "
                       f"(kp_pos={_direct_env.voc_kp_pos:.3f}, kp_rot={_direct_env.voc_kp_rot:.3f})")
             else:

@@ -129,10 +129,10 @@ for name, ee_poses in zip(arm_names, ee_poses_list):
     )
     ee_markers.append(marker)
 
-# kps = np.ones(6, dtype=np.float32) * 150.0
+kps = np.ones(6, dtype=np.float32) * 150.0
 kps = np.array([800, 600, 300, 200, 100, 100])
-kds = np.ones(6, dtype=np.float32) * 22.5
-kds = kps * 0.1
+# kds = np.ones(6, dtype=np.float32) * 22.5
+# kds = kps * 0.1
 
 
 

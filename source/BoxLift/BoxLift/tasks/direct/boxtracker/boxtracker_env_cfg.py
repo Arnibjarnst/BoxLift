@@ -138,9 +138,13 @@ class EventCfg:
     )
 
 @configclass
-class BoxhingeEnvCfg(DirectRLEnvCfg):
-    # Trajectory file path
+class BoxtrackerEnvCfg(DirectRLEnvCfg):
+    # Single full-trajectory path (kept for compatibility / tooling that still passes it).
     trajectory_path = ""
+    # Folder of segment npz files (seg_*.npz) produced by planning_through_contact's
+    # RL_data generator. Each episode loads a random segment and tracks it from the
+    # beginning. Variable-length segments → per-env segment_length tensor for timeout.
+    dataset_path = ""
     # env
     # physics_dt * decimations needs to match dt from planner/IK
     physics_dt = 1.0 / 100.0
@@ -188,6 +192,12 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     #   spikes) and false negatives (transient drops below threshold).
     contact_obs_delay_steps = 0
     contact_obs_flip_prob = 0.0
+    # Include the EE pose expressed in the box frame. Relative (actual-in-box minus
+    # reference-in-box, pos 3 + quat 4) is always added when on; the absolute
+    # EE-in-box pose (pos 3 + quat 4) is added too when include_absolute_obs is set.
+    # Helps the policy with relative tracking since the box frame is the natural one
+    # for contact-rich manipulation. The reward path's EE-box-relative term is unchanged.
+    include_ee_box_obs = False
     observation_space = 13  # recomputed in __post_init__
     state_space = 0
 
@@ -255,13 +265,21 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
             dim *= 2
         if self.include_contact_obs:
             dim += 1
+        if self.include_ee_box_obs:
+            # Relative EE-in-box (pos 3 + quat 4); + absolute EE-in-box (7) if absolute obs.
+            dim += 7
+            if self.include_absolute_obs:
+                dim += 7
         return dim
 
     def __post_init__(self):
         # Idempotent: always reset action_space/observation_space to base before recomputing.
         # Must be safe to call more than once (e.g. after hydra overrides).
         self.action_space = 7 if self.enable_phase_slowdown else 6
-        self.observation_space = self.per_step_feature_dim * self.obs_history_steps + 1
+        # Boxtracker: phase scalar is intentionally dropped from the observation (the
+        # policy must be phase-agnostic so it generalizes across arbitrary segments),
+        # so there is no "+ 1" here unlike boxhinge.
+        self.observation_space = self.per_step_feature_dim * self.obs_history_steps
         future_dim = 14 if self.include_absolute_obs else 7
         self.observation_space += future_dim * len(self.future_obs_steps)
         if self.include_prev_actions:
@@ -402,7 +420,7 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # tracking exists as guidance. Under the old weighting, the policy maxed track (cheap
     # kinematic following) at the expense of task, and VOC could decay past the policy's
     # actual contact-mechanics capability because the threshold check still saw high track.
-    w_task = 0.9
+    w_task = 0.8
     w_track = 1 - w_task
     w_regularization = 1.0
 
@@ -660,8 +678,8 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # majority dominate the mean). 0.65 is calibrated so a small completion-rate dip
     # (≈95%) brings the mean below threshold and pauses decay, giving the policy time
     # to adapt to the kp level before VOC weakens further.
-    voc_threshold_task: float = 0.6     # task reward (obj_pos · obj_quat or sum form)
-    voc_threshold_track: float = 0.5    # tracking reward (eef_box_rel + eef_pos + ...)
+    voc_threshold_task: float = 0.5     # task reward (obj_pos · obj_quat or sum form)
+    voc_threshold_track: float = 0.4    # tracking reward (eef_box_rel + eef_pos + ...)
     # Warmup period (in env steps via common_step_counter) before any decay can fire.
     # common_step_counter increments by 1 per env step (not per env*step), so this
     # divides by num_steps_per_env=24 to get "iterations": 5000 / 24 ≈ 208 iters.
@@ -670,12 +688,19 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # If decay starts when the policy is already deterministic, it can't adapt to
     # each kp level — adaptation requires exploring new residual patterns.
     voc_decay_warmup_steps: int = 0
+    # Per-segment VOC: each segment in the pool owns its own kp/kv and its own trailing-
+    # mean ring buffer of completed episodes. Easy segments decay (and zero out) early
+    # while hard segments keep their assist longer; decay decisions are local to each
+    # segment. When False (default), the original global scalar VOC behavior is preserved
+    # — a single kp/kv decays in lockstep across all segments. Per-segment ring buffer
+    # is sized (S, voc_reward_window_size); per-seg decay gating uses the same thresholds.
+    voc_per_segment: bool = False
 
 
 def get_ur5e_cfg(
     prim_path,
     init_pose,
-    cfg: BoxhingeEnvCfg,
+    cfg: "BoxtrackerEnvCfg",
 ):
     actuator_kwargs = dict(
         joint_names_expr=[".*"],

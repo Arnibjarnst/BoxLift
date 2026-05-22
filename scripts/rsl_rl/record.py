@@ -33,6 +33,12 @@ parser.add_argument(
     help="Use the pre-trained checkpoint from Nucleus.",
 )
 parser.add_argument("--real-time", action="store_true", default=False, help="Run in real-time, if possible.")
+parser.add_argument("--num_envs", type=int, default=1,
+                    help="Number of parallel rollouts to record. All start at phase=0. The loop "
+                         "continues until every env has hit `done`; finished envs are masked out "
+                         "of the running mean and their per-env slots are flagged in `alive_mask` "
+                         "so downstream code can ignore the post-reset garbage. Per-env arrays in "
+                         "the npz are (T, N, ...), even for N=1, so the schema is uniform.")
 parser.add_argument("--trajectory_path", type=str, default=None, help="Override trajectory path (default: read from run's env.yaml)")
 parser.add_argument("--keep_voc", action="store_true", default=False,
                     help="Record with the VOC gains saved at the end of training (loaded from <log_dir>/voc_state.npz). "
@@ -96,8 +102,14 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # override configurations with non-hydra CLI arguments
     agent_cfg: RslRlBaseRunnerCfg = cli_args.update_rsl_rl_cfg(agent_cfg, args_cli)
-    env_cfg.scene.num_envs = 1
+    env_cfg.scene.num_envs = int(args_cli.num_envs)
     env_cfg.max_episode_steps = -1
+
+    # Ask the env to also stash per-env reward components in extras["log_per_env"] so
+    # we can save per-env arrays alongside the env-mean ones. Off during training to
+    # avoid runner overhead; harmless on envs that don't recognize the flag.
+    if hasattr(env_cfg, "emit_per_env_extras"):
+        env_cfg.emit_per_env_extras = True
 
     # set the environment seed
     # note: certain randomizations occur in the environment initialization so we set the seed here
@@ -187,10 +199,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             _voc_state_path = os.path.join(log_dir, "voc_state.npz")
             if os.path.exists(_voc_state_path):
                 _voc_state = np.load(_voc_state_path)
-                _direct_env.voc_kp_pos = float(_voc_state["voc_kp_pos"])
-                _direct_env.voc_kp_rot = float(_voc_state["voc_kp_rot"])
-                _direct_env.voc_kv_pos = float(_voc_state["voc_kv_pos"])
-                _direct_env.voc_kv_rot = float(_voc_state["voc_kv_rot"])
+                # Per-segment training saves (S,) arrays; single-VOC saves scalars.
+                # apply_voc_state handles both transparently.
+                if hasattr(_direct_env, "apply_voc_state"):
+                    _direct_env.apply_voc_state(_voc_state)
+                else:
+                    _direct_env.voc_kp_pos = float(_voc_state["voc_kp_pos"])
+                    _direct_env.voc_kp_rot = float(_voc_state["voc_kp_rot"])
+                    _direct_env.voc_kv_pos = float(_voc_state["voc_kv_pos"])
+                    _direct_env.voc_kv_rot = float(_voc_state["voc_kv_rot"])
                 print(f"[INFO] --keep_voc: loaded VOC state from {_voc_state_path} "
                       f"(kp_pos={_direct_env.voc_kp_pos:.3f}, kp_rot={_direct_env.voc_kp_rot:.3f})")
             else:
@@ -259,65 +276,84 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     direct_env = env.env.unwrapped
     direct_env._reset_idx(None, 0)
+    num_envs = int(direct_env.num_envs)
+    device = direct_env.device
 
     # Detect single-arm (boxpush) vs dual-arm (boxlift) layout
     dual_arm = hasattr(direct_env, "ur5e_l") and hasattr(direct_env, "ur5e_r")
 
-    def _flatten(x):
-        """Concatenate tuples of per-arm tensors into a flat (12,) vector; pass through (6,) tensors."""
+    # All helpers below return per-env arrays of shape (N, ...). For dual-arm,
+    # joint-related quantities are concatenated as [left (6), right (6)] = (N, 12).
+    def _to_np_per_env(t):
+        """(N, D) torch tensor → (N, D) numpy array."""
+        return t.detach().cpu().numpy()
+
+    def _flatten_targets(x):
+        """get_joint_targets() returns either a single (N, 6) tensor (boxpush) or a
+        (q_l, q_r) tuple of (N, 6) tensors (boxlift). Concatenate to (N, 12 or 6)."""
         if isinstance(x, (tuple, list)):
-            return torch.cat([t[0] for t in x]).cpu().tolist()
-        return x[0].cpu().tolist()
+            return _to_np_per_env(torch.cat(x, dim=-1))
+        return _to_np_per_env(x)
 
-    def _joint_positions():
+    def _joint_positions_all():
         if dual_arm:
-            return torch.cat((direct_env.ur5e_l.data.joint_pos[0], direct_env.ur5e_r.data.joint_pos[0])).cpu().tolist()
-        return direct_env.ur5e.data.joint_pos[0].cpu().tolist()
+            return _to_np_per_env(torch.cat((direct_env.ur5e_l.data.joint_pos,
+                                             direct_env.ur5e_r.data.joint_pos), dim=-1))
+        return _to_np_per_env(direct_env.ur5e.data.joint_pos)
 
-    def _applied_torques():
+    def _applied_torques_all():
         if dual_arm:
-            return torch.cat((direct_env.ur5e_l.data.applied_torque[0], direct_env.ur5e_r.data.applied_torque[0])).cpu().tolist()
-        return direct_env.ur5e.data.applied_torque[0].cpu().tolist()
+            return _to_np_per_env(torch.cat((direct_env.ur5e_l.data.applied_torque,
+                                             direct_env.ur5e_r.data.applied_torque), dim=-1))
+        return _to_np_per_env(direct_env.ur5e.data.applied_torque)
 
-    def _expected_q():
-        """Trajectory joints at the current phase. Boxpush uses float phase + _interp;
-        boxlift uses integer episode_length_buf with separate joints_l/joints_r."""
+    def _expected_q_all():
+        """Trajectory joints at each env's current phase. Boxlift indexes per-env via
+        integer episode_length_buf with separate joints_l/joints_r; boxpush uses
+        float `phase` + `_interp`."""
         if dual_arm:
-            idx = int(direct_env.episode_length_buf[0].item())
-            idx = min(idx, direct_env.joints_l.shape[0] - 1)
-            return torch.cat([direct_env.joints_l[idx], direct_env.joints_r[idx]]).cpu().tolist()
-        return direct_env._interp(direct_env.joints)[0].cpu().tolist()
+            T_traj = direct_env.joints_l.shape[0]
+            idx = direct_env.episode_length_buf.clamp(max=T_traj - 1).long()
+            q_l = direct_env.joints_l[idx]  # (N, 6)
+            q_r = direct_env.joints_r[idx]
+            return _to_np_per_env(torch.cat([q_l, q_r], dim=-1))
+        return _to_np_per_env(direct_env._interp(direct_env.joints))
 
-    def _phase_value():
-        """Float phase index. Boxlift exposes only episode_length_buf (integer)."""
+    def _phase_all():
+        """Per-env float phase. Boxlift only exposes integer episode_length_buf."""
         if hasattr(direct_env, "phase"):
-            return float(direct_env.phase[0].item())
-        return float(direct_env.episode_length_buf[0].item())
+            return direct_env.phase.detach().cpu().numpy().astype(np.float32)
+        return direct_env.episode_length_buf.detach().cpu().numpy().astype(np.float32)
 
-    def _obj_pose():
-        """Box pose in env-frame. Returns (pos_xyz, quat_wxyz) as flat lists."""
-        pos = (direct_env.object.data.root_pos_w[0] - direct_env.scene.env_origins[0]).cpu().tolist()
-        quat = direct_env.object.data.root_quat_w[0].cpu().tolist()
-        return pos, quat
+    def _obj_pose_all():
+        """Per-env box pose in env-frame. Returns (pos_xyz (N, 3), quat_wxyz (N, 4))."""
+        pos = (direct_env.object.data.root_pos_w - direct_env.scene.env_origins)
+        quat = direct_env.object.data.root_quat_w
+        return _to_np_per_env(pos), _to_np_per_env(quat)
 
-    # Per-step rollout buffers. Schema matches ur_rtde_real_time.py's tracking_log so the
-    # same downstream tooling (visualize_traj.py, plot_rollout_rewards.py, analyze_*.ipynb,
-    # ur_rtde_test.py) works on both real and sim rollouts.
+    # Per-step rollout buffers. All per-env fields are (N, ...) at append time; we
+    # stack to (T, N, ...) at save time. Schema matches ur_rtde_real_time.py modulo
+    # the new N dim (downstream notebooks can .squeeze(1) for N=1 if needed).
     rollout = {
         "steps": [],
-        "phase": [],
-        "actual_q": [],          # post-step joint position (matches real-rollout convention)
-        "expected_q": [],        # trajectory joints at current phase
-        "target_q": [],          # joint targets sent to the actuator (was joint_targets)
-        "actual_obj_pos": [],
-        "actual_obj_quat": [],
-        "joint_torques": [],     # not in real npz; kept for analyze_policy_residual.ipynb
-        "rewards": [],
+        "phase": [],             # (T, N) float
+        "actual_q": [],          # (T, N, J) post-step joint position
+        "expected_q": [],        # (T, N, J) trajectory joints at current phase
+        "target_q": [],          # (T, N, J) joint targets sent to the actuator
+        "actual_obj_pos": [],    # (T, N, 3)
+        "actual_obj_quat": [],   # (T, N, 4)
+        "joint_torques": [],     # (T, N, J)
+        "rewards": [],           # (T, N) per-env reward; mean over alive envs derived at save
+        "alive_mask": [],        # (T, N) bool: True if env was alive going INTO this step
+        "done_this_step": [],    # (T, N) bool: True iff env's `done` fired at this step
     }
-    extras_log = []  # list of dicts of {metric_key: float}
+    extras_log = []          # per-step dicts of {metric_key: float} — already env-mean
+    extras_per_env_log = []  # per-step dicts of {metric_key: (N,) numpy array} — when the env
+                             # exposes `extras["log_per_env"]` (boxlift does). Lets downstream
+                             # tools split reward components per-env (e.g. why env 12 spiked).
 
     def _to_py(v):
-        """Convert a torch tensor / numpy scalar / python scalar to a python float."""
+        """Convert torch / numpy / python scalar to a python float (or list)."""
         if hasattr(v, "detach"):
             v = v.detach()
         if hasattr(v, "cpu"):
@@ -326,32 +362,63 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             return v.tolist()
         return v
 
+    def _to_np_1d(v):
+        """Convert a torch (N,) / numpy (N,) tensor to a 1-D numpy float32 array. Scalars
+        are broadcast to (num_envs,) NaN so the resulting stack stays shape-uniform."""
+        if hasattr(v, "detach"):
+            v = v.detach().cpu().numpy()
+        v = np.asarray(v)
+        if v.ndim == 0:
+            return np.full(num_envs, np.nan, dtype=np.float32)
+        return v.astype(np.float32, copy=False)
+
+    # Track per-env aliveness and the step at which each env terminated. Once an env
+    # hits done, IsaacLab auto-resets it and the data flowing through env.step is from
+    # the next episode — alive_mask is what downstream code uses to ignore those slots.
+    alive = torch.ones(num_envs, dtype=torch.bool, device=device)
+    done_step = torch.full((num_envs,), -1, dtype=torch.long, device=device)
+
     # reset environment
     obs = env.get_observations()
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
         start_time = time.time()
-        # run everything in inference mode
         with torch.inference_mode():
             actions = policy(obs)
 
-            target_q  = _flatten(direct_env.get_joint_targets())
-            expected  = _expected_q()
-            phase_val = _phase_value()
+            target_q  = _flatten_targets(direct_env.get_joint_targets())
+            expected  = _expected_q_all()
+            phase_val = _phase_all()
+            alive_now = alive.detach().cpu().numpy().copy()
 
             obs, rewards, dones, extras = env.step(actions)
+            # rsl_rl's VecEnvWrapper returns `dones` as torch.long (it's used as an
+            # index into the rollout-storage tensors inside the runner). For our
+            # bitwise-mask logic below we need it as bool — otherwise `alive & ~dones`
+            # silently coerces `alive` to int, `~alive` becomes bitwise-NOT (= -2 for
+            # value 1, -1 for value 0), and NumPy interprets the resulting int array
+            # as FANCY INDICES rather than a bool mask in `arr[dead_after] = nan`.
+            # The visible symptom is only envs N-2 (= ~int(1)) and N-1 (= ~int(0))
+            # ever getting NaN'd, regardless of which env actually terminated.
+            dones = dones.bool()
 
-            obj_pos, obj_quat = _obj_pose()
+            # Per-env data captured AFTER the step. For envs that just terminated,
+            # IsaacLab has already auto-reset them, so their slots reflect the new
+            # episode's reset state — alive_mask flags this so consumers ignore them.
+            obj_pos_all, obj_quat_all = _obj_pose_all()
             rollout["steps"].append(timestep)
             rollout["phase"].append(phase_val)
-            rollout["actual_q"].append(_joint_positions())
+            rollout["actual_q"].append(_joint_positions_all())
             rollout["expected_q"].append(expected)
             rollout["target_q"].append(target_q)
-            rollout["actual_obj_pos"].append(obj_pos)
-            rollout["actual_obj_quat"].append(obj_quat)
-            rollout["joint_torques"].append(_applied_torques())
-            rollout["rewards"].append(float(rewards[0].item()))
+            rollout["actual_obj_pos"].append(obj_pos_all)
+            rollout["actual_obj_quat"].append(obj_quat_all)
+            rollout["joint_torques"].append(_applied_torques_all())
+            rollout["rewards"].append(rewards.detach().cpu().numpy().astype(np.float32))
+            rollout["alive_mask"].append(alive_now)
+            newly_done = (dones & alive)
+            rollout["done_this_step"].append(newly_done.detach().cpu().numpy())
 
             log_entry = {}
             raw_log = extras.get("log", {}) if isinstance(extras, dict) else {}
@@ -359,8 +426,45 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 log_entry[k] = _to_py(v)
             extras_log.append(log_entry)
 
+            # Per-env metrics — only populated when the env exposes log_per_env.
+            log_pe_entry = {}
+            raw_log_pe = extras.get("log_per_env", {}) if isinstance(extras, dict) else {}
+            for k, v in raw_log_pe.items():
+                log_pe_entry[k] = _to_np_1d(v)
+            extras_per_env_log.append(log_pe_entry)
+
+            # Mark envs that just finished; stop when every env has terminated.
+            done_step[newly_done] = timestep
+            alive = alive & ~dones
+
+            # Once an env hits done, IsaacLab has already auto-reset it inside env.step
+            # — every per-env state quantity we just captured for that env is therefore
+            # the FIRST FRAME of a new episode, not the terminal state of the old one.
+            # NaN those slots so downstream tools (plot_rollout_rewards.py,
+            # visualize_traj.py, success-metric notebooks) naturally skip them instead
+            # of plotting/rendering the auto-reset garbage as if it were real behavior.
+            #
+            # Reward is the exception: IsaacLab computes rewards BEFORE the auto-reset,
+            # so the death-step reward IS the valid terminal reward — keep it. NaN
+            # rewards only for envs that were ALREADY dead going into this step (their
+            # reward at this step is the next-episode reward we want to ignore).
+            dead_after = (~alive).detach().cpu().numpy()    # died this step OR earlier
+            already_dead = ~alive_now                        # were already dead at start
+            if dead_after.any():
+                for k in ("phase", "actual_q", "expected_q", "target_q",
+                          "actual_obj_pos", "actual_obj_quat", "joint_torques"):
+                    arr = rollout[k][-1]
+                    arr[dead_after, ...] = np.nan
+                if log_pe_entry:
+                    for v in log_pe_entry.values():
+                        v[dead_after] = np.nan
+            if already_dead.any():
+                rollout["rewards"][-1][already_dead] = np.nan
+
             timestep += 1
-            if torch.any(dones):
+
+            if not bool(alive.any().item()):
+                print(f"[INFO] All {num_envs} env(s) terminated by step {timestep}.")
                 break
 
         if args_cli.video and timestep >= args_cli.video_length:
@@ -373,15 +477,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     rollout_path = os.path.join(log_dir, "rollout", "output.npz")
     os.makedirs(os.path.dirname(rollout_path), exist_ok=True)
 
-    # Per-step extras: collect every metric key seen, stack into (N,) arrays. NPZ keys can't
-    # contain '/', so encode "Rewards_task/obj_pos" → "extras__Rewards_task__obj_pos". The
-    # "extras__" prefix lets loaders enumerate them without false positives.
+    # Per-step extras (env-mean): collect every metric key seen, stack into (T,) arrays.
+    # NPZ keys can't contain '/', so encode "Rewards_task/obj_pos" →
+    # "extras__Rewards_task__obj_pos". The "extras__" prefix lets loaders enumerate them
+    # without false positives.
     all_extras_keys = sorted({k for e in extras_log for k in e.keys()})
     extras_arrays = {
         f"extras__{k.replace('/', '__')}": np.asarray(
             [e.get(k, float("nan")) for e in extras_log], dtype=np.float32
         )
         for k in all_extras_keys
+    }
+
+    # Per-step per-env extras: parallel to the above but with an N dim. Missing keys at any
+    # step (env-bound emission switched off mid-run) fill with NaN-(N,) so the (T, N) stack
+    # stays shape-uniform. Encoded with "extras_per_env__" prefix; downstream tools should
+    # prefer these over the env-mean `extras__*` when slicing to a specific env.
+    all_per_env_keys = sorted({k for e in extras_per_env_log for k in e.keys()})
+    nan_n = np.full(num_envs, np.nan, dtype=np.float32)
+    extras_per_env_arrays = {
+        f"extras_per_env__{k.replace('/', '__')}": np.stack(
+            [e.get(k, nan_n) for e in extras_per_env_log], axis=0
+        )
+        for k in all_per_env_keys
     }
 
     arm_pose_kwargs = (
@@ -391,17 +509,54 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         {"arm_pose": direct_env.arm_pose.cpu().numpy()}
     )
 
+    # Stack per-step lists into (T, N, ...) arrays.
+    phase_arr           = np.stack(rollout["phase"],          axis=0)  # (T, N)
+    actual_q_arr        = np.stack(rollout["actual_q"],       axis=0)  # (T, N, J)
+    expected_q_arr      = np.stack(rollout["expected_q"],     axis=0)
+    target_q_arr        = np.stack(rollout["target_q"],       axis=0)
+    actual_obj_pos_arr  = np.stack(rollout["actual_obj_pos"], axis=0)  # (T, N, 3)
+    actual_obj_quat_arr = np.stack(rollout["actual_obj_quat"],axis=0)  # (T, N, 4)
+    joint_torques_arr   = np.stack(rollout["joint_torques"],  axis=0)
+    rewards_arr         = np.stack(rollout["rewards"],        axis=0).astype(np.float32)  # (T, N)
+    alive_mask_arr      = np.stack(rollout["alive_mask"],     axis=0).astype(np.bool_)    # (T, N)
+    done_this_step_arr  = np.stack(rollout["done_this_step"], axis=0).astype(np.bool_)
+
+    # Convenience: alive-masked per-step mean reward. Computed once at save time so
+    # downstream notebooks don't have to redo the mask math. NaN-safe — already-dead
+    # envs have NaN rewards, which would otherwise propagate through the multiply
+    # (0 * NaN == NaN). Use `valid_mask = alive_mask & finite(rewards)` so dead envs
+    # are excluded from both the numerator and the denominator. Steps where no env
+    # has a valid reward (shouldn't happen post-loop) get NaN.
+    finite_mask = np.isfinite(rewards_arr)
+    valid_mask = alive_mask_arr & finite_mask
+    valid_f = valid_mask.astype(np.float32)
+    n_valid_per_step = valid_f.sum(axis=1)
+    r_safe = np.where(finite_mask, rewards_arr, 0.0)
+    rewards_mean_alive = np.where(
+        n_valid_per_step > 0,
+        (r_safe * valid_f).sum(axis=1) / np.maximum(n_valid_per_step, 1),
+        np.float32("nan"),
+    ).astype(np.float32)
+
+    done_step_arr = done_step.detach().cpu().numpy().astype(np.int64)  # (N,) -1 if never done
+
     np.savez(
         rollout_path,
         steps=np.asarray(rollout["steps"], dtype=np.int64),
-        phase=np.asarray(rollout["phase"], dtype=np.float32),
-        actual_q=np.asarray(rollout["actual_q"], dtype=np.float32),
-        expected_q=np.asarray(rollout["expected_q"], dtype=np.float32),
-        target_q=np.asarray(rollout["target_q"], dtype=np.float32),
-        actual_obj_pos=np.asarray(rollout["actual_obj_pos"], dtype=np.float32),
-        actual_obj_quat=np.asarray(rollout["actual_obj_quat"], dtype=np.float32),
-        joint_torques=np.asarray(rollout["joint_torques"], dtype=np.float32),
-        rewards=np.asarray(rollout["rewards"], dtype=np.float32),
+        # Per-env, per-step. Shapes (T, N, ...); for N=1 do .squeeze(1) downstream.
+        phase=phase_arr,
+        actual_q=actual_q_arr,
+        expected_q=expected_q_arr,
+        target_q=target_q_arr,
+        actual_obj_pos=actual_obj_pos_arr,
+        actual_obj_quat=actual_obj_quat_arr,
+        joint_torques=joint_torques_arr,
+        rewards=rewards_arr,                  # per-env raw rewards
+        rewards_mean_alive=rewards_mean_alive, # convenience: alive-masked mean per step
+        alive_mask=alive_mask_arr,             # True iff env was alive going INTO that step
+        done_this_step=done_this_step_arr,     # True iff env's `done` fired at that step
+        done_step=done_step_arr,               # (N,) step idx where each env terminated; -1 if never
+        num_envs=np.int64(num_envs),
         # Sample period of the rollout (env step). Real-rollout npz uses 1/500;
         # consumers should read this rather than hardcode 500Hz.
         src_dt=np.float64(dt),
@@ -416,8 +571,11 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         dual_arm=np.bool_(dual_arm),
         **arm_pose_kwargs,
         **extras_arrays,
+        **extras_per_env_arrays,
     )
-    print(f"[INFO] Rollout saved to: {rollout_path}")
+    print(f"[INFO] Rollout saved to: {rollout_path}  "
+          f"(T={len(rollout['steps'])}, N={num_envs}, "
+          f"done_step range=[{int(done_step_arr.min())}, {int(done_step_arr.max())}])")
 
     env.close()
 

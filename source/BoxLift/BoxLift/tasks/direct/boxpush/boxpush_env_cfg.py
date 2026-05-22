@@ -295,7 +295,7 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     # Reference path (planner trajectory) is NOT affected. Reward path reads clean ground
     # truth via _get_obj_pos / _get_obj_quat. To disable: set obs_obj_delay_steps=0 and
     # obs_obj_update_period=1.
-    obs_obj_delay_steps = 13             # 260ms at 20ms env step
+    obs_obj_delay_steps = 5              # 100ms at 20ms env step
     obs_obj_update_period = 2            # 25Hz
 
     # Perturbation forces (for sim-to-real robustness)

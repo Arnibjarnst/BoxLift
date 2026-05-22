@@ -21,7 +21,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         # that doesn't reflect a meaningful policy direction; PPO's gradient gets buried
         # under variance. Narrower init exploration helps PPO settle on what the rewards
         # actually prefer rather than wandering during the first 100 iters.
-        init_noise_std=0.5,
+        init_noise_std=1.0,
         actor_obs_normalization=True,
         critic_obs_normalization=True,
         actor_hidden_dims=[512, 256, 128],
@@ -32,12 +32,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
         value_loss_coef=1.0,
         use_clipped_value_loss=True,
         clip_param=0.2,
-        # entropy_coef = 0.01 — balanced setting. 0.015 was right for clean-obs VOC
-        # decay (kept std elevated as reward landscape shifted); with obs noise added,
-        # the gradient signal is noisier and 0.015 was pushing std too high (0.43→0.7+
-        # at iter 2k). 0.005 is too low — std collapses before VOC fully decays. 0.01
-        # is the middle ground.
-        entropy_coef=0.01,
+        entropy_coef=0.015,
         num_learning_epochs=5,
         num_mini_batches=4,
         learning_rate=3.0e-4,

@@ -323,6 +323,17 @@ class BoxpushEnv(DirectRLEnv):
         obj_quat = self._nlerp(self.obj_poses[:, 3:])
         self.cube_marker.visualize(translations=obj_pos, orientations=obj_quat)
 
+        # Cache the joint target once per policy step. Modes C/D depend on q_current —
+        # without caching, _apply_action would recompute the target every substep and the
+        # target would drift with the joint inside the decimation window. Caching here
+        # makes the target a plain ZOH-from-q_at_policy_time, matching standard deployment
+        # (ZOH between policy updates + high-rate low-level PD chasing a fixed target).
+        # Modes A/B don't depend on q_current so caching is a no-op for them.
+        self._cached_joint_target = self.get_joint_targets().clamp(
+            self.ur5e.data.joint_pos_limits[..., 0],
+            self.ur5e.data.joint_pos_limits[..., 1],
+        )
+
 
     def get_joint_targets_A(self):
         """Residual on planner targets. Planner feedforward is baked into the action."""
@@ -362,9 +373,7 @@ class BoxpushEnv(DirectRLEnv):
         raise ValueError(f"Unknown action_mode: {mode!r}")
 
     def _apply_action(self) -> None:
-        q = self.get_joint_targets()
-        q = q.clamp(self.ur5e.data.joint_pos_limits[...,0], self.ur5e.data.joint_pos_limits[..., 1])
-        self.ur5e.set_joint_position_target(q)
+        self.ur5e.set_joint_position_target(self._cached_joint_target)
 
     def _get_feedforward(self):
         """Planner's intended feedforward: joints_target - joints (proportional to desired PD force)."""
