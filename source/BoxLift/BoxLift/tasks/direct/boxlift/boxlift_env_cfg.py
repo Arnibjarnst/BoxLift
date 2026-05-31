@@ -182,10 +182,102 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     physics_dt = 1.0 / 100.0
     decimation = 2
     episode_length_s = 3.0
-    # - spaces definition
+    # === Observation layout ============================================================
+    # use_reference_obs=True  (reference mode):
+    #   per-step = rel_q(12) + rel_qd(12) + rel_obj(7) + abs_q(12) + abs_qd(12) + abs_obj(7) + contact(2) = 64
+    #   full obs = 64×history + phase(1) + future_box(14×offsets) + prev_actions(12)
+    #
+    # use_reference_obs=False (goal-conditioned / reference-free):
+    #   per-step = abs_q(12) + abs_qd(12) + abs_obj(7) + contact(2) = 33
+    #   full obs = 33×history + future_box(14×offsets) + prev_actions(12)   [no phase]
+    #   future_box offsets serve as goal waypoints; privileged critic still has full ref.
+    #
+    # action_space and observation_space recomputed in __post_init__.
     action_space = 12
-    observation_space = 38
+    observation_space = {"policy": 275, "privileged": 136}  # placeholder; __post_init__ overwrites
     state_space = 0
+
+    # Toggle reference observations. True = current behaviour. False = goal-conditioned:
+    # drops relative joint/obj obs and phase; keeps future box waypoints.
+    use_reference_obs: bool = True
+
+    # History of per-step features (newest-last, flattened into obs).
+    obs_history_steps: int = 3
+    # Phase offsets (env steps) for future reference box pose look-ahead.
+    # In reference-free mode these become goal waypoints (still meaningful at deployment
+    # if the trajectory planner can provide k-step box pose predictions).
+    future_obs_steps: tuple = (1, 2, 3, 4, 5)
+
+    # Force magnitude threshold (N) for the per-arm contact bool. ~0.5–2 N is reasonable
+    # for the UR5e wrist on the cube; tune by inspecting per-arm force-magnitude
+    # histograms in obvious-contact vs free-motion segments.
+    contact_threshold: float = 0.5
+    # Optional DR on the contact bool: shift the bool through a rolling buffer so the
+    # obs sees a value from N env steps ago (models force-estimator latency), and apply
+    # a per-step bit-flip rate (models false positives/negatives). 0/0.0 = clean.
+    contact_obs_delay_steps: int = 0
+    contact_obs_flip_prob: float = 0.0
+
+    # === Simulated tracker for the box pose ==========================================
+    # Both the relative AND absolute box obs are read from a buffer that latches the
+    # clean cube pose only every obs_obj_update_period env steps, and the latched read
+    # is taken from obs_obj_delay_steps ago — models a slow + delayed tracker (e.g. a
+    # 25 Hz vision tracker with ~100 ms latency at 50 Hz policy). Reward path keeps
+    # using clean ground truth via _get_obj_pos / _get_obj_quat / _get_obj_vel.
+    obs_obj_delay_steps: int = 5
+    obs_obj_update_period: int = 2
+    # Per-FRESH-SAMPLE Gaussian noise applied on every "fire" (when the latched value
+    # refreshes). Held readings between fires do NOT re-jitter — same held value goes
+    # into the obs until the next fire. 0 disables. Defaults match boxhinge.
+    obs_obj_pos_noise: float = 0.001     # m, std on position per fire
+    obs_obj_ori_noise: float = 0.001     # rad, axis-angle std on orientation per fire
+    # Per-EPISODE constant bias sampled in _reset_idx. Held for the entire episode
+    # so the policy can't average it out across frames — models systematic calibration
+    # error of the tracker. Applied BEFORE per-fire noise (so bias is the dominant
+    # systematic component, noise is residual detection jitter on top). 0 disables.
+    obs_obj_pos_bias_std: float = 0.005  # m, std on per-episode constant pos offset
+    obs_obj_ori_bias_std: float = 0.005  # rad, std on per-episode constant ori offset
+
+    def __post_init__(self) -> None:
+        # Idempotent: must be safe to call twice (the env's __init__ calls it again
+        # after Hydra CLI overrides land on the cfg).
+        base_pose = 3 + 4                       # obj pos + quat
+        if self.use_reference_obs:
+            per_step = 12 + 12 + base_pose      # rel_q + rel_qd + rel_obj
+            per_step += 12 + 12 + base_pose     # abs_q + abs_qd + abs_obj
+            per_step += 2                       # contact bools
+            phase_dim = 1
+        else:
+            per_step = 12 + 12 + base_pose      # abs_q + abs_qd + abs_obj only
+            per_step += 2                       # contact bools
+            phase_dim = 0                       # no trajectory clock
+        self.per_step_feature_dim = per_step
+
+        future_dim_per_offset = 2 * base_pose   # (rel pos+quat) + (abs pos+quat) per offset
+        actor_dim = (
+            per_step * self.obs_history_steps
+            + phase_dim
+            + future_dim_per_offset * len(self.future_obs_steps)
+            + 12                                         # prev_actions
+        )
+
+        # Privileged-extras layout (concatenated by _get_privileged_obs in this order):
+        #   13  clean obj state           (pos 3 + quat 4 + lin_vel 3 + ang_vel 3)
+        #   28  DR samples                (obj_mass 1 + obj_friction 3 + stiff_L 6 +
+        #                                  stiff_R 6 + damp_L 6 + damp_R 6)
+        #   75  reference state @ phase   (ref_obj_pos 3 + quat 4 + lin_vel 3 + ang_vel 3
+        #                                  + ref_joints_L 6 + R 6 + ref_joint_vels_L 6 + R 6
+        #                                  + ref_joints_target_L 6 + R 6
+        #                                  + planner_pd_err_L 6 + R 6
+        #                                  + ref_EE_pose_L 7 + R 7)
+        #   12  force/contact             (EE force mag L 1 + R 1 + EE force dir L 3 + R 3
+        #                                  + illegal_contact cube 1 + table 1
+        #                                  + flange-forearm dist L 1 + R 1)
+        #    4  eef-box rel scalars       (pos_err_L + quat_err_L + pos_err_R + quat_err_R)
+        #    4  voc / curriculum context  (current_seg kp_pos + kp_rot + alpha + seg_idx)
+        priv_dim = 13 + 28 + 75 + 12 + 4 + 4
+
+        self.observation_space = {"policy": actor_dim, "privileged": priv_dim}
 
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=physics_dt, render_interval=decimation, gravity=(0,0,-9.8))
@@ -233,21 +325,34 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     #          (full spring); at α=1 → mode C (no spring, pure residual on current).
     #          Action has full authority throughout — only the assist decays. Equivalent
     #          to a per-joint virtual controller with kp_vrc = (1-α)·kp, kd_vrc = 0.
-    #   "D"  — q_current + (planner PD error) + action_scale * action  (mode-C + planner
-    #          FF with curriculum α; not implemented in boxlift yet)
-    action_mode = "BC"
+    #   "D"  — q_current + (1-α)·(joints_target[t] - joints[t]) + (α + ε(1-α))·scale·a
+    #          Planner-PD-error feedforward transplanted to the CURRENT actual joint
+    #          position, blended with a residual whose authority is gated by α. At α=0
+    #          → mostly planner PD with a small ε·scale residual floor (≡ mode A
+    #          transplanted to current position, with limited policy authority). At α=1
+    #          → mode C (pure residual from current position, no FF). Difference vs BC:
+    #          BC decays the spring magnitude while keeping full action authority; D
+    #          decays the FF authority AND gates action authority together.
+    action_mode = "A"
 
-    # Curriculum α schedule. Used by mode BC (and mode D when implemented).
-    #   α ramps linearly from 0 to 1 over `alpha_warmup_steps` env steps; 0 disables the
-    #   curriculum (α=1 always — collapses BC to mode C).
-    #   `common_step_counter` increments once per env step, so for a 5000-iter run with
-    #   num_steps_per_env=24 you have ~120k env steps total — pick warmup ~50k–80k so the
-    #   spring is mostly gone by the end while leaving time for a fully-decayed phase.
-    alpha_warmup_steps: int = 24 * 1000
-    # Optional fixed-α override (≥ 0). Bypasses the schedule — used at eval to pin α to
-    # the value the policy was trained at (otherwise common_step_counter resets to 0
-    # during eval and the spring would re-appear).
+    # Curriculum α schedule. Used by modes BC and D.
+    # force_alpha ∈ [0,1]: pin α to a fixed value (eval override; bypasses all schedules).
     force_alpha: float = -1
+    # Mode D only: residual authority floor at α=0. The action gain is α + ε·(1-α).
+    action_alpha_floor: float = 1.0
+    # alpha_warmup_steps > 0: linear ramp (fallback when alpha_curriculum_enabled=False).
+    alpha_warmup_steps: int = 0
+
+    # Reward-based BC alpha curriculum (sequential: only activates after VOC reaches 0).
+    # (1-α) decays by phi each time mean task reward >= threshold; snaps to α=1 when
+    # (1-α) < alpha_min_support. Mirrors VOC gain decay exactly.
+    alpha_curriculum_enabled: bool = True
+    alpha_decay_phi: float = 0.95          # (1-alpha) *= phi per passing check
+    alpha_min_support: float = 0.01        # snap alpha=1 when (1-alpha) < this
+    alpha_threshold_task: float = 0.7      # mean task reward needed to trigger increase
+    alpha_reward_window_size: int = 100    # ring buffer capacity (completed episodes)
+    alpha_decay_check_interval: int = 240  # env steps between checks
+    alpha_decay_warmup_steps: int = 0      # env steps to wait before any increase
 
     # Action scale (scalar or per-joint list of length 12; broadcast against actions)
     action_scale: float | list = 0.1
@@ -265,10 +370,10 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
 
     # Box reset noise: xy-plane for translation / linear vel; yaw-only orientation noise
     # so the box stays flat; z-axis-only angular vel for consistency with the yaw noise.
-    reset_obj_pos_xy_noise = 0.02        # m, std on box x,y position
-    reset_obj_lin_vel_xy_noise = 0.05    # m/s, std on box linear x,y velocity
-    reset_obj_ori_noise = 0.1            # rad, axis-angle std for small yaw perturbation
-    reset_obj_ang_vel_noise = 0.1        # rad/s, std on box angular velocity (z axis)
+    reset_obj_pos_xy_noise = 0.01        # m, std on box x,y position
+    reset_obj_lin_vel_xy_noise = 0.0     # m/s, std on box linear x,y velocity
+    reset_obj_ori_noise = 0.03           # rad, axis-angle std for small yaw perturbation
+    reset_obj_ang_vel_noise = 0.0        # rad/s, std on box angular velocity (z axis)
 
     # Probability that a reset overrides random RSI and starts the episode at phase=0
     # instead. Pure RSI samples phase=0 with prob ~1/T (often <1%) — far too low for
@@ -335,28 +440,21 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     eef_box_gate_obj_vel_eps = 1e-3
     eef_box_gate_dilation_steps = 1e7
 
-    # Regularization reward parameters. HALVED from boxhinge's per-joint values because
-    # boxlift sums these penalties over 12 joints / 2 arms vs boxhinge's 6 / 1; without
-    # halving, the per-joint pressure is 2× what boxhinge tuned for, smothering action
-    # freedom and trapping the policy in a small-residual basin around the trajectory.
-    # (joint_acc, torque, action_rate, action_norm, joint_limit all sum over the joint
-    # axis; the boxhinge value × 0.5 keeps per-joint pressure identical.)
-    w_joint_acc = 1e-5              # boxhinge 2e-4 / 2
+    # Regularization reward parameters.
+    w_joint_acc = 1e-5
     tol_joint_acc = 0.0
 
-    w_joint_torque = 5e-5           # boxhinge 1e-3 / 2
+    w_joint_torque = 5e-5
     tol_joint_torque = 0.0
 
-    # Rate penalty: at 0 the policy outputs wildly different residuals on consecutive
-    # steps, jittering faster than kp can track. Boxhinge picked 0.5 to keep commands
-    # coherent without preventing time-varying residuals for FF compensation. Halved here.
-    w_action_rate = 2.5e-2          # boxhinge 5e-1 / 2
+    # Rate penalty: primary anti-jitter term. Needs to be high enough that consecutive
+    # step action differences are penalised, but low enough that the task reward (~1.0
+    # scale) still dominates.  2.5e-1 collapsed training (reg>>reward); 5e-2 was too
+    # weak to damp deployment oscillation. 1e-1 is the working compromise.
+    w_action_rate = 1e-1
     tol_action_rate = 0.0
 
-    # Residual-magnitude penalty (separate from rate): biases the policy toward zero
-    # residual when the nominal plan is already good. Important during VOC: the policy
-    # should output ~0 residual at the start so VOC's wrench is the only "actor".
-    w_action_norm = 1e-3          # boxhinge 5e-3 / 2
+    w_action_norm = 1e-3
     tol_action_norm = 0.0
 
     w_joint_limit = 5e2             # boxhinge 1e3 / 2 (sums over 12 joints × 2 arms)
@@ -371,7 +469,7 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     # number of brush-contacts firing per step is 2–3× boxhinge's single-arm regime.
     # At 50 the penalty hits 100–140 (=2–2.8 N total), drowning the task signal entirely
     # (w_task·R_task tops out near 0.9 while w_reg·rew_illegal_contact is ≥ 100).
-    w_illegal_contact = 1.0
+    w_illegal_contact = 0.1
     # Reject sensor reports below 1 N — filters out persistent micro-contact / sensor
     # noise that isn't a real safety violation. Real impacts (5+ N) still register.
     min_contact_force = 1
@@ -456,12 +554,12 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     # within the sampled-data stability boundary.
     voc_kp_pos: float = 1000.0    # N/m, initial translational stiffness
     voc_kp_rot: float = 100.0     # Nm/rad, initial rotational stiffness
-    voc_kp_min: float = 10.0      # absolute floor; below this kp/kv set to zero
+    voc_kp_min: float = 0.1       # absolute floor; below this kp/kv set to zero
     # Critical-damping multipliers: kv = scale · sqrt(kp · effective_inertia).
     voc_kv_pos_scale: float = 2.0
     voc_kv_rot_scale: float = 2.0
-    voc_decay_phi_p: float = 0.99  # multiplicative decay factor on kp per decay event
-    voc_decay_phi_v: float = 0.99  # multiplicative decay factor on kv per decay event
+    voc_decay_phi_p: float = 0.98  # multiplicative decay factor on kp per decay event
+    voc_decay_phi_v: float = 0.98  # multiplicative decay factor on kv per decay event
     # How often (in env steps) to check the decay condition. Decay fires only when ALL
     # tracked reward means exceed their thresholds; rate-limited so decay can fire at most
     # every ~4 iters (vs every iter), giving the policy time to adapt to each kp level.
@@ -472,10 +570,10 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     # Per-category normalized-reward thresholds (in [0,1]). Decay only triggers once the
     # trailing mean of every category exceeds its threshold — ensures the policy is
     # genuinely tracking well before VOC weakens further.
-    voc_threshold_task: float = 0.6     # task reward (obj_pos + obj_quat), max 1.0
+    voc_threshold_task: float = 0.7     # task reward (obj_pos + obj_quat), max 1.0
     # L+R kernels are now averaged in _get_rewards (rew_EE_* and rew_eef_box_rel_*),
     # so rew_track_unweighted_per_step is back in [0, 1.0] — same scale as boxhinge.
-    voc_threshold_track: float = 0.5    # tracking reward (mean of L+R kernels, max 1.0)
+    voc_threshold_track: float = 0.0    # tracking reward (mean of L+R kernels, max 1.0)
     # Warmup period (in env steps) before any decay can fire. Without this gate, decay
     # would start firing while VOC is doing all the work and the policy hasn't learned
     # to compensate; 0 means warmup-off (decay can fire as soon as the buffer fills).

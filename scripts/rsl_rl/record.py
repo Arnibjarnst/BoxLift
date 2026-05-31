@@ -40,6 +40,15 @@ parser.add_argument("--num_envs", type=int, default=1,
                          "so downstream code can ignore the post-reset garbage. Per-env arrays in "
                          "the npz are (T, N, ...), even for N=1, so the schema is uniform.")
 parser.add_argument("--trajectory_path", type=str, default=None, help="Override trajectory path (default: read from run's env.yaml)")
+parser.add_argument("--rollout_path", type=str, default=None,
+                    help="Full output path for the rollout npz. Default: <ckpt_log_dir>/rollout/output.npz. "
+                         "Used by scripts/record_dataset.py to direct per-trajectory outputs into "
+                         "separate files within one shared folder.")
+parser.add_argument("--voc_kp_pos", type=float, default=None,
+                    help="Record-time override: set a single VOC kp_pos and derive kp_rot, kv_pos, kv_rot "
+                         "from the env's init formulas (proportional + critical damping). Lookup the value "
+                         "at the iter of interest from W&B (VOC/kp_pos_mean) and pass it here to recreate "
+                         "that training-time VOC strength. Ignored if --keep_voc is set. Pass 0 to disable.")
 parser.add_argument("--keep_voc", action="store_true", default=False,
                     help="Record with the VOC gains saved at the end of training (loaded from <log_dir>/voc_state.npz). "
                          "If unset (default), VOC is forcibly disabled so the rollout matches deployment (kp=kv=0).")
@@ -52,6 +61,29 @@ args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
+
+
+def _hydra_overridden_env_fields(hydra_args: list[str]) -> set[str]:
+    """Extract the set of top-level `env.<X>` keys the user set on the command line.
+    Used to gate the saved-cfg restoration block in main() — fields the user explicitly
+    overrode via Hydra must NOT be clobbered back to the trained-run's saved value.
+    Handles +env.X=... (add) and ~env.X (delete) prefixes. Nested keys like
+    `env.scene.num_envs` collapse to the top-level (`scene`) — fine for our use since
+    the restoration block only touches top-level env fields."""
+    out = set()
+    for arg in hydra_args:
+        a = arg.lstrip("+~")
+        if not a.startswith("env."):
+            continue
+        rest = a[len("env."):]
+        key = rest.split("=", 1)[0]
+        out.add(key.split(".")[0])
+    return out
+
+
+_env_overrides = _hydra_overridden_env_fields(hydra_args)
+if _env_overrides:
+    print(f"[INFO] Hydra env overrides detected, will NOT restore from saved env.yaml: {sorted(_env_overrides)}")
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -136,30 +168,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     with open(os.path.join(log_dir, "params", "env.yaml"), "r") as f:
         saved_env_cfg = yaml.unsafe_load(f)
 
+    # User-explicit CLI flag for trajectory_path wins over saved value (legacy non-Hydra arg).
     if args_cli.trajectory_path is not None:
         env_cfg.trajectory_path = args_cli.trajectory_path
-    else:
+    elif "trajectory_path" not in _env_overrides:
         env_cfg.trajectory_path = saved_env_cfg["trajectory_path"]
     print(f"[INFO] Using trajectory: {env_cfg.trajectory_path}")
 
+    # All restorations below: only apply if the user didn't already set the field via a
+    # Hydra `env.<field>=...` override. Otherwise we'd silently clobber the override.
+    if "dataset_path" in saved_env_cfg and "dataset_path" not in _env_overrides:
+        env_cfg.dataset_path = saved_env_cfg["dataset_path"]
+    if getattr(env_cfg, "dataset_path", ""):
+        print(f"[INFO] Using dataset: {env_cfg.dataset_path}")
+
     # Restore fields that affect obs/action layout from the trained run
-    if "obs_history_steps" in saved_env_cfg:
+    if "obs_history_steps" in saved_env_cfg and "obs_history_steps" not in _env_overrides:
         env_cfg.obs_history_steps = int(saved_env_cfg["obs_history_steps"])
-    if "action_mode" in saved_env_cfg:
+    if "action_mode" in saved_env_cfg and "action_mode" not in _env_overrides:
         env_cfg.action_mode = saved_env_cfg["action_mode"]
-    if "observation_space" in saved_env_cfg:
-        env_cfg.observation_space = int(saved_env_cfg["observation_space"])
+    if "observation_space" in saved_env_cfg and "observation_space" not in _env_overrides:
+        obs_space = saved_env_cfg["observation_space"]
+        env_cfg.observation_space = obs_space if isinstance(obs_space, dict) else int(obs_space)
     # Phase slowdown determines action_space (7 if enabled, 6 otherwise) — must be set
     # before env creation so __post_init__ allocates the correct action head shape, or
     # checkpoint loading will fail with a size mismatch on actor.6.weight/bias.
-    if "enable_phase_slowdown" in saved_env_cfg:
+    if "enable_phase_slowdown" in saved_env_cfg and "enable_phase_slowdown" not in _env_overrides:
         env_cfg.enable_phase_slowdown = bool(saved_env_cfg["enable_phase_slowdown"])
     # Phase-mapping variants (only meaningful if enable_phase_slowdown is True). These
     # control how action[6] is interpreted; mismatch between train and eval would make
     # the policy's commanded dphase wrong even if shapes match.
     for _phase_field in ("phase_mapping", "dphase_max", "dphase_min",
                          "task_scale_by_dphase", "track_scale_by_dphase"):
-        if _phase_field in saved_env_cfg and hasattr(env_cfg, _phase_field):
+        if (_phase_field in saved_env_cfg and hasattr(env_cfg, _phase_field)
+                and _phase_field not in _env_overrides):
             setattr(env_cfg, _phase_field, saved_env_cfg[_phase_field])
     print(f"[INFO] obs_history_steps={getattr(env_cfg, 'obs_history_steps', None)}, "
           f"action_mode={getattr(env_cfg, 'action_mode', None)}, "
@@ -214,12 +256,23 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print(f"[WARN] --keep_voc requested but {_voc_state_path} not found; "
                       f"VOC will use the cfg's initial values (kp_pos={_direct_env.voc_kp_pos}). "
                       f"This is likely wrong — re-train with VOC state saving, or omit --keep_voc.")
+        elif args_cli.voc_kp_pos is not None:
+            # User-specified kp_pos. Env derives kp_rot / kv_pos / kv_rot via the
+            # init-time formulas (proportional + critical damping). Single-scalar
+            # approximation — per-segment differences during training are flattened.
+            if hasattr(_direct_env, "set_voc_strength"):
+                _direct_env.set_voc_strength(float(args_cli.voc_kp_pos))
+            else:
+                _direct_env.voc_kp_pos = float(args_cli.voc_kp_pos)
+                print(f"[WARN] env has no set_voc_strength method; only kp_pos overridden "
+                      f"(kp_rot / kv_* unchanged). Update the env to derive them properly.")
         else:
             _direct_env.voc_kp_pos = 0.0
             _direct_env.voc_kp_rot = 0.0
             _direct_env.voc_kv_pos = 0.0
             _direct_env.voc_kv_rot = 0.0
-            print("[INFO] VOC disabled for record (kp=kv=0). Use --keep_voc to load training-end gains.")
+            print("[INFO] VOC disabled for record (kp=kv=0). Use --keep_voc to load training-end "
+                  "gains, or --voc_kp_pos <value> to recreate a specific iter's strength.")
 
     # wrap for video recording
     if args_cli.video:
@@ -380,6 +433,30 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
 
     # reset environment
     obs = env.get_observations()
+
+    # === Dataset-mode capture (boxtracker / any env with a per-env segment pool) ======
+    # Single-trajectory envs (boxhinge / boxlift) share one trajectory across all envs
+    # and the per-env reference is implicit. Dataset-mode envs assign a (potentially
+    # different) trajectory to each env on reset; the active per-env reference lives at
+    # `env.unwrapped.obj_poses` with shape (N, T_max, 7). Capture it RIGHT NOW (after
+    # the initial reset, before any step has fired) so rollout_summary can do per-env
+    # reference lookups without needing to re-load the dataset.
+    _u = env.unwrapped
+    _dataset_kwargs = {}
+    if hasattr(_u, "obj_poses") and _u.obj_poses.dim() == 3:
+        # (N, T_max, 7) — store as float32 to keep the npz small.
+        _dataset_kwargs["ref_obj_poses"] = _u.obj_poses.detach().cpu().numpy().astype(np.float32)
+        if hasattr(_u, "cur_seg_idx"):
+            _dataset_kwargs["env_traj_idx"] = _u.cur_seg_idx.detach().cpu().numpy().astype(np.int64)
+        if hasattr(_u, "segment_length"):
+            # Per-env length of the active (variable-length) segment. Lets rollout_summary
+            # pick the right "goal" frame (= last valid frame) instead of relying on the
+            # right-padded sentinel — padding usually replicates the last valid frame so
+            # `ref_obj_poses[env, -1]` would also work, but explicit lengths are safer.
+            _dataset_kwargs["env_traj_length"] = _u.segment_length.detach().cpu().numpy().astype(np.int64)
+        print(f"[INFO] dataset-mode capture: ref_obj_poses shape {_dataset_kwargs['ref_obj_poses'].shape}, "
+              f"unique env_traj_idx={len(np.unique(_dataset_kwargs.get('env_traj_idx', np.zeros(1))))}")
+
     timestep = 0
     # simulate environment
     while simulation_app.is_running():
@@ -474,7 +551,7 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         if args_cli.real_time and sleep_time > 0:
             time.sleep(sleep_time)
 
-    rollout_path = os.path.join(log_dir, "rollout", "output.npz")
+    rollout_path = args_cli.rollout_path or os.path.join(log_dir, "rollout", "output.npz")
     os.makedirs(os.path.dirname(rollout_path), exist_ok=True)
 
     # Per-step extras (env-mean): collect every metric key seen, stack into (T,) arrays.
@@ -566,12 +643,15 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         # Metadata.
         action_scale=np.asarray(getattr(env_cfg, "action_scale", 0.0)),
         action_mode=np.asarray(str(getattr(env_cfg, "action_mode", ""))),
-        trajectory_path=np.asarray(str(env_cfg.trajectory_path)),
+        trajectory_path=np.asarray(str(getattr(env_cfg, "trajectory_path", ""))),
+        # Dataset-mode metadata (empty string when env runs a single trajectory).
+        dataset_path=np.asarray(str(getattr(env_cfg, "dataset_path", ""))),
         obs_history_steps=np.int64(getattr(env_cfg, "obs_history_steps", 1)),
         dual_arm=np.bool_(dual_arm),
         **arm_pose_kwargs,
         **extras_arrays,
         **extras_per_env_arrays,
+        **_dataset_kwargs,
     )
     print(f"[INFO] Rollout saved to: {rollout_path}  "
           f"(T={len(rollout['steps'])}, N={num_envs}, "

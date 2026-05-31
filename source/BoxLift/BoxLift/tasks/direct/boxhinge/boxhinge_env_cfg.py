@@ -141,6 +141,8 @@ class EventCfg:
 class BoxhingeEnvCfg(DirectRLEnvCfg):
     # Trajectory file path
     trajectory_path = ""
+
+    emit_per_env_extras: bool = False
     # env
     # physics_dt * decimations needs to match dt from planner/IK
     physics_dt = 1.0 / 100.0
@@ -188,7 +190,7 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     #   spikes) and false negatives (transient drops below threshold).
     contact_obs_delay_steps = 0
     contact_obs_flip_prob = 0.0
-    observation_space = 13  # recomputed in __post_init__
+    observation_space = {"policy": 13, "privileged": 85}  # recomputed in __post_init__
     state_space = 0
 
     # True: action[6] sets per-step advance dphase ∈ [dphase_min, 1]; ref interpolated at
@@ -261,11 +263,12 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
         # Idempotent: always reset action_space/observation_space to base before recomputing.
         # Must be safe to call more than once (e.g. after hydra overrides).
         self.action_space = 7 if self.enable_phase_slowdown else 6
-        self.observation_space = self.per_step_feature_dim * self.obs_history_steps + 1
+        actor_dim = self.per_step_feature_dim * self.obs_history_steps + 1
         future_dim = 14 if self.include_absolute_obs else 7
-        self.observation_space += future_dim * len(self.future_obs_steps)
+        actor_dim += future_dim * len(self.future_obs_steps)
         if self.include_prev_actions:
-            self.observation_space += 6
+            actor_dim += 6
+        self.observation_space = {"policy": actor_dim, "privileged": 85}
 
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=physics_dt, render_interval=decimation, gravity=(0,0,-9.8))
@@ -660,8 +663,8 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # majority dominate the mean). 0.65 is calibrated so a small completion-rate dip
     # (≈95%) brings the mean below threshold and pauses decay, giving the policy time
     # to adapt to the kp level before VOC weakens further.
-    voc_threshold_task: float = 0.6     # task reward (obj_pos · obj_quat or sum form)
-    voc_threshold_track: float = 0.5    # tracking reward (eef_box_rel + eef_pos + ...)
+    voc_threshold_task: float = 0.7     # task reward (obj_pos · obj_quat or sum form)
+    voc_threshold_track: float = 0.0    # tracking reward (eef_box_rel + eef_pos + ...)
     # Warmup period (in env steps via common_step_counter) before any decay can fire.
     # common_step_counter increments by 1 per env step (not per env*step), so this
     # divides by num_steps_per_env=24 to get "iterations": 5000 / 24 ≈ 208 iters.

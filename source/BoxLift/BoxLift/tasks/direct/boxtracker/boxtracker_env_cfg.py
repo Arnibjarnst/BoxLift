@@ -145,6 +145,12 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
     # RL_data generator. Each episode loads a random segment and tracks it from the
     # beginning. Variable-length segments → per-env segment_length tensor for timeout.
     dataset_path = ""
+    # Opt-in per-env extras emission. When True, _get_rewards also stashes each per-env
+    # reward / error tensor under self.extras["log_per_env"] alongside the env-mean
+    # entries in self.extras["log"]. record.py flips this to True automatically so
+    # rollout_summary can do per-env success classification. Off by default during
+    # training to keep the runner's extras payload identical to pre-refactor.
+    emit_per_env_extras: bool = False
     # env
     # physics_dt * decimations needs to match dt from planner/IK
     physics_dt = 1.0 / 100.0
@@ -198,7 +204,7 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
     # Helps the policy with relative tracking since the box frame is the natural one
     # for contact-rich manipulation. The reward path's EE-box-relative term is unchanged.
     include_ee_box_obs = False
-    observation_space = 13  # recomputed in __post_init__
+    observation_space = {"policy": 13, "privileged": 85}  # recomputed in __post_init__
     state_space = 0
 
     # True: action[6] sets per-step advance dphase ∈ [dphase_min, 1]; ref interpolated at
@@ -279,11 +285,12 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
         # Boxtracker: phase scalar is intentionally dropped from the observation (the
         # policy must be phase-agnostic so it generalizes across arbitrary segments),
         # so there is no "+ 1" here unlike boxhinge.
-        self.observation_space = self.per_step_feature_dim * self.obs_history_steps
+        actor_dim = self.per_step_feature_dim * self.obs_history_steps
         future_dim = 14 if self.include_absolute_obs else 7
-        self.observation_space += future_dim * len(self.future_obs_steps)
+        actor_dim += future_dim * len(self.future_obs_steps)
         if self.include_prev_actions:
-            self.observation_space += 6
+            actor_dim += 6
+        self.observation_space = {"policy": actor_dim, "privileged": 85}
 
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=physics_dt, render_interval=decimation, gravity=(0,0,-9.8))

@@ -15,6 +15,13 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 100
     experiment_name = "boxlift"
     logger = "wandb"
+    # Asymmetric actor / critic obs. The env returns {"policy": <actor_obs>,
+    # "privileged": <extras>}. Map both algorithm sets here: actor consumes "policy"
+    # only; critic consumes the concat of "policy" + "privileged" → critic_dim =
+    # actor_dim + 136 priv extras. See _get_privileged_obs in boxlift_env.py for the
+    # contents of the privileged block (clean obj state, DR samples, reference state,
+    # contact forces, VOC kp, etc.).
+    obs_groups = {"policy": ["policy"], "critic": ["policy", "privileged"]}
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_obs_normalization=True,

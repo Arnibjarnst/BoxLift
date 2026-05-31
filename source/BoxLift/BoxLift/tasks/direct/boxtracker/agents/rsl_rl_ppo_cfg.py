@@ -15,6 +15,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 100
     experiment_name = "boxhinge"
     logger = "wandb"
+    obs_groups = {"policy": ["policy"], "critic": ["policy", "privileged"]}
     policy = RslRlPpoActorCriticCfg(
         # Lowered from 1.0 (default) to give cleaner gradient signal during VOC training.
         # With std=1.0 and small action_scale, exploration is dominated by per-step noise

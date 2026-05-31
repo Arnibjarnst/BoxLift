@@ -127,6 +127,8 @@ class BoxmagicEnv(DirectRLEnv):
         # Regularization stuff
         self.prev_actions = torch.zeros((self.num_envs, 6), device=self.device)
         self.prev_joint_vel = torch.zeros((self.num_envs, 6), device=self.device)
+        self._dr_obj_mass = torch.zeros((self.num_envs, 1), device=self.device)
+        self._dr_obj_friction = torch.zeros((self.num_envs, 3), device=self.device)
 
         # Observation history buffer: (num_envs, history_steps, per_step_feature_dim).
         # per_step_feature_dim = 12 (rel_q + rel_qd) [+ 26 (obj_pos_rel/abs + obj_quat_rel/abs) if include_object_obs]
@@ -572,8 +574,62 @@ class BoxmagicEnv(DirectRLEnv):
             obs_parts.append(self.prev_actions)
 
         obs = torch.cat(obs_parts, dim=-1)
-        observations = {"policy": obs}
-        return observations
+        return {"policy": obs, "privileged": self._get_privileged_obs()}
+
+    def _get_privileged_obs(self) -> torch.Tensor:
+        """85-dim privileged critic obs. Layout:
+          13  clean obj state   (pos 3 + quat 4 + lin_vel 3 + ang_vel 3)
+          16  DR samples        (mass 1 + friction 3 + stiff 6 + damp 6)
+          44  reference @ phase (ref_obj 13 + zeros for joints/jvel/jtgt/pd 24 + ref_EE 7)
+           6  force/contact     (EE force mag 1 + dir 3 + illegal 1 + flange-forearm 1)
+           2  eef-box rel       (pos_err 1 + quat_err 1)
+           4  VOC/curriculum    (kp_pos 1 + kp_rot 1 + alpha 1 + phase_norm 1)
+        """
+        T = self.obj_poses.shape[0]
+
+        # (1) clean obj state
+        clean_pos = self.object.data.root_pos_w.clone() - self.scene.env_origins
+        clean_quat = self.object.data.root_quat_w.clone()
+        clean_vel = self.object.data.root_vel_w.clone()
+        obj_block = torch.cat([clean_pos, clean_quat, clean_vel], dim=-1)  # (N, 13)
+
+        # (2) DR samples
+        stiff = self.ur5e.data.joint_stiffness   # (N, 6)
+        damp  = self.ur5e.data.joint_damping     # (N, 6)
+        dr_block = torch.cat([self._dr_obj_mass, self._dr_obj_friction, stiff, damp], dim=-1)  # (N, 16)
+
+        # (3) reference state at phase — joints/jvel/jtgt/planner_pd unavailable, use zeros
+        ref_obj_pos  = self._interp(self.obj_poses[:, :3])
+        ref_obj_quat = self._nlerp(self.obj_poses[:, 3:])
+        ref_obj_vel  = self._interp(self.obj_vel)
+        joint_zeros = torch.zeros((self.num_envs, 24), device=self.device)  # 4×6 joint fields
+        ref_EE = torch.cat([self._interp(self.EE_poses[:, :3]), self._nlerp(self.EE_poses[:, 3:])], dim=-1)
+        ref_block = torch.cat([ref_obj_pos, ref_obj_quat, ref_obj_vel,
+                                joint_zeros, ref_EE], dim=-1)  # (N, 44)
+
+        # (4) force/contact
+        f_mat = self.ee_contact_sensor.data.force_matrix_w.sum(dim=(1, 2))  # (N, 3)
+        ee_f_mag = f_mat.norm(dim=-1, keepdim=True)
+        ee_f_dir = f_mat / ee_f_mag.clamp(min=1e-6)
+        illegal = torch.zeros((self.num_envs, 1), device=self.device)
+        for sensor in self.illegal_contact_sensors.values():
+            illegal[:, 0] += sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1).flatten()
+        fl = self._get_flange_to_forearm_distance(self.ur5e).unsqueeze(-1)
+        force_block = torch.cat([ee_f_mag, ee_f_dir, illegal, fl], dim=-1)  # (N, 6)
+
+        # (5) eef-box rel — boxmagic _compute_eef_box_rel_errors returns pos_err only
+        pos_err = self._compute_eef_box_rel_errors()
+        quat_err = torch.zeros_like(pos_err)
+        eef_block = torch.stack([pos_err, quat_err], dim=-1)                # (N, 2)
+
+        # (6) VOC/curriculum
+        kp_pos_t = torch.full((self.num_envs, 1), self.voc_kp_pos, device=self.device)
+        kp_rot_t = torch.full((self.num_envs, 1), self.voc_kp_rot, device=self.device)
+        alpha_t  = torch.full((self.num_envs, 1), self._curriculum_alpha(), device=self.device)
+        phase_norm = (self.phase / max(T - 1, 1)).unsqueeze(-1)
+        voc_block = torch.cat([kp_pos_t, kp_rot_t, alpha_t, phase_norm], dim=-1)  # (N, 4)
+
+        return torch.cat([obj_block, dr_block, ref_block, force_block, eef_block, voc_block], dim=-1)  # (N, 85)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # Trajectory completion. episode_length_s is sized in _setup_scene so the wall-clock
@@ -746,6 +802,15 @@ class BoxmagicEnv(DirectRLEnv):
         self._err_task_prev[env_ids] = 0.0
         self._err_track_prev[env_ids] = 0.0
 
+        try:
+            masses = self.object.root_physx_view.get_masses().to(self.device)
+            self._dr_obj_mass[env_ids] = masses[env_ids]
+            mat = self.object.root_physx_view.get_material_properties().to(self.device)
+            self._dr_obj_friction[env_ids] = mat[env_ids, 0, :]
+        except Exception as e:
+            if not getattr(self, "_dr_readback_warned", False):
+                print(f"[boxmagic] _reset_idx: DR cache readback failed: {e!r}.")
+                self._dr_readback_warned = True
 
     def _reward_track(self, error, sigma, tolerance=0.0):
         # sigma can be a scalar or an iterable of scalars. With multiple sigmas the kernels

@@ -4,3 +4,5 @@
 # SPDX-License-Identifier: BSD-3-Clause
 
 import gymnasium as gym  # noqa: F401
+
+from . import boxliftpool  # noqa: F401

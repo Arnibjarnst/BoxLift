@@ -15,6 +15,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     save_interval = 100
     experiment_name = "boxpush"
     logger = "wandb"
+    obs_groups = {"policy": ["policy"], "critic": ["policy", "privileged"]}
     policy = RslRlPpoActorCriticCfg(
         init_noise_std=1.0,
         actor_obs_normalization=True,

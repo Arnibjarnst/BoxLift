@@ -26,6 +26,12 @@ class BoxliftEnv(DirectRLEnv):
     cfg: BoxliftEnvCfg
 
     def __init__(self, cfg: BoxliftEnvCfg, render_mode: str | None = None, **kwargs):
+        # Re-run __post_init__ to pick up fields set by Hydra CLI overrides after the
+        # dataclass was originally constructed (e.g. obs_history_steps, future_obs_steps
+        # — all of which feed into observation_space). DirectRLEnv reads
+        # cfg.observation_space in super().__init__ to allocate buffers, so this must
+        # run first.
+        cfg.__post_init__()
         super().__init__(cfg, render_mode, **kwargs)
 
         # With the ur5e.usd asset (no separate sphere attachment) the EE *is* wrist_3_link
@@ -101,6 +107,63 @@ class BoxliftEnv(DirectRLEnv):
         # Regularization stuff
         self.prev_actions = torch.zeros((self.num_envs, 12), device=self.device)
         self.prev_joint_vel = torch.zeros((self.num_envs, 12), device=self.device)
+
+        # Per-arm thresholded contact-bool delay buffer (newest-last). Shape
+        # (num_envs, delay+1, 2): last dim is [left, right]. Push current bool to [:, -1],
+        # read [:, 0] for the delayed value. delay_steps=0 → buffer length 1, no delay.
+        self.ee_contact_delay_buf = torch.zeros(
+            (self.num_envs, self.cfg.contact_obs_delay_steps + 1, 2),
+            device=self.device,
+        )
+
+        # Per-step feature history (newest-last, flattened into obs). Filled in
+        # _get_observations; zeroed in _reset_idx so a freshly-reset env's earliest
+        # history slots don't leak the previous episode.
+        self.obs_history = torch.zeros(
+            (self.num_envs, self.cfg.obs_history_steps, self.cfg.per_step_feature_dim),
+            device=self.device,
+        )
+
+        # === Simulated cube tracker (delay + sub-rate update) ============================
+        # obj_pose_delay_buf  : ring of clean abs cube poses, newest-last. [:, 0] holds the
+        #                       pose from obs_obj_delay_steps env steps ago.
+        # obj_phase_delay_buf : matching episode_length_buf values so we can evaluate the
+        #                       reference at the past phase (temporally consistent rel obs).
+        # obj_obs_counter     : ticks per env; when it reaches obs_obj_update_period the
+        #                       env "fires" — latches a fresh delayed sample into
+        #                       obj_obs_last_pose / obj_obs_last_rel and resets the counter.
+        # obj_obs_last_*      : the held (sub-rate) reading the policy actually sees on
+        #                       every step (abs + rel views, mutually consistent).
+        self.obj_pose_delay_buf = torch.zeros(
+            (self.num_envs, self.cfg.obs_obj_delay_steps + 1, 7),
+            device=self.device,
+        )
+        self.obj_phase_delay_buf = torch.zeros(
+            (self.num_envs, self.cfg.obs_obj_delay_steps + 1),
+            device=self.device,
+        )
+        self.obj_obs_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self.obj_obs_last_pose = torch.zeros(self.num_envs, 7, device=self.device)
+        # Identity quat as the safe initial held reading (overwritten on first fire).
+        self.obj_obs_last_pose[:, 3] = 1.0
+        self.obj_obs_last_rel = torch.zeros(self.num_envs, 7, device=self.device)
+        self.obj_obs_last_rel[:, 3] = 1.0
+        # Per-episode constant tracker bias (resampled in _reset_idx). Applied in the
+        # fire branch before per-fire noise. Identity quat as the safe initial value
+        # so an env that hasn't been reset yet doesn't get a corrupting bias.
+        self.obj_obs_bias_pos = torch.zeros(self.num_envs, 3, device=self.device)
+        self.obj_obs_bias_ori_quat = torch.zeros(self.num_envs, 4, device=self.device)
+        self.obj_obs_bias_ori_quat[:, 0] = 1.0
+
+        # === Privileged DR-sample cache (per-env) ====================================
+        # DR events fire during super()._reset_idx(); their effect is per-env-constant
+        # within an episode. Read the per-env values into GPU tensors at reset and read
+        # back each step from _get_privileged_obs (no per-step PhysX view calls).
+        # obj_friction is (static, dynamic, restitution); joint stiff/damp are read live
+        # off self.ur5e_l.data / self.ur5e_r.data (already GPU tensors that update when
+        # DR fires), so they don't need a separate cache here.
+        self._dr_obj_mass = torch.zeros((self.num_envs, 1), device=self.device)
+        self._dr_obj_friction = torch.zeros((self.num_envs, 3), device=self.device)
 
         # === Virtual Object Controller (VOC) state ===
         # Per-segment gains: each segment of the trajectory has its OWN kp/kv that
@@ -201,6 +264,17 @@ class BoxliftEnv(DirectRLEnv):
         self._voc_buf_track_seg = torch.full((N_s, W), float("nan"), device=self.device)
         self._voc_buf_idx_seg   = torch.zeros(N_s, dtype=torch.long, device=self.device)
         self._voc_decay_step_counter = 0
+
+        # === BC alpha curriculum state ===
+        # Sequential: only activates once all VOC gains reach 0. (1-alpha) decays by
+        # alpha_decay_phi each time the global task-reward mean clears alpha_threshold_task.
+        self._alpha_value: float = 0.0
+        W_a = self.cfg.alpha_reward_window_size
+        self._alpha_buf_task   = torch.full((W_a,), float("nan"), device=self.device)
+        self._alpha_buf_idx:  int = 0
+        self._alpha_ep_rew_task = torch.zeros(self.num_envs, device=self.device)
+        self._alpha_ep_steps    = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
+        self._alpha_check_counter: int = 0
 
         # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
@@ -306,6 +380,28 @@ class BoxliftEnv(DirectRLEnv):
         q_r = q_curr[:, 6:] + self._scaled_action()[:, 6:]
         return q_l, q_r
 
+    def get_joint_targets_D(self):
+        """Planner PD-error feedforward (transplanted to current joints) + scaled residual,
+        blended via curriculum α ∈ [0, 1]:
+            q_target = q_curr + (1-α)·(joints_target[t] - joints[t]) + (α + ε(1-α))·scale·a
+        At α=0 the command is mostly planner-intended PD feedforward (applied from the
+        ACTUAL current position, not the planner's nominal one — so deviations get
+        corrected) with a small ε action floor that keeps the residual gradient alive.
+        At α=1 it collapses to mode C (pure residual from current position).
+        """
+        alpha = self._curriculum_alpha()
+        eps = float(self.cfg.action_alpha_floor)
+        action_gain = alpha + eps * (1.0 - alpha)
+        idx = self.episode_length_buf
+        # Planner's intended PD error at the current trajectory step, per arm.
+        planner_pd_l = self.joints_target_l[idx] - self.joints_l[idx]
+        planner_pd_r = self.joints_target_r[idx] - self.joints_r[idx]
+        q_curr = self._get_joint_pos()
+        scaled = self._scaled_action()
+        q_l = q_curr[:, :6] + (1.0 - alpha) * planner_pd_l + action_gain * scaled[:, :6]
+        q_r = q_curr[:, 6:] + (1.0 - alpha) * planner_pd_r + action_gain * scaled[:, 6:]
+        return q_l, q_r
+
     def get_joint_targets_BC(self):
         """B→C curriculum: q_target = (1-α)·q_ref + α·q_curr + scale·a.
 
@@ -324,13 +420,12 @@ class BoxliftEnv(DirectRLEnv):
         return q_l, q_r
 
     def _curriculum_alpha(self) -> float:
-        """α ∈ [0, 1] schedule used by mode BC (and mode D when implemented).
-        `alpha_warmup_steps=0` disables the curriculum (α=1 always, equivalent to mode C).
-        `force_alpha ∈ [0, 1]` short-circuits the schedule — used at eval to pin α to
-        the training-end value so the policy isn't re-exposed to the assist on a fresh
-        common_step_counter."""
+        """α ∈ [0, 1]: force_alpha pins it; reward-based curriculum increases it
+        after VOC reaches 0; linear warmup is a fallback; else 1.0 (mode C)."""
         if 0.0 <= self.cfg.force_alpha <= 1.0:
             return float(self.cfg.force_alpha)
+        if self.cfg.alpha_curriculum_enabled:
+            return self._alpha_value
         if self.cfg.alpha_warmup_steps > 0:
             return min(1.0, self.common_step_counter / self.cfg.alpha_warmup_steps)
         return 1.0
@@ -350,10 +445,7 @@ class BoxliftEnv(DirectRLEnv):
         if mode == "BC":
             return self.get_joint_targets_BC()
         if mode == "D":
-            raise NotImplementedError(
-                "Mode D (planner-PD-error blend with curriculum α) is not yet ported to "
-                "boxlift. Use mode B (no curriculum) or BC (decaying spring) instead."
-            )
+            return self.get_joint_targets_D()
         raise ValueError(f"Unknown action_mode: {mode!r}")
 
     def _apply_action(self) -> None:
@@ -419,20 +511,278 @@ class BoxliftEnv(DirectRLEnv):
             force.unsqueeze(1), torque.unsqueeze(1), is_global=True,
         )
 
-    def _get_observations(self) -> dict:
-        obs = torch.cat(
-            (
-                self._get_joint_pos(relative=True),
-                self._get_joint_vel(relative=True),
-                self._get_obj_pos(relative=True),
-                self._get_obj_quat(relative=True),
-                self._get_obj_vel(),
-                self.episode_length_buf[:, None] / self.max_episode_length,
-            ),
-            dim=-1,
+    def _get_noisy_obj_obs(self):
+        """Simulated cube-tracker reading. Pose-only, fixed delay + sub-rate update.
+        Returns (rel_pos, rel_quat, abs_pos, abs_quat); both views come from the same
+        latched sample so the policy sees mutually consistent abs and rel readings.
+        Reward path reads clean ground truth via _get_obj_pos / _get_obj_quat / _get_obj_vel
+        and is unaffected. No noise / bias is applied here — add those later if sim2real
+        flakiness demands it (mirrors the structure boxhinge uses).
+        """
+        obj_pos_now  = self.object.data.root_pos_w.clone() - self.scene.env_origins
+        obj_quat_now = self.object.data.root_quat_w.clone()
+
+        # Push current clean pose + phase into the buffers (newest-last). After this
+        # push, [:, 0] holds the pose / phase from exactly obs_obj_delay_steps env
+        # steps ago — the past phase is what we need to evaluate the reference at the
+        # time the delayed measurement was taken.
+        pose_now = torch.cat([obj_pos_now, obj_quat_now], dim=-1)
+        self.obj_pose_delay_buf = torch.roll(self.obj_pose_delay_buf, shifts=-1, dims=1)
+        self.obj_pose_delay_buf[:, -1] = pose_now
+        self.obj_phase_delay_buf = torch.roll(self.obj_phase_delay_buf, shifts=-1, dims=1)
+        self.obj_phase_delay_buf[:, -1] = self.episode_length_buf.float()
+
+        # Tick age; fire fresh tracker frame where the counter has reached the period.
+        self.obj_obs_counter += 1
+        fires = self.obj_obs_counter >= self.cfg.obs_obj_update_period
+        fires_idx = fires.nonzero(as_tuple=False).squeeze(-1)
+
+        if fires_idx.numel() > 0:
+            n_f = fires_idx.numel()
+            sampled = self.obj_pose_delay_buf[fires_idx, 0]
+            sampled_phase = self.obj_phase_delay_buf[fires_idx, 0]
+            sampled_pos  = sampled[:, :3]
+            sampled_quat = sampled[:, 3:]
+            # Per-episode constant bias: position is additive, orientation is a small-
+            # angle quat composed onto the measurement. Held for the whole episode so
+            # the policy can't average it out across frames.
+            sampled_pos = sampled_pos + self.obj_obs_bias_pos[fires_idx]
+            sampled_quat = quat_mul(self.obj_obs_bias_ori_quat[fires_idx], sampled_quat)
+            # Per-fire noise: applied only on fresh samples so held readings between
+            # fires don't re-jitter (the policy sees the SAME noisy value until the
+            # next fire — matches a real tracker holding its last frame).
+            if self.cfg.obs_obj_pos_noise > 0.0:
+                sampled_pos = sampled_pos + (
+                    self.cfg.obs_obj_pos_noise * torch.randn(n_f, 3, device=self.device)
+                )
+            if self.cfg.obs_obj_ori_noise > 0.0:
+                aa = self.cfg.obs_obj_ori_noise * torch.randn(n_f, 3, device=self.device)
+                delta_quat = torch.cat([torch.ones(n_f, 1, device=self.device), 0.5 * aa], dim=-1)
+                delta_quat = delta_quat / delta_quat.norm(dim=-1, keepdim=True)
+                sampled_quat = quat_mul(delta_quat, sampled_quat)
+            sampled_quat = sampled_quat / sampled_quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+            # Reference evaluated at the past phase — temporally aligned with the
+            # measurement. Integer indexing (boxlift has no fractional phase).
+            past_idx = sampled_phase.long().clamp(max=self.obj_poses.shape[0] - 1)
+            past_ref_pos  = self.obj_poses[past_idx, :3]
+            past_ref_quat = self.obj_poses[past_idx, 3:]
+            rel_pos_fire  = sampled_pos - past_ref_pos
+            # World-frame quat delta (matches _get_obj_quat's `desired * inv(actual)`).
+            rel_quat_fire = quat_mul(past_ref_quat, quat_inv(sampled_quat))
+            self.obj_obs_last_pose[fires_idx, :3] = sampled_pos
+            self.obj_obs_last_pose[fires_idx, 3:] = sampled_quat
+            self.obj_obs_last_rel[fires_idx, :3]  = rel_pos_fire
+            self.obj_obs_last_rel[fires_idx, 3:]  = rel_quat_fire
+            self.obj_obs_counter[fires_idx] = 0
+
+        return (
+            self.obj_obs_last_rel[:, :3],
+            self.obj_obs_last_rel[:, 3:],
+            self.obj_obs_last_pose[:, :3],
+            self.obj_obs_last_pose[:, 3:],
         )
-        observations = {"policy": obs}
-        return observations
+
+    def _get_observations(self) -> dict:
+        # === Per-arm contact bool (one bool per EE contact sensor) ===================
+        # force_matrix_w shape per arm sensor: (N, 1, n_filter, 3). Norm along the last
+        # axis → (N, 1, n_filter); sum over body+filter → (N,) total magnitude per env.
+        contact_bools = []
+        for sensor in self.ee_contact_sensors:
+            f_mag = sensor.data.force_matrix_w.norm(dim=-1)
+            total_mag = f_mag.sum(dim=(-1, -2))
+            contact_bools.append((total_mag > self.cfg.contact_threshold).float())
+        in_contact = torch.stack(contact_bools, dim=-1)              # (N, 2) [L, R]
+        self.ee_contact_delay_buf = torch.roll(self.ee_contact_delay_buf, shifts=-1, dims=1)
+        self.ee_contact_delay_buf[:, -1] = in_contact
+        delayed_contact = self.ee_contact_delay_buf[:, 0]            # (N, 2)
+        if self.cfg.contact_obs_flip_prob > 0.0:
+            flip_mask = torch.rand_like(delayed_contact) < self.cfg.contact_obs_flip_prob
+            delayed_contact = torch.where(flip_mask, 1.0 - delayed_contact, delayed_contact)
+
+        # === Box obs: delayed + sub-rate tracker (abs + rel from same latched sample)
+        # Always computed — side-effects update the delay buffer regardless of obs mode.
+        obj_rel_pos, obj_rel_quat, obj_abs_pos, obj_abs_quat = self._get_noisy_obj_obs()
+
+        # === Per-step feature (layout must match cfg.per_step_feature_dim) =============
+        if self.cfg.use_reference_obs:
+            current_features = torch.cat([
+                self._get_joint_pos(relative=True),   # q - q_ref
+                self._get_joint_vel(relative=True),   # qd - qd_ref
+                obj_rel_pos, obj_rel_quat,            # box error vs reference
+                self._get_joint_pos(relative=False),
+                self._get_joint_vel(relative=False),
+                obj_abs_pos, obj_abs_quat,
+                delayed_contact,
+            ], dim=-1)
+        else:
+            current_features = torch.cat([
+                self._get_joint_pos(relative=False),
+                self._get_joint_vel(relative=False),
+                obj_abs_pos, obj_abs_quat,
+                delayed_contact,
+            ], dim=-1)
+
+        # Shift history: oldest entry drops out, current becomes newest.
+        self.obs_history = torch.roll(self.obs_history, shifts=-1, dims=1)
+        self.obs_history[:, -1] = current_features
+
+        T = self.obj_poses.shape[0]
+        obs_parts = [self.obs_history.flatten(start_dim=1)]
+
+        if self.cfg.use_reference_obs:
+            phase_obs = (self.episode_length_buf.float() / max(T - 1, 1)).unsqueeze(-1)
+            obs_parts.append(phase_obs)
+
+        # === Future box pose look-ahead ==============================================
+        # In reference mode: predictions from the nominal plan (privileged ground truth).
+        # In reference-free mode: goal waypoints — the policy knows where the box must
+        # go without knowing how the joints should move to get it there.
+        if self.cfg.future_obs_steps:
+            idx_now = self.episode_length_buf.clamp(max=T - 1)
+            cur_pos  = self.obj_poses[idx_now, :3]
+            cur_quat = self.obj_poses[idx_now, 3:]
+            inv_cur_quat = quat_inv(cur_quat)
+            futures = []
+            for k in self.cfg.future_obs_steps:
+                fut_idx = (idx_now + int(k)).clamp(max=T - 1)
+                fut_pos  = self.obj_poses[fut_idx, :3]
+                fut_quat = self.obj_poses[fut_idx, 3:]
+                futures.append(fut_pos - cur_pos)
+                futures.append(quat_mul(fut_quat, inv_cur_quat))
+                futures.append(fut_pos)
+                futures.append(fut_quat)
+            obs_parts.append(torch.cat(futures, dim=-1))
+
+        # Previous raw policy action (pre-scale).
+        obs_parts.append(self.prev_actions)
+
+        obs = torch.cat(obs_parts, dim=-1)
+        # Critic obs is concatenated by RSL-RL from obs_groups = {"policy": ["policy"],
+        # "critic": ["policy", "privileged"]} — see agents/rsl_rl_ppo_cfg.py. We return
+        # both keys here; the wrapper passes them through as a TensorDict.
+        return {"policy": obs, "privileged": self._get_privileged_obs()}
+
+    def _get_privileged_obs(self) -> torch.Tensor:
+        """Build the privileged-extras tensor for the critic. Layout (136 dims) matches
+        the priv_dim breakdown documented in boxlift_env_cfg.__post_init__:
+            13  clean obj state           (no tracker delay / noise)
+            28  DR samples                (mass, friction, actuator stiff/damp per arm)
+            75  reference state @ phase   (ref obj / joints / EE pose / planner PD err)
+            12  force / contact           (EE force mag+dir L/R, illegal contact, flange-forearm)
+             4  eef-box rel scalars       (per-arm pos+quat tracking error in box frame)
+             4  voc / curriculum context  (current-segment kp_pos/kp_rot, alpha, seg_idx)
+        Order matters — the critic network is normalized via a running mean/std per
+        dim, so dim semantics must stay stable across runs.
+        """
+        idx = self.episode_length_buf
+        T = self.obj_poses.shape[0]
+        idx_clamped = idx.clamp(max=T - 1)
+
+        # --- (1) Clean obj state ----------------------------------------------------
+        clean_obj_pos = self.object.data.root_pos_w.clone() - self.scene.env_origins   # (N, 3)
+        clean_obj_quat = self.object.data.root_quat_w.clone()                           # (N, 4)
+        clean_obj_vel = self.object.data.root_vel_w.clone()                             # (N, 6) lin+ang
+        clean_obj_block = torch.cat([clean_obj_pos, clean_obj_quat, clean_obj_vel], dim=-1)  # (N, 13)
+
+        # --- (2) DR samples ---------------------------------------------------------
+        # Mass and friction were cached at reset; stiffness/damping are live from .data.
+        stiff_l = self.ur5e_l.data.joint_stiffness                                      # (N, 6)
+        stiff_r = self.ur5e_r.data.joint_stiffness                                      # (N, 6)
+        damp_l  = self.ur5e_l.data.joint_damping                                        # (N, 6)
+        damp_r  = self.ur5e_r.data.joint_damping                                        # (N, 6)
+        dr_block = torch.cat([
+            self._dr_obj_mass, self._dr_obj_friction,
+            stiff_l, stiff_r, damp_l, damp_r,
+        ], dim=-1)                                                                       # (N, 28)
+
+        # --- (3) Reference state at current phase (clean, no tracker model) ---------
+        ref_obj_pos = self.obj_poses[idx_clamped, :3]                                   # (N, 3)
+        ref_obj_quat = self.obj_poses[idx_clamped, 3:]                                  # (N, 4)
+        ref_obj_vel = self.obj_vel[idx_clamped]                                         # (N, 6)
+        ref_joints_l = self.joints_l[idx_clamped]                                       # (N, 6)
+        ref_joints_r = self.joints_r[idx_clamped]
+        ref_joint_vels_l = self.joint_vel_l[idx_clamped]
+        ref_joint_vels_r = self.joint_vel_r[idx_clamped]
+        ref_joints_target_l = self.joints_target_l[idx_clamped]
+        ref_joints_target_r = self.joints_target_r[idx_clamped]
+        # Planner's intended PD error per arm (what the actuator's spring "wants" to do).
+        # Distinct from joints_target alone because the planner accounted for the gap
+        # between the expected joint state (joints) and the commanded target.
+        planner_pd_l = ref_joints_target_l - ref_joints_l
+        planner_pd_r = ref_joints_target_r - ref_joints_r
+        ref_EE_pose_l = self.EE_poses_l[idx_clamped]                                    # (N, 7)
+        ref_EE_pose_r = self.EE_poses_r[idx_clamped]
+        ref_block = torch.cat([
+            ref_obj_pos, ref_obj_quat, ref_obj_vel,                                     # 13
+            ref_joints_l, ref_joints_r,                                                 # 12
+            ref_joint_vels_l, ref_joint_vels_r,                                         # 12
+            ref_joints_target_l, ref_joints_target_r,                                   # 12
+            planner_pd_l, planner_pd_r,                                                 # 12
+            ref_EE_pose_l, ref_EE_pose_r,                                               # 14
+        ], dim=-1)                                                                       # (N, 75)
+
+        # --- (4) Force / contact state ----------------------------------------------
+        # EE force per arm: continuous magnitude + direction (vs the actor's thresholded
+        # bool). force_matrix_w shape per arm sensor: (N, 1, n_filter, 3); summing across
+        # body+filter axes gives the net force vector applied AT the EE.
+        ee_force_vecs = []
+        ee_force_mags = []
+        for sensor in self.ee_contact_sensors:
+            f = sensor.data.force_matrix_w.sum(dim=(1, 2))                              # (N, 3) net force vec
+            mag = f.norm(dim=-1, keepdim=True)                                          # (N, 1)
+            dir_ = f / mag.clamp(min=1e-6)                                              # (N, 3) unit (or 0)
+            ee_force_mags.append(mag)
+            ee_force_vecs.append(dir_)
+        ee_force_mag_l, ee_force_mag_r = ee_force_mags[0], ee_force_mags[1]             # (N, 1) each
+        ee_force_dir_l, ee_force_dir_r = ee_force_vecs[0], ee_force_vecs[1]             # (N, 3) each
+
+        # Illegal-contact summed magnitudes (matches what _get_rewards uses for the penalty).
+        illegal_cube = torch.zeros((self.num_envs, 1), device=self.device)
+        illegal_table = torch.zeros((self.num_envs, 1), device=self.device)
+        if "cube" in self.illegal_contact_sensors:
+            illegal_cube[:, 0] = (
+                self.illegal_contact_sensors["cube"].data.force_matrix_w
+                .norm(dim=-1).sum(dim=-1).flatten()
+            )
+        if "table" in self.illegal_contact_sensors:
+            illegal_table[:, 0] = (
+                self.illegal_contact_sensors["table"].data.force_matrix_w
+                .norm(dim=-1).sum(dim=-1).flatten()
+            )
+
+        # Continuous flange-forearm distance (actor sees only the binary penalty).
+        fl = self._get_flange_to_forearm_distance(self.ur5e_l).unsqueeze(-1)            # (N, 1)
+        fr = self._get_flange_to_forearm_distance(self.ur5e_r).unsqueeze(-1)            # (N, 1)
+
+        force_block = torch.cat([
+            ee_force_mag_l, ee_force_mag_r,                                             # 2
+            ee_force_dir_l, ee_force_dir_r,                                             # 6
+            illegal_cube, illegal_table,                                                # 2
+            fl, fr,                                                                     # 2
+        ], dim=-1)                                                                       # (N, 12)
+
+        # --- (5) Eef-box relative tracking errors (scalars from reward path) --------
+        pos_err_l, quat_err_l, pos_err_r, quat_err_r = self._compute_eef_box_rel_errors()
+        eef_box_block = torch.stack(
+            [pos_err_l, quat_err_l, pos_err_r, quat_err_r], dim=-1
+        )                                                                                # (N, 4)
+
+        # --- (6) VOC / curriculum context -------------------------------------------
+        # Per-env current-segment VOC gains. Tells the critic "this env is getting this
+        # much assist right now" — V should reflect outcomes under the active kp.
+        seg_idx_per_env = self.phase_to_segment[
+            idx_clamped.clamp(max=self.phase_to_segment.shape[0] - 1)
+        ]                                                                                # (N,) long
+        cur_kp_pos = self._voc_kp_pos_seg[seg_idx_per_env].unsqueeze(-1)                # (N, 1)
+        cur_kp_rot = self._voc_kp_rot_seg[seg_idx_per_env].unsqueeze(-1)                # (N, 1)
+        alpha_scalar = float(self._curriculum_alpha())
+        alpha_t = torch.full((self.num_envs, 1), alpha_scalar, device=self.device)
+        seg_t = seg_idx_per_env.float().unsqueeze(-1)                                   # (N, 1)
+        voc_block = torch.cat([cur_kp_pos, cur_kp_rot, alpha_t, seg_t], dim=-1)         # (N, 4)
+
+        return torch.cat([
+            clean_obj_block, dr_block, ref_block, force_block, eef_box_block, voc_block
+        ], dim=-1)                                                                       # (N, 136)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         time_out = self.episode_length_buf >= self.max_episode_length - 1
@@ -525,7 +875,7 @@ class BoxliftEnv(DirectRLEnv):
         delta_quat = torch.stack([torch.cos(half), zeros, zeros, torch.sin(half)], dim=-1)
         initial_object_pose[:, 3:7] = quat_mul(delta_quat, initial_object_pose[:, 3:7])
         initial_object_vel[:, 0:2] += self.cfg.reset_obj_lin_vel_xy_noise * torch.randn(n, 2, device=self.device)
-        initial_object_vel[:, 5]   += self.cfg.reset_obj_ang_vel_noise * torch.randn(n, device=self.device)
+        initial_object_vel[:, 3:6] += self.cfg.reset_obj_ang_vel_noise * torch.randn(n, 3, device=self.device)
 
         self.object.write_root_pose_to_sim(initial_object_pose, env_ids)
         self.object.write_root_velocity_to_sim(initial_object_vel, env_ids)
@@ -554,12 +904,96 @@ class BoxliftEnv(DirectRLEnv):
         self._voc_ep_rew_track_seg[eids_t] = 0.0
         self._voc_ep_steps_seg[eids_t]     = 0
 
+        # === BC alpha ring-buffer push ===
+        steps_a = self._alpha_ep_steps[eids_t].clamp(min=1).float()
+        norm_task_a = self._alpha_ep_rew_task[eids_t] / steps_a
+        n_a = eids_t.numel()
+        W_a = self.cfg.alpha_reward_window_size
+        slots_a = (self._alpha_buf_idx + torch.arange(n_a, device=self.device)) % W_a
+        self._alpha_buf_task[slots_a] = norm_task_a
+        self._alpha_buf_idx = int((self._alpha_buf_idx + n_a) % W_a)
+        self._alpha_ep_rew_task[eids_t] = 0.0
+        self._alpha_ep_steps[eids_t]    = 0
+
         # Reset prev variables. prev_actions tracks the previous RAW residual action
         # (units: policy output, ≈ [-1, 1]), NOT joint positions — reset to 0 so the
         # first-step action_rate penalty isn't a giant spike from the unit mismatch.
         self.prev_actions[env_ids] = 0.0
         self.prev_joint_vel[env_ids, :6] = initial_joint_vel_l
         self.prev_joint_vel[env_ids, 6:] = initial_joint_vel_r
+
+        # Contact-bool delay buffer: zero on reset so the freshly-reset env doesn't
+        # carry the previous episode's contact history into its first few obs. At
+        # episode start the EE may or may not already be against the cube (depends on
+        # the RSI phase); 0 is the safe default and the buffer refills in <delay_steps.
+        self.ee_contact_delay_buf[env_ids] = 0.0
+
+        # === Reset cube-tracker state ================================================
+        # Warm the delay buffers with the post-reset cube pose (and the RSI starting
+        # phase) so a delayed read returns sensible, temporally consistent values from
+        # step 1 onward. Set counter == period so a fresh fire happens on the very
+        # first post-reset step (which then writes the properly delayed pose into
+        # obj_obs_last_*).
+        # NOTE: obj_poses stores env-frame poses; initial_object_pose has had
+        # env_origins added back in for write_root_pose_to_sim. Subtract them out so
+        # the tracker buffer stays in env-frame (matches what _get_noisy_obj_obs reads).
+        init_pose_env = initial_object_pose.clone()
+        init_pose_env[:, :3] -= self.scene.env_origins[env_ids]
+        self.obj_pose_delay_buf[env_ids]  = init_pose_env.unsqueeze(1)
+        self.obj_phase_delay_buf[env_ids] = self.episode_length_buf[env_ids].float().unsqueeze(1)
+        self.obj_obs_last_pose[env_ids]   = init_pose_env
+        # rel ≈ 0 at reset (actual = ref + small reset noise; ref(start_phase) = trajectory[start_phase]).
+        self.obj_obs_last_rel[env_ids, :3] = 0.0
+        self.obj_obs_last_rel[env_ids, 3:] = 0.0
+        self.obj_obs_last_rel[env_ids, 3]  = 1.0  # identity quat (wxyz)
+        self.obj_obs_counter[env_ids] = self.cfg.obs_obj_update_period
+
+        # Sample fresh per-episode constant bias for the cube tracker. Held for the
+        # whole episode, applied in _get_noisy_obj_obs's fire branch BEFORE per-fire
+        # noise. Position bias is direct additive; orientation bias is a small-angle
+        # quat (so direct quat_mul). std == 0 → bias is identity (no-op).
+        n_b = len(env_ids)
+        if self.cfg.obs_obj_pos_bias_std > 0.0:
+            self.obj_obs_bias_pos[env_ids] = (
+                self.cfg.obs_obj_pos_bias_std * torch.randn(n_b, 3, device=self.device)
+            )
+        else:
+            self.obj_obs_bias_pos[env_ids] = 0.0
+        if self.cfg.obs_obj_ori_bias_std > 0.0:
+            aa = self.cfg.obs_obj_ori_bias_std * torch.randn(n_b, 3, device=self.device)
+            bias_quat = torch.cat([torch.ones(n_b, 1, device=self.device), 0.5 * aa], dim=-1)
+            bias_quat = bias_quat / bias_quat.norm(dim=-1, keepdim=True)
+            self.obj_obs_bias_ori_quat[env_ids] = bias_quat
+        else:
+            self.obj_obs_bias_ori_quat[env_ids, 0] = 1.0
+            self.obj_obs_bias_ori_quat[env_ids, 1:] = 0.0
+
+        # Per-step feature history: zero on reset. Earliest history slots are zeros
+        # until obs_history_steps env steps have elapsed; acceptable since the policy
+        # sees this same convention at training time.
+        self.obs_history[env_ids] = 0.0
+
+        # === Refresh privileged DR cache for the just-reset envs =====================
+        # By this point super()._reset_idx has fired all reset-mode events (object_mass,
+        # object_physics_material, etc.), so the asset's PhysX view reflects the new
+        # per-env samples. get_masses returns (N_total, 1); get_material_properties
+        # returns (N_total, num_shapes, 3) with [static, dynamic, restitution] — cube
+        # has one shape so we take index 0. Both come back as CPU tensors → move to GPU.
+        # joint_stiffness / joint_damping live on .data and update via the actuator's
+        # set_dof_stiffnesses path — read directly in _get_privileged_obs, no cache.
+        try:
+            masses = self.object.root_physx_view.get_masses().to(self.device)
+            self._dr_obj_mass[env_ids] = masses[env_ids]
+            mat = self.object.root_physx_view.get_material_properties().to(self.device)
+            self._dr_obj_friction[env_ids] = mat[env_ids, 0, :]
+        except Exception as e:
+            # Defensive: if a future IsaacLab version changes the PhysX view API,
+            # log once and continue with stale (zeros / last good) cache values rather
+            # than crash. The critic will see slightly stale DR info but training continues.
+            if not getattr(self, "_dr_readback_warned", False):
+                print(f"[boxlift] _reset_idx: DR cache readback failed: {e!r}. "
+                      f"Privileged critic will see zero/stale DR samples.")
+                self._dr_readback_warned = True
 
     def _reward_track(self, error, sigma, tolerance=0.0):
         error *= error > tolerance
@@ -576,6 +1010,10 @@ class BoxliftEnv(DirectRLEnv):
 
         rew_task_unweighted = rew_obj_pos + rew_obj_quat
         rew_task = self.cfg.w_task * rew_task_unweighted
+
+        # Accumulate for BC alpha curriculum
+        self._alpha_ep_rew_task += rew_task_unweighted
+        self._alpha_ep_steps    += 1
 
         # Tracking — phase-exclusive: absolute (EE/joint) when the reference is OUT of
         # contact (abs_gate=1), relative EE-in-box-frame when IN contact (gate=1). No
@@ -637,17 +1075,30 @@ class BoxliftEnv(DirectRLEnv):
         torque_penalty = torque.square().sum(dim=-1)
         rew_torque = self.cfg.w_joint_torque * torque_penalty
 
+        # Action-authority scaling for the policy-authored regularization terms. In
+        # mode D the policy's effective gain on the joint command is α + ε(1-α), so
+        # penalizing a unit-norm action the same way at α=0 (10% authority) as at α=1
+        # (100% authority) would overweight the rate/norm penalties exactly when the
+        # policy can least afford them. Mode-D only — other modes keep full action
+        # authority across α and are unaffected.
+        if self.cfg.action_mode == "D":
+            alpha = self._curriculum_alpha()
+            eps = float(self.cfg.action_alpha_floor)
+            action_authority_scale = alpha + eps * (1.0 - alpha)
+        else:
+            action_authority_scale = 1.0
+
         action_rate_error = (self.actions - self.prev_actions)
         action_rate_error *= torch.abs(action_rate_error) > self.cfg.tol_action_rate
         action_rate_penalty = action_rate_error.square().sum(dim=-1)
-        rew_action_rate = self.cfg.w_action_rate * action_rate_penalty
+        rew_action_rate = action_authority_scale * self.cfg.w_action_rate * action_rate_penalty
 
         # Residual action magnitude penalty: bias toward zero residual when the nominal
         # plan is already good (important for VOC since the VOC wrench is the actor early).
         action_norm_error = self.actions.clone()
         action_norm_error *= torch.abs(action_norm_error) > self.cfg.tol_action_norm
         action_norm_penalty = action_norm_error.square().sum(dim=-1)
-        rew_action_norm = self.cfg.w_action_norm * action_norm_penalty
+        rew_action_norm = action_authority_scale * self.cfg.w_action_norm * action_norm_penalty
 
         # Joint limit penalty — read from the cached (already-clamped) joint target to
         # match what _apply_action commanded. joint_limit_eps insets the soft band slightly
@@ -762,6 +1213,15 @@ class BoxliftEnv(DirectRLEnv):
             self._voc_decay_step_counter = 0
             self._voc_decay_check()
 
+        # BC alpha curriculum: rate-limited check, only when VOC is fully off
+        self._alpha_check_counter += 1
+        if (self.cfg.alpha_curriculum_enabled
+                and self._alpha_value < 1.0
+                and float(self._voc_kp_pos_seg.max().item()) <= 0.0
+                and self._alpha_check_counter >= self.cfg.alpha_decay_check_interval):
+            self._alpha_check_counter = 0
+            self._alpha_increase_check()
+
         # VOC logging — headline values are cross-segment mean / min / max so you can
         # see the distribution at a glance, plus per-segment kp and recent task/track
         # means for spotting which segment is the bottleneck.
@@ -770,8 +1230,11 @@ class BoxliftEnv(DirectRLEnv):
         self.extras["log"]["VOC/kp_pos_max"]  = self._voc_kp_pos_seg.max()
         self.extras["log"]["VOC/kp_rot_mean"] = self._voc_kp_rot_seg.mean()
         self.extras["log"]["VOC/n_active_segments"] = (self._voc_kp_pos_seg > 0.0).sum().float()
-        # Curriculum α (used by mode BC; 1.0 if disabled).
         self.extras["log"]["Curriculum/alpha"] = torch.tensor(self._curriculum_alpha(), device=self.device)
+        valid_a = ~torch.isnan(self._alpha_buf_task)
+        self.extras["log"]["Curriculum/alpha_buf_mean"] = (
+            self._alpha_buf_task[valid_a].mean() if valid_a.any() else torch.tensor(0.0, device=self.device)
+        )
 
         # Per-segment recent trailing means and current gain. If seg2_task_mean plateaus
         # low while others are at 0.8, that segment is the bottleneck — address with
@@ -856,6 +1319,25 @@ class BoxliftEnv(DirectRLEnv):
             self._voc_kv_rot_seg[below] = 0.0
         self._save_voc_state()
 
+    def _alpha_increase_check(self):
+        """Phi-based alpha increase: (1-alpha) *= phi when task reward exceeds threshold.
+        Mirrors _voc_decay_check — phi < 1 so (1-alpha) decays exponentially toward 0,
+        snapping to alpha=1 when support < alpha_min_support. Buffer is cleared after
+        each increase so the policy re-qualifies at the new (harder) alpha level."""
+        if self.common_step_counter < self.cfg.alpha_decay_warmup_steps:
+            return
+        valid = ~torch.isnan(self._alpha_buf_task)
+        if int(valid.sum().item()) < self.cfg.alpha_reward_window_size // 2:
+            return
+        mean_task = float(self._alpha_buf_task[valid].mean().item())
+        if mean_task < self.cfg.alpha_threshold_task:
+            return
+        support = (1.0 - self._alpha_value) * self.cfg.alpha_decay_phi
+        self._alpha_value = 1.0 if support < self.cfg.alpha_min_support else float(1.0 - support)
+        self._alpha_buf_task.fill_(float("nan"))
+        self._alpha_buf_idx = 0
+        print(f"[BC-alpha] alpha → {self._alpha_value:.4f}  (mean_task={mean_task:.3f})")
+
     def _save_voc_state(self):
         """Persist current per-segment VOC runtime gains to <log_dir>/voc_state.npz so
         play.py / record.py can resume eval at the trained-end VOC level (via --keep_voc)
@@ -874,6 +1356,33 @@ class BoxliftEnv(DirectRLEnv):
             )
         except OSError:
             pass
+
+    def set_voc_strength(self, kp_pos: float) -> None:
+        """Eval-time override: set a single scalar VOC kp_pos and derive kp_rot, kv_pos,
+        kv_rot from the same formulas used at env init.
+          * kp_rot scales proportionally to kp_pos (preserves the cfg's trans/rot ratio).
+          * kv_pos / kv_rot are critically damped from the new kp_* values.
+        Applied uniformly across all segments. Use this from play.py / record.py to
+        recreate the VOC strength a policy was trained against (lookup kp_pos from W&B,
+        pass it here). 0.0 disables VOC entirely. Per-segment differences during training
+        are flattened — this is a single-scalar approximation, not a full snapshot."""
+        mass = float(self.cfg.cube_cfg.spawn.mass_props.mass)
+        d_max = float(max(self.cfg.cube_cfg.spawn.size))
+        inertia_est = mass * (d_max ** 2) / 12.0
+        kp_pos_init = float(self.cfg.voc_kp_pos)
+        kp_rot_init = float(self.cfg.voc_kp_rot)
+        scale = (kp_pos / kp_pos_init) if kp_pos_init > 0 else 0.0
+        kp_rot = kp_rot_init * scale
+        # Critical-damping derivation matches _setup_scene.
+        kv_pos = float(self.cfg.voc_kv_pos_scale) * max(kp_pos * mass, 0.0) ** 0.5
+        kv_rot = float(self.cfg.voc_kv_rot_scale) * max(kp_rot * inertia_est, 0.0) ** 0.5
+        self._voc_kp_pos_seg.fill_(float(kp_pos))
+        self._voc_kp_rot_seg.fill_(float(kp_rot))
+        self._voc_kv_pos_seg.fill_(float(kv_pos))
+        self._voc_kv_rot_seg.fill_(float(kv_rot))
+        print(f"[INFO] set_voc_strength: kp_pos={kp_pos:.3g}, kp_rot={kp_rot:.3g}, "
+              f"kv_pos={kv_pos:.3g}, kv_rot={kv_rot:.3g} "
+              f"(uniform across {self._voc_n_segments} segments)")
 
     def apply_voc_state(self, state) -> None:
         """Restore VOC gains from a saved `voc_state.npz` (dict-like with `voc_kp_pos`,

@@ -160,6 +160,8 @@ class BoxhingeEnv(DirectRLEnv):
         # Regularization stuff
         self.prev_actions = torch.zeros((self.num_envs, 6), device=self.device)
         self.prev_joint_vel = torch.zeros((self.num_envs, 6), device=self.device)
+        self._dr_obj_mass = torch.zeros((self.num_envs, 1), device=self.device)
+        self._dr_obj_friction = torch.zeros((self.num_envs, 3), device=self.device)
 
         # Observation history buffer: (num_envs, history_steps, per_step_feature_dim).
         # per_step_feature_dim = 12 (rel_q + rel_qd) [+ 13 (obj_pos_rel + obj_quat_rel + obj_vel_rel) if include_object_obs]
@@ -653,8 +655,65 @@ class BoxhingeEnv(DirectRLEnv):
             obs_parts.append(self.prev_actions)
 
         obs = torch.cat(obs_parts, dim=-1)
-        observations = {"policy": obs}
-        return observations
+        return {"policy": obs, "privileged": self._get_privileged_obs()}
+
+    def _get_privileged_obs(self) -> torch.Tensor:
+        """85-dim privileged critic obs. Layout:
+          13  clean obj state   (pos 3 + quat 4 + lin_vel 3 + ang_vel 3)
+          16  DR samples        (mass 1 + friction 3 + stiff 6 + damp 6)
+          44  reference @ phase (ref_obj 13 + ref_joints 6 + ref_jvel 6 + ref_jtgt 6 + planner_pd 6 + ref_EE 7)
+           6  force/contact     (EE force mag 1 + dir 3 + illegal 1 + flange-forearm 1)
+           2  eef-box rel       (pos_err 1 + quat_err 1)
+           4  VOC/curriculum    (kp_pos 1 + kp_rot 1 + alpha 1 + phase_norm 1)
+        """
+        T = self.obj_poses.shape[0]
+
+        # (1) clean obj state
+        clean_pos = self.object.data.root_pos_w.clone() - self.scene.env_origins
+        clean_quat = self.object.data.root_quat_w.clone()
+        clean_vel = self.object.data.root_vel_w.clone()
+        obj_block = torch.cat([clean_pos, clean_quat, clean_vel], dim=-1)  # (N, 13)
+
+        # (2) DR samples
+        stiff = self.ur5e.data.joint_stiffness   # (N, 6)
+        damp  = self.ur5e.data.joint_damping     # (N, 6)
+        dr_block = torch.cat([self._dr_obj_mass, self._dr_obj_friction, stiff, damp], dim=-1)  # (N, 16)
+
+        # (3) reference state at phase
+        ref_obj_pos  = self._interp(self.obj_poses[:, :3])
+        ref_obj_quat = self._nlerp(self.obj_poses[:, 3:])
+        ref_obj_vel  = self._interp(self.obj_vel)
+        ref_joints      = self._interp(self.joints)
+        ref_joint_vel   = self._interp(self.joint_vel)
+        ref_joints_tgt  = self._interp(self.joints_target)
+        planner_pd      = ref_joints_tgt - ref_joints
+        ref_EE          = torch.cat([self._interp(self.EE_poses[:, :3]), self._nlerp(self.EE_poses[:, 3:])], dim=-1)
+        ref_block = torch.cat([ref_obj_pos, ref_obj_quat, ref_obj_vel,
+                                ref_joints, ref_joint_vel, ref_joints_tgt, planner_pd,
+                                ref_EE], dim=-1)  # (N, 44)
+
+        # (4) force/contact
+        f_mat = self.ee_contact_sensor.data.force_matrix_w.sum(dim=(1, 2))  # (N, 3)
+        ee_f_mag = f_mat.norm(dim=-1, keepdim=True)                         # (N, 1)
+        ee_f_dir = f_mat / ee_f_mag.clamp(min=1e-6)                         # (N, 3)
+        illegal = torch.zeros((self.num_envs, 1), device=self.device)
+        for sensor in self.illegal_contact_sensors.values():
+            illegal[:, 0] += sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1).flatten()
+        fl = self._get_flange_to_forearm_distance(self.ur5e).unsqueeze(-1)
+        force_block = torch.cat([ee_f_mag, ee_f_dir, illegal, fl], dim=-1)  # (N, 6)
+
+        # (5) eef-box rel
+        pos_err, quat_err = self._compute_eef_box_rel_errors()
+        eef_block = torch.stack([pos_err, quat_err], dim=-1)                # (N, 2)
+
+        # (6) VOC/curriculum
+        kp_pos_t = torch.full((self.num_envs, 1), self.voc_kp_pos, device=self.device)
+        kp_rot_t = torch.full((self.num_envs, 1), self.voc_kp_rot, device=self.device)
+        alpha_t  = torch.full((self.num_envs, 1), self._curriculum_alpha(), device=self.device)
+        phase_norm = (self.phase / max(T - 1, 1)).unsqueeze(-1)
+        voc_block = torch.cat([kp_pos_t, kp_rot_t, alpha_t, phase_norm], dim=-1)  # (N, 4)
+
+        return torch.cat([obj_block, dr_block, ref_block, force_block, eef_block, voc_block], dim=-1)  # (N, 85)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # Trajectory completion. episode_length_s is sized in _setup_scene so the wall-clock
@@ -898,6 +957,16 @@ class BoxhingeEnv(DirectRLEnv):
         # 0 → step-1 improvement delta clamps to 0 (no spurious discount).
         self._err_task_prev[env_ids] = 0.0
         self._err_track_prev[env_ids] = 0.0
+
+        try:
+            masses = self.object.root_physx_view.get_masses().to(self.device)
+            self._dr_obj_mass[env_ids] = masses[env_ids]
+            mat = self.object.root_physx_view.get_material_properties().to(self.device)
+            self._dr_obj_friction[env_ids] = mat[env_ids, 0, :]
+        except Exception as e:
+            if not getattr(self, "_dr_readback_warned", False):
+                print(f"[boxhinge] _reset_idx: DR cache readback failed: {e!r}.")
+                self._dr_readback_warned = True
 
     def _curriculum_alpha(self) -> float:
         """α ∈ [0, 1] schedule used by the reward curriculum, the mode-D action blend, and
@@ -1194,6 +1263,51 @@ class BoxhingeEnv(DirectRLEnv):
             "Phase/slowdown_improvement": slowdown_improvement.mean(),
             "Phase/slowdown_improvement_factor": improvement_factor.mean(),
         }
+
+        # Per-env extras for record.py / rollout_summary. Only populated when
+        # cfg.emit_per_env_extras=True (record.py flips this on at eval time). Skipped
+        # during normal training to keep extras["log"] identical to the pre-refactor
+        # payload — RSL-RL only consumes that, so a missing log_per_env is a no-op.
+        # Keys mirror the per-component reward / error names from extras["log"] above;
+        # the (N,) tensors are the un-.mean()'d sources of those scalars. Curriculum
+        # / Phase / aggregate-fraction fields aren't per-env-meaningful and are
+        # deliberately omitted.
+        if getattr(self.cfg, "emit_per_env_extras", False):
+            self.extras["log_per_env"] = {
+                "Rewards_task/obj_pos": rew_obj_pos,
+                "Rewards_task/obj_quat": rew_obj_quat,
+                "Rewards_task/obj_lin_vel": rew_obj_lin_vel,
+                "Rewards_task/obj_ang_vel": rew_obj_ang_vel,
+                "Rewards_task/total": rew_task,
+                "Rewards_track/eef_pos": rew_EE_pos,
+                "Rewards_track/eef_quat": rew_EE_quat,
+                "Rewards_track/joint_pos": rew_joint_pos,
+                "Rewards_track/eef_box_rel_pos": rew_eef_box_rel_pos,
+                "Rewards_track/eef_box_rel_quat": rew_eef_box_rel_quat,
+                "Rewards_track/total": rew_track,
+                "Rewards/completion_bonus": rew_completion,
+                "Rewards_regularization/total": rew_regularization,
+                "Rewards_regularization/joint_acceleration": rew_joint_acc,
+                "Rewards_regularization/torque": rew_torque,
+                "Rewards_regularization/action_rate": rew_action_rate,
+                "Rewards_regularization/action_norm": rew_action_norm,
+                "Rewards_regularization/joint_limit": rew_joint_limit,
+                "Rewards_regularization/illegal_contact": rew_illegal_contact,
+                "Rewards_regularization/illegal_proximity": rew_proximity,
+                "Rewards_regularization/flange_forearm_distance": rew_flange_forearm_dist,
+                "Rewards_regularization/total_slowdown": rew_total_slowdown,
+                "Rewards_regularization/slowdown_gated": rew_slowdown_gated,
+                "Rewards_regularization/slowdown_improvement": rew_slowdown_improvement,
+                "Error/obj_pos_error": obj_pos_error,
+                "Error/obj_quat_error": obj_quat_error,
+                # obj_lin_vel_error / obj_ang_vel_error are only defined when
+                # cfg.task_reward_form != "sum"; omit to keep this block branch-safe
+                # (and matches boxhinge's existing extras["log"] which also omits them).
+                "Error/EE_pos_error": EE_pos_error,
+                "Error/EE_quat_error": eef_quat_error,
+                "Error/eef_box_rel_pos": eef_box_rel_pos_err,
+                "Error/eef_box_rel_quat": eef_box_rel_quat_err,
+            }
 
         # Failure-aware phase resampling diagnostics.
         if self.cfg.enable_failure_resampling:

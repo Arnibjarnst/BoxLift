@@ -38,6 +38,11 @@ parser.add_argument("--trajectory_path", type=str, default=None, help="Override 
 parser.add_argument("--keep_voc", action="store_true", default=False,
                     help="Eval with the VOC gains saved at the end of training (loaded from <log_dir>/voc_state.npz). "
                          "If unset (default), VOC is forcibly disabled so eval matches deployment (kp=kv=0).")
+parser.add_argument("--voc_kp_pos", type=float, default=None,
+                    help="Eval-time override: set a single VOC kp_pos and derive kp_rot, kv_pos, kv_rot "
+                         "from the env's init formulas (proportional + critical damping). Lookup the value "
+                         "at the iter of interest from W&B (VOC/kp_pos_mean) and pass it here to recreate "
+                         "that training-time VOC strength. Ignored if --keep_voc is set. Pass 0 to disable.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -47,6 +52,26 @@ args_cli, hydra_args = parser.parse_known_args()
 # always enable cameras to record video
 if args_cli.video:
     args_cli.enable_cameras = True
+
+
+def _hydra_overridden_env_fields(hydra_args: list[str]) -> set[str]:
+    """Top-level `env.<X>` keys the user set on the command line. Used to gate the
+    saved-cfg restoration block in main() so explicit Hydra overrides aren't
+    silently clobbered back to the trained-run's saved value. Handles +/~ prefixes."""
+    out = set()
+    for arg in hydra_args:
+        a = arg.lstrip("+~")
+        if not a.startswith("env."):
+            continue
+        rest = a[len("env."):]
+        key = rest.split("=", 1)[0]
+        out.add(key.split(".")[0])
+    return out
+
+
+_env_overrides = _hydra_overridden_env_fields(hydra_args)
+if _env_overrides:
+    print(f"[INFO] Hydra env overrides detected, will NOT restore from saved env.yaml: {sorted(_env_overrides)}")
 
 # clear out sys.argv for Hydra
 sys.argv = [sys.argv[0]] + hydra_args
@@ -125,34 +150,40 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     with open(os.path.join(log_dir, "params", "env.yaml"), "r") as f:
         saved_env_cfg = yaml.unsafe_load(f)
 
+    # User-explicit CLI flag for trajectory_path wins over saved value (legacy non-Hydra arg).
     if args_cli.trajectory_path is not None:
         env_cfg.trajectory_path = args_cli.trajectory_path
-    else:
+    elif "trajectory_path" not in _env_overrides:
         env_cfg.trajectory_path = saved_env_cfg["trajectory_path"]
     print(f"[INFO] Using trajectory: {env_cfg.trajectory_path}")
 
-    if "dataset_path" in saved_env_cfg:
+    # All restorations below: only apply if the user didn't already set the field via a
+    # Hydra `env.<field>=...` override. Otherwise we'd silently clobber the override.
+    if "dataset_path" in saved_env_cfg and "dataset_path" not in _env_overrides:
         env_cfg.dataset_path = saved_env_cfg["dataset_path"]
+    if getattr(env_cfg, "dataset_path", ""):
         print(f"[INFO] Using dataset: {env_cfg.dataset_path}")
 
     # Restore fields that affect obs/action layout from the trained run
-    if "obs_history_steps" in saved_env_cfg:
+    if "obs_history_steps" in saved_env_cfg and "obs_history_steps" not in _env_overrides:
         env_cfg.obs_history_steps = int(saved_env_cfg["obs_history_steps"])
-    if "action_mode" in saved_env_cfg:
+    if "action_mode" in saved_env_cfg and "action_mode" not in _env_overrides:
         env_cfg.action_mode = saved_env_cfg["action_mode"]
-    if "observation_space" in saved_env_cfg:
-        env_cfg.observation_space = int(saved_env_cfg["observation_space"])
+    if "observation_space" in saved_env_cfg and "observation_space" not in _env_overrides:
+        obs_space = saved_env_cfg["observation_space"]
+        env_cfg.observation_space = obs_space if isinstance(obs_space, dict) else int(obs_space)
     # Phase slowdown determines action_space (7 if enabled, 6 otherwise) — must be set
     # before env creation so __post_init__ allocates the correct action head shape, or
     # checkpoint loading will fail with a size mismatch on actor.6.weight/bias.
-    if "enable_phase_slowdown" in saved_env_cfg:
+    if "enable_phase_slowdown" in saved_env_cfg and "enable_phase_slowdown" not in _env_overrides:
         env_cfg.enable_phase_slowdown = bool(saved_env_cfg["enable_phase_slowdown"])
     # Phase-mapping variants (only meaningful if enable_phase_slowdown is True). These
     # control how action[6] is interpreted; mismatch between train and eval would make
     # the policy's commanded dphase wrong even if shapes match.
     for _phase_field in ("phase_mapping", "dphase_max", "dphase_min",
                          "task_scale_by_dphase", "track_scale_by_dphase"):
-        if _phase_field in saved_env_cfg and hasattr(env_cfg, _phase_field):
+        if (_phase_field in saved_env_cfg and hasattr(env_cfg, _phase_field)
+                and _phase_field not in _env_overrides):
             setattr(env_cfg, _phase_field, saved_env_cfg[_phase_field])
     print(f"[INFO] obs_history_steps={getattr(env_cfg, 'obs_history_steps', None)}, "
           f"action_mode={getattr(env_cfg, 'action_mode', None)}, "
@@ -212,12 +243,26 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
                 print(f"[WARN] --keep_voc requested but {_voc_state_path} not found; "
                       f"VOC will use the cfg's initial values (kp_pos={_direct_env.voc_kp_pos}). "
                       f"This is likely wrong — re-train with VOC state saving, or omit --keep_voc.")
+        elif args_cli.voc_kp_pos is not None:
+            # User-specified kp_pos. Env derives kp_rot / kv_pos / kv_rot via the
+            # init-time formulas (proportional + critical damping). Single-scalar
+            # approximation — per-segment differences during training are flattened.
+            if hasattr(_direct_env, "set_voc_strength"):
+                _direct_env.set_voc_strength(float(args_cli.voc_kp_pos))
+            else:
+                # Legacy fallback: write only the scalar kp_pos and let the env keep
+                # its existing kp_rot / kv_* (likely cfg defaults — not great, but
+                # better than crashing).
+                _direct_env.voc_kp_pos = float(args_cli.voc_kp_pos)
+                print(f"[WARN] env has no set_voc_strength method; only kp_pos overridden "
+                      f"(kp_rot / kv_* unchanged). Update the env to derive them properly.")
         else:
             _direct_env.voc_kp_pos = 0.0
             _direct_env.voc_kp_rot = 0.0
             _direct_env.voc_kv_pos = 0.0
             _direct_env.voc_kv_rot = 0.0
-            print("[INFO] VOC disabled for eval (kp=kv=0). Use --keep_voc to load training-end gains.")
+            print("[INFO] VOC disabled for eval (kp=kv=0). Use --keep_voc to load training-end "
+                  "gains, or --voc_kp_pos <value> to recreate a specific iter's strength.")
 
     # wrap for video recording
     if args_cli.video:
