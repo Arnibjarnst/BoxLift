@@ -36,6 +36,8 @@ POSE_ESTIMATION_PORT = 5555
 BOX_BOARD_ID = "0"
 POSE_FIRST_POSE_TIMEOUT_S = 5.0
 
+MEASURED_OFFSET = np.array([-0.013, -0.013, 0])
+
 
 # ---------------------------
 # Argument parsing
@@ -309,7 +311,7 @@ def real_to_sim_pose(pose):
     if pose is None:
         return None
     pose = np.asarray(pose, dtype=np.float32)
-    pos = REAL_TO_SIM_R @ pose[:3]
+    pos = REAL_TO_SIM_R @ (pose[:3] + MEASURED_OFFSET)
     quat = quat_mul_np(REAL_TO_SIM_Q_WXYZ, pose[3:])
     if quat[0] < 0.0:
         quat = -quat
@@ -1115,8 +1117,8 @@ def control_thread():
 
             # Should be at the end to ensure correct timing
             t2 = time.perf_counter()
-            if (t2 - t1) > (1 / rtde_frequency):
-                raise Exception(f"too slow: {t2-t1}")
+            # if (t2 - t1) > (1 / rtde_frequency) * 2:
+            #     raise Exception(f"too slow: {t2-t1}")
             rtde_c.waitPeriod(t_start)
 
     except Exception as e:

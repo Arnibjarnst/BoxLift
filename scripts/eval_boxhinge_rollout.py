@@ -40,6 +40,7 @@ Usage:
 
 import argparse
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -90,6 +91,20 @@ def _npz_scalar(d, key: str) -> float | None:
     """Read an optional scalar from the npz as float. Older real rollouts may
     not carry gain/lookahead_time, so missing → None rather than KeyError."""
     return float(d[key]) if key in d.files else None
+
+
+def _parse_timestamp(npz_path: Path) -> datetime | None:
+    """Pull the rollout's wall-clock datetime out of the filename. ur_rtde_real_time.py
+    names rollouts <YYYYMMDD>_<HHMMSS>_..., so split on '_' and parse the first
+    two tokens. Returned as a datetime so pandas can filter on time ranges via
+    `pd.to_datetime(df['datetime'])`. None for unrecognized stems."""
+    tokens = npz_path.stem.split("_")
+    if len(tokens) < 2:
+        return None
+    try:
+        return datetime.strptime(f"{tokens[0]}_{tokens[1]}", "%Y-%m-%d_%H-%M-%S")
+    except ValueError:
+        return None
 
 
 def _collect_rollouts(path: Path) -> list[Path]:
@@ -282,6 +297,7 @@ def evaluate(npz_path: Path, verbose: bool = True) -> dict | None:
 
     return {
         "npz": npz_path.name,
+        "datetime": _parse_timestamp(npz_path),
         "use_ref": _uses_ref(npz_path),
         "gain": _npz_scalar(d, "gain"),
         "lookahead": _npz_scalar(d, "lookahead_time"),
