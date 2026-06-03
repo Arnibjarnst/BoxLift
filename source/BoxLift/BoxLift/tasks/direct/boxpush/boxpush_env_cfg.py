@@ -146,7 +146,7 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     future_obs_steps = (1,2,3,4,5)
     # Include previous raw residual action (6 dims) in the observation.
     include_prev_actions = True
-    observation_space = 13  # recomputed in __post_init__
+    observation_space = {"policy": 13, "privileged": 85}  # recomputed in __post_init__
     state_space = 0
 
     # Continuous phase variable with slowdown-only semantics. When True, action[6] controls
@@ -199,11 +199,12 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
         # Idempotent: always reset action_space/observation_space to base before recomputing.
         # Must be safe to call more than once (e.g. after hydra overrides).
         self.action_space = 7 if self.enable_phase_slowdown else 6
-        self.observation_space = self.per_step_feature_dim * self.obs_history_steps + 1
+        actor_dim = self.per_step_feature_dim * self.obs_history_steps + 1
         future_dim = 14 if self.include_absolute_obs else 7
-        self.observation_space += future_dim * len(self.future_obs_steps)
+        actor_dim += future_dim * len(self.future_obs_steps)
         if self.include_prev_actions:
-            self.observation_space += 6
+            actor_dim += 6
+        self.observation_space = {"policy": actor_dim, "privileged": 85}
 
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=physics_dt, render_interval=decimation, gravity=(0,0,-9.8))
@@ -295,7 +296,7 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     # Reference path (planner trajectory) is NOT affected. Reward path reads clean ground
     # truth via _get_obj_pos / _get_obj_quat. To disable: set obs_obj_delay_steps=0 and
     # obs_obj_update_period=1.
-    obs_obj_delay_steps = 13             # 260ms at 20ms env step
+    obs_obj_delay_steps = 5              # 100ms at 20ms env step
     obs_obj_update_period = 2            # 25Hz
 
     # Perturbation forces (for sim-to-real robustness)

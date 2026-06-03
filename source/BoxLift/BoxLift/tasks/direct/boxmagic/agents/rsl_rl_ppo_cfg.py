@@ -13,7 +13,7 @@ class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 1000
     save_interval = 100
-    experiment_name = "boxhinge"
+    experiment_name = "boxmagic"
     logger = "wandb"
     obs_groups = {"policy": ["policy"], "critic": ["policy", "privileged"]}
     policy = RslRlPpoActorCriticCfg(

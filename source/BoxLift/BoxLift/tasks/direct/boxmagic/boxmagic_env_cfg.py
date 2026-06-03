@@ -53,7 +53,7 @@ TABLE_CFG = RigidObjectCfg(
             friction_combine_mode="multiply"
         )
     ),
-    init_state=RigidObjectCfg.InitialStateCfg(pos=(0,0,-0.5 + 0.018))
+    init_state=RigidObjectCfg.InitialStateCfg(pos=(0,0,-0.5))
 )
 
 @configclass
@@ -138,11 +138,9 @@ class EventCfg:
     )
 
 @configclass
-class BoxhingeEnvCfg(DirectRLEnvCfg):
+class BoxmagicEnvCfg(DirectRLEnvCfg):
     # Trajectory file path
     trajectory_path = ""
-
-    emit_per_env_extras: bool = False
     # env
     # physics_dt * decimations needs to match dt from planner/IK
     physics_dt = 1.0 / 100.0
@@ -163,13 +161,9 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # the real robot). Reward path uses ground-truth velocity via _get_obj_vel and is
     # unaffected.
     include_object_obs = True
-    # Include absolute (world/env-frame) state alongside the relative (error) obs. Doubles the
-    # per-step feature dim and adds (pos (3) + quat (4)) per future_obs_steps entry for the
-    # absolute future reference obj pose.
-    include_absolute_obs = True
+
     # Future reference obj pose look-ahead: list of phase offsets (in env steps) to include
     # as (pos_delta (3) + quat_delta (4)) relative to the reference at the current phase.
-    # If include_absolute_obs, also appends absolute (pos (3) + quat (4)) per offset.
     # Empty tuple = disabled.
     future_obs_steps = (1,2,3,4,5)
     # Include previous raw residual action (6 dims) in the observation.
@@ -211,15 +205,6 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # Also scale track by dphase → all per-step reward vanishes at dphase=0.
     track_scale_by_dphase: bool = True
 
-    # Hard cap on per-episode wall-clock length, in simulator steps. When set (>0), the
-    # episode terminates by time_out after this many steps regardless of phase progress,
-    # AND t0 sampling in _reset_idx is restricted to [0, T-1-L] so an episode at full
-    # speed can run for L steps without falling off the trajectory. The combination gives
-    # roughly uniform state visitation across the trajectory (each state t is visited
-    # with probability ~ min(L, t+1) / (T-L+1) instead of (t+1)/(T-1) under the default).
-    # -1 disables the cap (use full trajectory length, the behavior before this flag).
-    max_episode_steps: int = -1
-
     # Continue the episode for this many seconds after the trajectory phase reaches its
     # end. During the hold, phase stays clamped at max so the reference targets stay at
     # the trajectory's final pose, and the policy keeps receiving rewards for maintaining
@@ -229,32 +214,13 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # penalty). 0.0 disables the hold (legacy behavior — terminate as soon as phase ends).
     post_traj_hold_s: float = 2.0
 
-    # Probability that a reset overrides RSI/failure-resampling and starts at phase=0
-    # instead. Pure RSI samples phase=0 with probability ~1/T (where T is trajectory
-    # length, often <1%), but deployment ALWAYS starts at 0 — so the start of the
-    # trajectory is heavily under-trained. Setting this to 0.05 gives the start ~5×
-    # the training exposure it would otherwise get. Useful when the policy oscillates
-    # on the real robot during initial-approach motion. 0.0 disables the override.
-    reset_to_zero_prob: float = 0.05
-
-    # Failure-aware phase resampling: biases episode start phases toward segments with
-    # high historical failure rate. Credits are assigned to the segment each episode
-    # STARTED in (not where it failed), which matches the RSI lever we actually control.
-    enable_failure_resampling = False
-    phase_segment_s = 1.0                    # segment duration in seconds; num segments = ceil((T-1)*dt / phase_segment_s)
-    phase_resample_alpha = 0.05              # per-event EMA weight
-    phase_resample_beta = 1.0                # temperature: p_s ∝ r_s^beta
-    phase_resample_clamp = (0.1, 0.9)        # (low, high) bounds on each r_s
-
     @property
     def per_step_feature_dim(self) -> int:
         # 12: relative joint pos (6) + relative joint vel (6) — always present.
         # If include_object_obs: + 7 (obj pos 3 + obj quat 4).
         # If include_absolute_obs: doubles the whole thing (joint and obj parts mirrored).
         # If include_contact_obs: + 1 (EE-cube thresholded contact bool, not mirrored).
-        dim = 12 + (7 if self.include_object_obs else 0)
-        if self.include_absolute_obs:
-            dim *= 2
+        dim = 12 + (14 if self.include_object_obs else 0)
         if self.include_contact_obs:
             dim += 1
         return dim
@@ -264,8 +230,7 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
         # Must be safe to call more than once (e.g. after hydra overrides).
         self.action_space = 7 if self.enable_phase_slowdown else 6
         actor_dim = self.per_step_feature_dim * self.obs_history_steps + 1
-        future_dim = 14 if self.include_absolute_obs else 7
-        actor_dim += future_dim * len(self.future_obs_steps)
+        actor_dim += 14 * len(self.future_obs_steps)
         if self.include_prev_actions:
             actor_dim += 6
         self.observation_space = {"policy": actor_dim, "privileged": 85}
@@ -301,26 +266,6 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
         "wrist_3_joint": 28.0,
     }
 
-    # Action formulation. One of:
-    #   "A" — joints_target[t] + action_scale * action
-    #         Residual on the planner's absolute target.
-    #   "B" — joints[t] + action_scale * action
-    #         Residual on the planner's trajectory position (planner feedforward not applied).
-    #   "C" — curr_joints + action_scale * action
-    #         Residual on the robot's current joint position (no planner info).
-    #   "D" — curr_joints + (joints_target[t] - joints[t]) + action_scale * action
-    #         Planner's intended PD error (force direction) applied from current position,
-    #         plus learned residual. Effective PD error is independent of tracking state.
-    # Mode A chosen after observing mode B + VOC (kp=1000) struggle to learn: tracking
-    # peaked at 0.72 then regressed below the action_scale=0 baseline (0.65). Mode B's
-    # learning problem is "discover FF from scratch under weak gradient signal", which
-    # PPO didn't solve in this setup. Mode A's planner FF gives good baseline tracking
-    # at residual=0; the policy only needs small corrections on top — a friendlier RL
-    # problem. The earlier mode A + VOC failure (erratic motion) was driven by the
-    # combination of high reset noise + VOC yanking the cube; with reset_joint_pos_noise
-    # halved that interaction is much milder.
-    action_mode = "B"
-
     # Action scale
     action_scale: float | list = 0.05
 
@@ -334,26 +279,9 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     replicate_physics = bool(np.all([event["mode"] != "prestartup" and event["mode"] != "startup" for event in events.to_dict().values()])) # type: ignore
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=4.0, replicate_physics=replicate_physics)
 
-    # Reset noise (for sim-to-real robustness). Per-joint (length 6, ordered shoulder_pan,
-    # shoulder_lift, elbow, wrist_1, wrist_2, wrist_3). Wrist joints have small Jacobians on
-    # EE position, so they can absorb more noise without dragging the EE far from the
-    # trajectory. Scalar still works (broadcasts across all 6 joints).
-    # Halved for VOC training. Mode B without FF needs the controller (kp=300) to recover
-    # from initial offset before the trajectory diverges; large initial noise compounds
-    # with the FF-lag problem. Re-widen once the policy is reliably tracking.
-    # Restored to original values (Step 2 sim2real). Halved during VOC-curriculum
-    # bring-up because mode B without FF couldn't recover from large initial joint
-    # offsets fast enough; with the policy now trained and VOC mostly decayed, the
-    # original spread (which simulates a wider band of real-robot startup states) is
-    # appropriate.
-    reset_joint_pos_noise = [0.1, 0.1, 0.1, 0.2, 0.2, 0.2]
-    reset_joint_vel_noise = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
-
     # Box reset noise: xy-plane for translation / linear vel; small 3-axis rotation + ang vel.
     reset_obj_pos_xy_noise = 0.02        # m, std on box x,y position (z unchanged)
-    reset_obj_lin_vel_xy_noise = 0.05    # m/s, std on box linear x,y velocity (z unchanged)
     reset_obj_ori_noise = 0.1            # rad, axis-angle std for small orientation perturbation
-    reset_obj_ang_vel_noise = 0.1        # rad/s, std on box angular velocity (z axis)
 
     # Box observation noise (sim2real). Sampled fresh each step, applied ONLY to the
     # observation path — rewards still see the clean ground-truth box state. Same noise
@@ -409,27 +337,6 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     w_track = 1 - w_task
     w_regularization = 1.0
 
-    # Curriculum ("α schedule"). α ramps linearly from 0 to 1 over alpha_warmup_steps env
-    # steps; 0 disables the curriculum (α=1 always). Drives three coupled shifts:
-    #   1) (w_task, w_track) interpolate (w_task_start, w_track_start) → (w_task, w_track).
-    #   2) In action_mode == "D" only: the action command blends
-    #        q_curr + (1-α)·(ref_target - ref_pos) + (α + ε(1-α))·scale·a
-    #      where ε = action_alpha_floor keeps a minimum action authority at α=0.
-    #   3) In action_mode == "D" only: the policy-authored regularization terms
-    #      (action_rate, action_norm) are scaled by (α + ε(1-α)) so the penalty
-    #      tracks the action's actual effect on the env. Safety penalties (joint_limit,
-    #      illegal_contact, flange_forearm, proximity, joint_acc, torque) stay unscaled.
-    alpha_warmup_steps = 24 * 0
-    w_task_start = 0.7
-    w_track_start = 0.3
-    action_alpha_floor = 0.1
-    # Optional fixed-α override. When set (≥ 0), bypasses the schedule and uses this value
-    # everywhere _curriculum_alpha() is consulted. Intended for eval: play.py / record.py
-    # compute the training-final α from the checkpoint and pin it so the frozen policy runs
-    # in the same regime it was trained at (critical for mode D, where α controls the
-    # action blend between planner feedforward and learned residual).
-    force_alpha: float = -1
-
     # === Task reward aggregation form ===
     # "sum"     — legacy: rew_task = w_pos·exp(-d²/σ²) + w_quat·exp(-d²/σ²) + vel terms.
     #             Policy can compensate one bad axis with another good one.
@@ -468,16 +375,6 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     sigma_eef_pos = 0.03    # 1cm err: 0.89; 3cm err: 0.37
     tol_eef_pos = 0.0
 
-    w_eef_quat = 0.0
-    sigma_eef_quat = 0.2    # 10° err: 0.79; 25° err: 0.20
-    tol_eef_quat = 0.1
-
-    w_joint_pos = 0.0
-    # Tuned for the per-joint averaged kernel (r_bc form). At σ=0.1, a single joint with
-    # 0.1 rad error gives kernel = exp(-0.01/0.01) ≈ 0.37; 0.2 rad gives ≈ 0.018. Was 0.2
-    # under the old sum-then-kernel form; not equivalent — this is the per-joint scale.
-    sigma_joint_pos = 0.1
-    tol_joint_pos = 0.0
 
     # Relative EE-box tracking: rewards matching the reference's EE-position-in-box-frame
     # (and optionally quat). Only active during reference-trajectory segments where the
@@ -486,28 +383,15 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # unachievable if the box is flipped from the reference. The gate is a precomputed
     # boolean mask derived from |obj_vel_ref| > eps, dilated by ±dilation_steps so it
     # captures brief pre-contact approach and post-release follow-through.
-    w_eef_box_rel_pos = 0.7
-    sigma_eef_box_rel_pos = 0.05
+    w_eef_box_rel_pos = 1.0
+    sigma_eef_box_rel_pos = 0.1
     tol_eef_box_rel_pos = 0.0
-
-    w_eef_box_rel_quat = 0.3
-    sigma_eef_box_rel_quat = 0.5
-    tol_eef_box_rel_quat = 0.0
 
     # Gate parameters: a reference step is "active" if ||obj_vel_lin|| + ||obj_vel_ang||
     # > eps, then dilated by ±dilation_steps (in policy steps).
     eef_box_gate_obj_vel_eps = 1e-3
     eef_box_gate_dilation_steps = 1e7 # everything
 
-    # RSI (random start init) contact exclusion. The set of trajectory phases that count
-    # as "in contact" for RSI sampling is the raw |obj_vel_ref| > eef_box_gate_obj_vel_eps
-    # mask, dilated by this many integer steps in each direction. INDEPENDENT of
-    # eef_box_gate_dilation_steps — that one controls reward shaping, this one controls
-    # which start phases the env will reset to.
-    #
-    # Resetting mid-contact tends to put the EE inside the box (after joint reset noise)
-    # and snap-resolves into weird states, so we forbid it. 0 = use the raw boolean mask.
-    rsi_contact_dilation_steps = 5
 
     # Regularization reward parameters
     w_joint_acc = 2e-4
@@ -585,15 +469,6 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     table_contact_filter.append(f"{ur5e_prim_path}/wrist_3_link/")
 
     illegal_contact_sensor_cfgs = {
-        # "cube": ContactSensorCfg(
-        #     prim_path=cube_cfg.prim_path,
-        #     update_period=0.0,
-        #     history_length=0,
-        #     debug_vis=True,
-        #     force_threshold=min_contact_force,
-        #     max_contact_data_count_per_prim=16,
-        #     filter_prim_paths_expr=cube_contact_filter
-        # ),
         "table": ContactSensorCfg(
             prim_path=table_cfg.prim_path,
             update_period=0.0,
@@ -625,21 +500,26 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # back; tight thresholds would terminate episodes before that recovery completes.
     max_obj_dist_from_traj = 0.2
     max_obj_angle_from_traj = 10000 # just continue if we fail lifting until end
+    # Independent EE-position-tracking reset: terminate if the end-effector is more than
+    # this many meters from its reference position. Catches runaway robot states that
+    # don't yet show up in the cube-distance check (e.g., the policy diverging while the
+    # cube is held in place by VOC). Set to a large value to disable.
+    max_eef_dist_from_traj = 0.4
 
     # === Virtual Object Controller (VOC) curriculum ===
     # DexMachina-style assist: a virtual PD controller drives the cube along its reference
     # trajectory while the policy learns the contact pattern; gain decays exponentially as
     # the policy meets reward thresholds, eventually handing off full control. See
-    # `_apply_voc` and `_voc_decay_check` in boxhinge_env.py for the runtime logic.
+    # `_apply_voc` and `_voc_decay_check` in boxmagic_env.py for the runtime logic.
     voc_enabled: bool = True
     # Translational stiffness chosen so the controller can overpower gravity at typical
     # tracking offsets. For a 4.4 kg box, gravity ≈ 43 N; at 1000 N/m a 5 cm error gives
     # 50 N — comfortably above gravity, so the VOC dominates object dynamics during the
     # high-gain phase. Tune up if the box still droops; tune down if the controller
     # overshoots / oscillates against contact.
-    voc_kp_pos: float = 1000.0    # N/m, initial translational stiffness
-    voc_kp_rot: float = 100.0     # Nm/rad, initial rotational stiffness
-    voc_kp_min: float = 10        # absolute floor; below this kp/kv set to zero
+    voc_kp_pos: float = 100.0    # N/m, initial translational stiffness
+    voc_kp_rot: float = 10.0     # Nm/rad, initial rotational stiffness
+    voc_kp_min: float = 1        # absolute floor; below this kp/kv set to zero
     # Critical-damping multipliers: kv = scale · sqrt(kp · effective_inertia).
     voc_kv_pos_scale: float = 2.0
     voc_kv_rot_scale: float = 2.0
@@ -678,7 +558,7 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
 def get_ur5e_cfg(
     prim_path,
     init_pose,
-    cfg: BoxhingeEnvCfg,
+    cfg: BoxmagicEnvCfg,
 ):
     actuator_kwargs = dict(
         joint_names_expr=[".*"],

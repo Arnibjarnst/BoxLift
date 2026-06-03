@@ -108,7 +108,7 @@ desired_box_marker = VisualCuboid(
 ) if args.simulate else None
 
 
-usd_path = "./robots/ur5e_sphere.usd" if dual_arm else "./robots/ur5e.usd"
+usd_path = "./robots/ur5e.usd"
 
 arms = []
 for name in arm_names:
@@ -129,10 +129,10 @@ for name, ee_poses in zip(arm_names, ee_poses_list):
     )
     ee_markers.append(marker)
 
-# kps = np.ones(6, dtype=np.float32) * 150.0
-kps = np.array([800, 600, 300, 200, 100, 100])
+kps = np.ones(6, dtype=np.float32) * 150.0
+# kps = np.array([800, 600, 300, 200, 100, 100])
 kds = np.ones(6, dtype=np.float32) * 22.5
-kds = kps * 0.1
+# kds = kps * 0.1
 
 
 

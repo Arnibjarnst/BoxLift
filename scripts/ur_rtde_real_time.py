@@ -16,6 +16,31 @@ import onnxruntime as ort
 from rtde_control import RTDEControlInterface as RTDEControl
 from rtde_receive import RTDEReceiveInterface as RTDEReceive
 
+
+class RTDEArm:
+    """Per-arm RTDE connections and trajectory arrays."""
+    def __init__(self, name: str, ip: str, joints_ref, joints_target, joint_vel_ref, frequency: int):
+        self.name = name
+        self.ip = ip
+        self.joints_ref = joints_ref
+        self.joints_target = joints_target
+        self.joint_vel_ref = joint_vel_ref
+        self.rtde_r = RTDEReceive(ip, frequency)
+        self.rtde_c = RTDEControl(ip, frequency, RTDEControl.FLAG_VERBOSE | RTDEControl.FLAG_UPLOAD_SCRIPT)
+
+    def get_q(self) -> np.ndarray:
+        return np.array(self.rtde_r.getActualQ())
+
+    def get_qd(self) -> np.ndarray:
+        return np.array(self.rtde_r.getActualQd())
+
+    def stop(self):
+        for fn in (self.rtde_c.servoStop, self.rtde_c.stopScript, self.rtde_c.stopJ):
+            try:
+                fn()
+            except Exception:
+                pass
+
 # Make tag_pose_estimation importable regardless of pip-install state.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _TAG_POSE_DIR = _REPO_ROOT / "tag_pose_estimation"
@@ -117,6 +142,7 @@ contact_obs_delay_steps = int(env_cfg.get("contact_obs_delay_steps", 0))
 # Bit-flip noise from training — not applied at deployment (we want clean readings) but
 # kept here so the obs schema is identical. flip_prob is read but not used.
 contact_obs_flip_prob = float(env_cfg.get("contact_obs_flip_prob", 0.0))
+use_reference_obs = bool(env_cfg.get("use_reference_obs", True))
 enable_phase_slowdown = bool(env_cfg.get("enable_phase_slowdown", False))
 # Phase-slowdown / mode-D curriculum settings. Sentinel <0 on force_alpha disables the
 # override; 1.0 ≈ "training completed warmup" which is what we usually want at deploy.
@@ -372,14 +398,16 @@ if os_used == "win32":  # Windows (either 32-bit or 64-bit)
     process.nice(psutil.REALTIME_PRIORITY_CLASS)
 
 if args.real_robot:
-    # Single Robot
-    robot_ip = "192.168.1.100"
+    robot_ip_l = "192.168.1.100"
+    if dual_arm:
+        robot_ip_l = "192.168.1.33"
+        robot_ip_r = "192.168.1.66"
+elif os_used == "win32":
+    robot_ip_l = "172.29.144.1"
+    robot_ip_r = "172.29.144.2"
 else:
-    if os_used == "win32":
-        robot_ip = "172.29.144.1"
-    else:
-        robot_ip = "192.168.56.1"
-
+    robot_ip_l = "192.168.56.101"
+    robot_ip_r = "192.168.56.102"
 
 rtde_frequency = 500
 dt = 1 / rtde_frequency
@@ -387,11 +415,24 @@ policy_decimation = 10
 max_steps = (len(joints) - 2) * policy_decimation
 max_wallclock_steps = max_steps * 2
 
+# Global arms list (1 or 2 RTDEArm objects). All non-IsaacSim control goes through this.
+arms: list[RTDEArm] = []
+
 if not args.isaacsim:
-    logger.info(f"Connecting to robot at {robot_ip}", extra={"step": -1})
-    rtde_r = RTDEReceive(robot_ip, rtde_frequency)
-    print("RTDE_r connected successfully")
-    rtde_c = RTDEControl(robot_ip, rtde_frequency, RTDEControl.FLAG_VERBOSE | RTDEControl.FLAG_UPLOAD_SCRIPT)
+    logger.info(f"Connecting to left arm at {robot_ip_l}", extra={"step": -1})
+    arm_l = RTDEArm("left", robot_ip_l, joints, joints_target, joint_vel_ref, rtde_frequency)
+    arms.append(arm_l)
+    logger.info("Left arm connected", extra={"step": -1})
+
+    if dual_arm:
+        logger.info(f"Connecting to right arm at {robot_ip_r}", extra={"step": -1})
+        arm_r = RTDEArm("right", robot_ip_r, joints_r, traj["joints_target_r"], joint_vel_r, rtde_frequency)
+        arms.append(arm_r)
+        logger.info("Right arm connected", extra={"step": -1})
+
+    # Convenience aliases kept for the IsaacSim-legacy path and log() calls.
+    rtde_r = arms[0].rtde_r
+    rtde_c = arms[0].rtde_c
 else:
     rtde_r = None
     rtde_c = None
@@ -399,9 +440,9 @@ else:
 logger.info("Connection established", extra={"step": -1})
 
 if not args.isaacsim:
-    # Attempt to clear errors and reset robot state
     logger.info("Resetting robot state", extra={"step": -1})
-    rtde_c.reuploadScript()
+    for arm in arms:
+        arm.rtde_c.reuploadScript()
 
 np.set_printoptions(suppress=True, precision=8)
 
@@ -486,17 +527,25 @@ def save_tracking_npz():
             policy_dphase=np.array([d["dphase"] for d in policy_snapshot]),
         )
 
+    # Arm base poses from the reference trajectory — required by visualize_traj.py to
+    # place the robot bases in IsaacSim. Save whichever keys exist in the traj file.
+    arm_pose_arrays = {}
+    if "arm_l_pose" in traj:
+        arm_pose_arrays["arm_l_pose"] = np.asarray(traj["arm_l_pose"])
+    if "arm_r_pose" in traj:
+        arm_pose_arrays["arm_r_pose"] = np.asarray(traj["arm_r_pose"])
+    if "arm_pose" in traj:
+        arm_pose_arrays["arm_pose"] = np.asarray(traj["arm_pose"])
+
     np.savez(
         tracking_npz_path,
-        # Source sample period (s) for the 500 Hz arrays so downstream visualizers
-        # don't have to assume 500Hz.
         src_dt=np.float64(dt),
-        # Control ticks per policy step — multiply by this to map policy_iter to
-        # the corresponding control step index.
         policy_decimation=np.int32(policy_decimation),
+        dual_arm=np.bool_(dual_arm),
         gain=gain,
         lookahead_time=lookahead_time,
         action_scale=action_scale,
+        **arm_pose_arrays,
         **arrays,
     )
     logger.info(
@@ -506,79 +555,63 @@ def save_tracking_npz():
     )
 
 def log(i, target_q, phase):
-    actual_q = np.array(rtde_r.getActualQ())
-    # Joint velocities at 500 Hz — used both for the velocity safety check below
-    # and stored in tracking_log so analysis can recover the velocity at the
-    # exact moment the policy thread sampled state (decimate to 50 Hz).
-    actual_qd = np.array(rtde_r.getActualQd())
+    # Concatenate state from all arms (6 dims each → 6 or 12 dims total).
+    actual_q  = np.concatenate([arm.get_q()  for arm in arms])
+    actual_qd = np.concatenate([arm.get_qd() for arm in arms])
 
-    # External wrench at the TCP in the UR base frame: [Fx, Fy, Fz, Tx, Ty, Tz].
-    # The UR controller computes this from joint-torque sensing — useful for
-    # detecting contact events and correlating force spikes with policy actions.
-    tcp_force = np.array(rtde_r.getActualTCPForce(), dtype=np.float32)
-
-    # Per-joint torque proxy for the directTorque comparison. MUST come from the
-    # RECEIVE interface (rtde_r), never the control interface. rtde_c.getJointTorques()
-    # is a blocking round-trip over the same control channel servoJ() uses — calling
-    # it every 500 Hz tick contends with the servo stream and jitters the reference.
-    # waitPeriod() hides this from the loop-time check because it normalizes the
-    # *period*, not the servoJ send *phase*. rtde_r.* getters are free local reads of
-    # the streamed RTDE packet, so they don't perturb the control timing.
-    # target_moment = controller's commanded joint torque [Nm] (core RTDE register).
-    # getActualCurrentAsTorque is firmware-dependent, so guard it and NaN-fill.
-    target_moment = np.array(rtde_r.getTargetMoment(), dtype=np.float32)
+    tcp_force = np.concatenate([
+        np.array(arm.rtde_r.getActualTCPForce(), dtype=np.float32) for arm in arms
+    ])
+    target_moment = np.concatenate([
+        np.array(arm.rtde_r.getTargetMoment(), dtype=np.float32) for arm in arms
+    ])
     try:
-        current_as_torque = np.array(
-            rtde_r.getActualCurrentAsTorque(), dtype=np.float32
-        )
+        current_as_torque = np.concatenate([
+            np.array(arm.rtde_r.getActualCurrentAsTorque(), dtype=np.float32) for arm in arms
+        ])
     except Exception:
-        current_as_torque = np.full(6, np.nan, dtype=np.float32)
+        current_as_torque = np.full(len(arms) * 6, np.nan, dtype=np.float32)
 
-    # Reference is the trajectory interpolated at the exact phase the policy thread
-    # produced for this servo tick (control thread linearly blends previous→current).
-    expected_q = interp_np(joints, phase)
+    # Reference trajectory at the current phase (concatenated across arms).
+    expected_q = np.concatenate([interp_np(arm.joints_ref, phase) for arm in arms])
 
-    # Reuse the box pose the policy thread last fetched, instead of polling the
-    # listener again on every 500 Hz servoJ tick.
     with data_lock:
-        actual_obj_pos = current_actual_obj_pos.copy()
+        actual_obj_pos  = current_actual_obj_pos.copy()
         actual_obj_quat = current_actual_obj_quat.copy()
 
     if i >= 0:
         tracking_log.append({
             "step": i,
             "phase": float(phase),
-            "actual_q": actual_q.copy(),
+            "actual_q":  actual_q.copy(),
             "actual_qd": actual_qd.copy(),
             "expected_q": expected_q.copy(),
             "target_q": np.array(target_q).copy(),
-            "actual_obj_pos": actual_obj_pos.copy(),
+            "actual_obj_pos":  actual_obj_pos.copy(),
             "actual_obj_quat": actual_obj_quat.copy(),
-            "tcp_force": tcp_force.copy(),
-            "target_moment": target_moment.copy(),
+            "tcp_force":        tcp_force.copy(),
+            "target_moment":    target_moment.copy(),
             "current_as_torque": current_as_torque.copy(),
         })
 
     tracking_error = np.linalg.norm(actual_q - expected_q)
 
-    robot_mode = rtde_r.getRobotMode()
-    safety_mode = rtde_r.getSafetyMode()
+    for arm in arms:
+        safety_mode = arm.rtde_r.getSafetyMode()
+        robot_mode  = arm.rtde_r.getRobotMode()
+        if safety_mode != 1:
+            logger.error(
+                f"[{arm.name}] Robot left NORMAL safety mode. safety_mode={safety_mode}",
+                extra={"step": i},
+            )
+            raise RuntimeError("Robot safety event")
+        if robot_mode != 7:
+            logger.error(
+                f"[{arm.name}] Robot not running. robot_mode={robot_mode}",
+                extra={"step": i},
+            )
+            raise RuntimeError("Robot stopped")
 
-    if safety_mode != 1:  # 1 = NORMAL
-        logger.error(
-            f"Robot left NORMAL safety mode. safety_mode={safety_mode}",
-            extra={"step": i},
-        )
-        raise RuntimeError("Robot safety event")
-
-    if robot_mode != 7:  # 7 = RUNNING
-        logger.error(
-            f"Robot not running. robot_mode={robot_mode}",
-            extra={"step": i},
-        )
-        raise RuntimeError("Robot stopped")
-
-    # Safety: check tracking error
     if i >= 0 and tracking_error > max_tracking_error:
         logger.error(
             f"Tracking error {tracking_error:.4f} exceeds limit {max_tracking_error}",
@@ -586,7 +619,6 @@ def log(i, target_q, phase):
         )
         raise RuntimeError("Tracking error too large")
 
-    # Safety: check joint velocities (actual_qd was read at the top of log())
     max_vel = np.max(np.abs(actual_qd))
     if max_vel > max_joint_velocity:
         logger.error(
@@ -622,46 +654,35 @@ joint_limits_upper = np.array([ 2*np.pi,  2*np.pi,  np.pi,  2*np.pi,  2*np.pi,  
 # ---------------------------
 if not args.isaacsim:
     try:
-        logger.info(
-            f"moveJ to initial position {joints[0]}",
-            extra={"step": -1},
-        )
+        for arm in arms:
+            logger.info(f"[{arm.name}] moveJ to initial position {arm.joints_ref[0]}", extra={"step": -1})
+        # Command all arms to start simultaneously (non-blocking async=True), then wait.
+        for arm in arms:
+            last_t = time.perf_counter()
+            success = arm.rtde_c.moveJ(arm.joints_ref[0], 0.5, 1.0, True)
+            while not success:
+                if time.perf_counter() - last_t > 5:
+                    raise TimeoutError(f"[{arm.name}] Timed out moving to initial position")
+                success = arm.rtde_c.moveJ(arm.joints_ref[0], 0.5, 1.0, True)
+                time.sleep(dt)
 
-        last_time = time.perf_counter()
-
-        success = rtde_c.moveJ(joints[0], 0.5, 1.0, True)
-        while not success:
-            curr_time = time.perf_counter()
-            success = rtde_c.moveJ(joints[0], 0.5, 1.0, True)
-            if curr_time - last_time > 5:
-                raise TimeoutError("Ran out of time getting to initial position")
-
+        # Wait until all arms are steady.
+        while any(not arm.rtde_c.isSteady() for arm in arms):
+            log(-1, np.concatenate([arm.joints_ref[0] for arm in arms]), 0.0)
             time.sleep(dt)
 
-        last_time = time.perf_counter()
-
-        while rtde_c.isSteady() == False:
-            log(-1, joints[0], 0.0)
-
-            # No need to be accurate
-            time.sleep(dt)
-
-        logger.info(
-            f"moveJ finished to initial position {joints[0]}",
-            extra={"step": -1},
-        )
+        logger.info("moveJ finished to initial positions", extra={"step": -1})
     except KeyboardInterrupt:
-
-        logger.warning(
-            "Execution interrupted by user",
-            extra={"step": -1},
-        )
-
+        logger.warning("Execution interrupted by user", extra={"step": -1})
     finally:
-        rtde_c.stopJ()
+        for arm in arms:
+            try:
+                arm.rtde_c.stopJ()
+            except Exception:
+                pass
 
 if not args.isaacsim:
-    current_target_q = np.array(rtde_r.getActualQ())
+    current_target_q = np.concatenate([arm.get_q() for arm in arms])
 else:
     current_target_q = np.asarray(joints[0], dtype=np.float64)
 previous_target_q = np.copy(current_target_q)
@@ -671,15 +692,19 @@ previous_target_q = np.copy(current_target_q)
 # arm pose but is roughly constant at this initial pose; subtracting this baseline
 # leaves ||delta|| as a usable proxy for external contact force.
 # Only meaningful when include_contact_obs is set and RTDE is connected.
-tcp_force_baseline = np.zeros(6, dtype=np.float64)
-if include_contact_obs and not args.isaacsim and rtde_r is not None:
-    logger.info("Sampling TCP force baseline (50 readings)...", extra={"step": -1})
-    samples = np.array([rtde_r.getActualTCPForce() for _ in range(50)])
-    tcp_force_baseline = samples.mean(axis=0)
-    logger.info(
-        f"TCP force baseline (Fxyz, Txyz) = {tcp_force_baseline.round(3).tolist()}",
-        extra={"step": -1},
-    )
+# Per-arm TCP force baselines (6-dim each). Indexed as tcp_force_baselines[arm_idx].
+tcp_force_baselines = [np.zeros(6, dtype=np.float64) for _ in arms]
+if include_contact_obs and not args.isaacsim and arms:
+    for idx, arm in enumerate(arms):
+        logger.info(f"[{arm.name}] Sampling TCP force baseline (50 readings)...", extra={"step": -1})
+        samples = np.array([arm.rtde_r.getActualTCPForce() for _ in range(50)])
+        tcp_force_baselines[idx] = samples.mean(axis=0)
+        logger.info(
+            f"[{arm.name}] TCP force baseline = {tcp_force_baselines[idx].round(3).tolist()}",
+            extra={"step": -1},
+        )
+# Single-arm legacy alias.
+tcp_force_baseline = tcp_force_baselines[0] if tcp_force_baselines else np.zeros(6, dtype=np.float64)
 # Float trajectory phase (matches the policy thread's `phase` variable). Updated under
 # data_lock by the policy thread; the control thread blends previous→current the same
 # way as target_q so we can compute the exact expected reference at any servo tick.
@@ -791,157 +816,140 @@ def policy_thread():
     global current_target_q, previous_target_q, current_phase, previous_phase
     global current_actual_obj_pos, current_actual_obj_quat
     global ood_reason
-    # Float phase to support enable_phase_slowdown. Indexed via floor() into trajectory
-    # arrays. For legacy (no-slowdown) policies dphase=1 each step → phase increments by 1
-    # → indexing matches the old integer trajectory_step behavior exactly.
+
     phase = 0.0
-    # Per-step feature dim must match training: joints (12 or 24 for dual-arm)
-    # [+ 13 for object state (rel_pos 3 + rel_quat 4 + rel_vel 6) if include_object_obs]
-    # [+ same again (absolute versions) if include_absolute_obs].
+
+    # Compute per-step obs dim to match the env's __post_init__ logic.
+    base_pose = 7  # 3 pos + 4 quat
+    n_joints = len(arms) * 6  # 6 or 12
     if dual_arm:
-        per_step_features = 24
-        if include_object_obs:
-            raise NotImplementedError("include_object_obs with dual-arm is not supported in the real-robot script yet.")
-        if include_absolute_obs:
-            raise NotImplementedError("include_absolute_obs with dual-arm is not supported in the real-robot script yet.")
+        if use_reference_obs:
+            per_step_features = (n_joints + n_joints + base_pose   # rel_q + rel_qd + rel_obj
+                                 + n_joints + n_joints + base_pose  # abs_q + abs_qd + abs_obj
+                                 + 2)                                # contact (one per arm)
+        else:
+            per_step_features = (n_joints + n_joints + base_pose   # abs_q + abs_qd + abs_obj
+                                 + 2)                                # contact
     else:
-        # 12 = relative joint pos (6) + relative joint vel (6); always present.
-        # +7 (pos+quat) if include_object_obs.
         per_step_features = 12 + (7 if include_object_obs else 0)
         if include_absolute_obs:
             per_step_features *= 2
         if include_contact_obs:
             per_step_features += 1
-    # Observation history buffer: (history_steps, per_step_features). Zero-initialized to
-    # match sim reset behavior.
+
     obs_history = np.zeros((obs_history_steps, per_step_features), dtype=np.float32)
-    # Previous raw policy action (pre-scale), fed back into obs when include_prev_actions=True.
-    prev_action = np.zeros(6, dtype=np.float32)
-    max_traj_idx = len(joints) - 1
-    # Phase history (length delay+1), newest-last. Each policy iteration appends the current
-    # phase; the box obs uses index 0 (oldest) as the phase that was current `obs_obj_delay_steps`
-    # iterations ago — matching the env's obj_phase_delay_buf so the rel pose comparison is
-    # temporally aligned with the (already-delayed) tracker measurement.
+    prev_action = np.zeros(n_joints, dtype=np.float32)
+    max_traj_idx = len(arms[0].joints_ref) - 1
     phase_history = np.zeros(obs_obj_delay_steps + 1, dtype=np.float32)
-    # Note: no software contact-delay buffer here. The training-side
-    # contact_obs_delay_steps exists to simulate the real TCP force sensor's intrinsic
-    # latency (~10-30ms) — at deployment that latency is already physically present in
-    # getActualTCPForce(), so applying additional software delay would double-shift it.
-    # The --isaacsim path (which has no physical delay) does apply the buffer.
-    policy_iter = 0  # row index in policy_log; aligns 50 Hz obs/action data to the 500 Hz tracking_log
+    policy_iter = 0
+
     while True:
         run_policy_event.wait()
         run_policy_event.clear()
 
-        actual_q = np.array(rtde_r.getActualQ())
-        actual_qd = np.array(rtde_r.getActualQd())
-        traj_idx = min(int(np.floor(phase)), max_traj_idx)  # integer floor, used only for logging
+        # Read all arm states simultaneously (serial reads are fast local RTDE packet reads).
+        qs  = [arm.get_q()  for arm in arms]
+        qds = [arm.get_qd() for arm in arms]
+
+        traj_idx = min(int(np.floor(phase)), max_traj_idx)
         phase_obs = np.array([phase / max_traj_idx])
 
-        # Fetch the latest box pose once per policy step. Reused both for the obs
-        # (when include_object_obs is on) and by the 500 Hz log thread via the
-        # current_actual_obj_* globals set under data_lock below.
         actual_obj_pos = None
         actual_obj_quat = None
         if pose_listener is not None:
             box_pose = real_to_sim_pose(pose_listener.get_pose(BOX_BOARD_ID))
             if box_pose is not None:
-                actual_obj_pos = box_pose[:3].astype(np.float32)
+                actual_obj_pos  = box_pose[:3].astype(np.float32)
                 actual_obj_quat = box_pose[3:].astype(np.float32)
 
-        # Roll phase history newest-last and stash the current phase. We do this BEFORE
-        # building obs so phase_history[0] is the phase from delay_steps iterations ago.
         phase_history = np.roll(phase_history, -1)
         phase_history[-1] = phase
         delayed_phase = float(phase_history[0])
 
-        # Interpolate trajectory references at the current float phase, matching the env's
-        # _interp / _nlerp so the policy sees consistent conventions in sim and real.
-        joints_at_phase        = interp_np(joints,        phase)
-        joints_target_at_phase = interp_np(joints_target, phase)
-        joint_vel_at_phase     = interp_np(joint_vel_ref, phase)
-        obj_pos_at_phase       = interp_np(obj_poses_ref[:, :3], phase)
-        obj_quat_at_phase      = nlerp_np(obj_poses_ref[:, 3:], phase)
-        # Reference at the *delayed* phase — temporally aligned with the (delayed) tracker
-        # measurement. Used to compute relative box obs in the same way the trained env did.
-        obj_pos_at_delayed     = interp_np(obj_poses_ref[:, :3], delayed_phase)
-        obj_quat_at_delayed    = nlerp_np(obj_poses_ref[:, 3:], delayed_phase)
+        obj_pos_at_phase   = interp_np(obj_poses_ref[:, :3], phase)
+        obj_quat_at_phase  = nlerp_np(obj_poses_ref[:, 3:],  phase)
+        obj_pos_at_delayed = interp_np(obj_poses_ref[:, :3], delayed_phase)
+        obj_quat_at_delayed = nlerp_np(obj_poses_ref[:, 3:], delayed_phase)
+
+        # Per-arm reference interpolations.
+        ref_q      = [interp_np(arm.joints_ref,    phase) for arm in arms]
+        ref_target = [interp_np(arm.joints_target, phase) for arm in arms]
+        ref_qd     = [interp_np(arm.joint_vel_ref, phase) for arm in arms]
+
+        # Build object obs (shared across single/dual arm).
+        use_actual_obj = actual_obj_pos is not None
+        if use_actual_obj:
+            rel_obj_pos  = actual_obj_pos - obj_pos_at_delayed
+            rel_obj_quat = quat_mul_np(obj_quat_at_delayed, quat_inv_np(actual_obj_quat))
+            abs_obj_pos  = actual_obj_pos
+            abs_obj_quat = actual_obj_quat
+            if guard_enabled and not ood_event.is_set():
+                _pos_err = float(np.linalg.norm(rel_obj_pos))
+                _w = min(1.0, abs(float(rel_obj_quat[0])))
+                _ang_err = 2.0 * float(np.arccos(_w))
+                if _pos_err > guard_max_obj_dist or _ang_err > guard_max_obj_angle:
+                    ood_reason = (
+                        f"box OOD: pos_err={_pos_err:.4f}m (limit {guard_max_obj_dist:.3f}), "
+                        f"ang_err={_ang_err:.4f}rad (limit {guard_max_obj_angle:.3f}) "
+                        f"at phase={phase:.1f}"
+                    )
+                    logger.error(ood_reason, extra={"step": traj_idx})
+                    ood_event.set()
+        else:
+            if include_object_obs:
+                logger.warning("No box pose available; falling back to zeros", extra={"step": traj_idx})
+            rel_obj_pos  = np.zeros(3, dtype=np.float32)
+            rel_obj_quat = IDENTITY_QUAT_WXYZ
+            abs_obj_pos  = obj_pos_at_phase
+            abs_obj_quat = obj_quat_at_phase
 
         if dual_arm:
-            relative_q_l = actual_q - joints_at_phase
-            relative_q_r = np.zeros(6)
-            relative_qd_l = actual_qd - joint_vel_at_phase
-            relative_qd_r = np.zeros(6)
-            current_features = np.concatenate((relative_q_l, relative_q_r, relative_qd_l, relative_qd_r))
+            # Contact bools: one per arm (2 total).
+            contact_dims = []
+            if include_contact_obs:
+                for idx, arm in enumerate(arms):
+                    wrench = np.array(arm.rtde_r.getActualTCPForce())
+                    delta  = wrench[:3] - tcp_force_baselines[idx][:3]
+                    contact_dims.append(1.0 if np.linalg.norm(delta) > contact_threshold else 0.0)
+            else:
+                contact_dims = [0.0, 0.0]
+            contact_arr = np.array(contact_dims, dtype=np.float32)
+
+            abs_q  = np.concatenate([q.astype(np.float32)  for q  in qs])
+            abs_qd = np.concatenate([qd.astype(np.float32) for qd in qds])
+            rel_q  = np.concatenate([(qs[i]  - ref_q[i]).astype(np.float32)  for i in range(len(arms))])
+            rel_qd = np.concatenate([(qds[i] - ref_qd[i]).astype(np.float32) for i in range(len(arms))])
+
+            if use_reference_obs:
+                current_features = np.concatenate([
+                    rel_q, rel_qd, rel_obj_pos, rel_obj_quat,   # relative state
+                    abs_q, abs_qd, abs_obj_pos, abs_obj_quat,   # absolute state
+                    contact_arr,
+                ]).astype(np.float32)
+            else:
+                current_features = np.concatenate([
+                    abs_q, abs_qd, abs_obj_pos, abs_obj_quat,
+                    contact_arr,
+                ]).astype(np.float32)
         else:
-            relative_q = actual_q - joints_at_phase
-            relative_qd = actual_qd - joint_vel_at_phase
+            actual_q  = qs[0]
+            actual_qd = qds[0]
+            relative_q  = (actual_q  - ref_q[0]).astype(np.float32)
+            relative_qd = (actual_qd - ref_qd[0]).astype(np.float32)
             feature_parts = [relative_q, relative_qd]
             if include_object_obs:
-                # Feed the measured pose to the policy whenever the tracker is alive,
-                # regardless of whether the robot side is real or URSim. Running URSim
-                # against a live tracker is the "hybrid" test: real perception, sim arm
-                # dynamics. Falls back to zeros/identity only when the listener is dead
-                # or hasn't received a pose yet.
-                use_actual = actual_obj_pos is not None
-                if actual_obj_pos is None:
-                    logger.warning("No box pose available from listener; falling back to zeros",
-                                   extra={"step": traj_idx})
-                if use_actual:
-                    # Compare actual (already lagged by tracker latency) against the reference
-                    # at the same lag — matches sim training, where rel = delayed_actual minus
-                    # reference_at_delayed_phase.
-                    rel_obj_pos = actual_obj_pos - obj_pos_at_delayed
-                    rel_obj_quat = quat_mul_np(obj_quat_at_delayed, quat_inv_np(actual_obj_quat))
-                    feature_parts.append(rel_obj_pos.astype(np.float32))
-                    feature_parts.append(rel_obj_quat.astype(np.float32))
-
-                    # OOD protective guard. Same relative box error the env's _get_dones
-                    # uses to terminate training episodes — beyond it the policy is
-                    # extrapolating. Signal the control thread to raise (its teardown
-                    # does servoStop, the main teardown does stopJ). |w| handles the
-                    # quaternion double cover so a 180° flip reads as ~π, not ~0.
-                    if guard_enabled and not ood_event.is_set():
-                        _pos_err = float(np.linalg.norm(rel_obj_pos))
-                        _w = min(1.0, abs(float(rel_obj_quat[0])))
-                        _ang_err = 2.0 * float(np.arccos(_w))
-                        if _pos_err > guard_max_obj_dist or _ang_err > guard_max_obj_angle:
-                            ood_reason = (
-                                f"box OOD: pos_err={_pos_err:.4f}m "
-                                f"(limit {guard_max_obj_dist:.3f}), "
-                                f"ang_err={_ang_err:.4f}rad "
-                                f"(limit {guard_max_obj_angle:.3f}) at phase={phase:.1f}"
-                            )
-                            logger.error(ood_reason, extra={"step": traj_idx})
-                            ood_event.set()
-                else:
-                    feature_parts.append(np.zeros(3, dtype=np.float32))             # relative obj pos
-                    feature_parts.append(IDENTITY_QUAT_WXYZ)                        # relative obj quat
+                feature_parts.append(rel_obj_pos.astype(np.float32))
+                feature_parts.append(rel_obj_quat.astype(np.float32))
             if include_absolute_obs:
-                # Absolute joint state is directly observable from the robot.
                 feature_parts.append(actual_q.astype(np.float32))
                 feature_parts.append(actual_qd.astype(np.float32))
                 if include_object_obs:
-                    # Same hybrid-test policy as above: use the measured pose whenever
-                    # the tracker is alive (real robot OR URSim), reference pose otherwise.
-                    use_actual = actual_obj_pos is not None
-                    if use_actual:
-                        feature_parts.append(actual_obj_pos)
-                        feature_parts.append(actual_obj_quat)
-                    else:
-                        # No-tracker fallback: reference pose at current phase.
-                        feature_parts.append(obj_pos_at_phase)
-                        feature_parts.append(obj_quat_at_phase)
+                    feature_parts.append(abs_obj_pos.astype(np.float32))
+                    feature_parts.append(abs_obj_quat.astype(np.float32))
             if include_contact_obs:
-                # Real-side contact bool: thresholded ||current_tcp_force - baseline||.
-                # Force-only magnitude (first 3 dims); torque component is ignored —
-                # contact with the cube manifests primarily as a translational push.
-                # The sensor's intrinsic latency (~10-30ms) is what training's
-                # contact_obs_delay_steps was modeling, so we don't add software delay
-                # here — that would double-shift the signal.
-                current_tcp_wrench = np.array(rtde_r.getActualTCPForce())
-                delta_force = current_tcp_wrench[:3] - tcp_force_baseline[:3]
-                force_mag = float(np.linalg.norm(delta_force))
+                wrench = np.array(arms[0].rtde_r.getActualTCPForce())
+                delta  = wrench[:3] - tcp_force_baselines[0][:3]
+                force_mag = float(np.linalg.norm(delta))
                 in_contact = 1.0 if force_mag > contact_threshold else 0.0
                 feature_parts.append(np.array([in_contact], dtype=np.float32))
                 logger.debug(
@@ -951,122 +959,110 @@ def policy_thread():
                 )
             current_features = np.concatenate(feature_parts).astype(np.float32)
 
-        # Shift history and append newest
         obs_history = np.roll(obs_history, shift=-1, axis=0)
         obs_history[-1] = current_features
 
-        obs_parts = [obs_history.flatten().astype(np.float32), phase_obs.astype(np.float32)]
+        # Phase dim present only in reference mode (matches env's __post_init__ logic).
+        obs_parts = [obs_history.flatten().astype(np.float32)]
+        if use_reference_obs or not dual_arm:
+            obs_parts.append(phase_obs.astype(np.float32))
 
-        # Future reference obj pose look-ahead (pos delta + world-frame quat delta,
-        # plus absolute future pos/quat if include_absolute_obs).
         if future_obs_steps:
             inv_cur_quat = quat_inv_np(obj_quat_at_phase)
             futures = []
             for k in future_obs_steps:
-                fut_phase = phase + float(k)  # interp_np / nlerp_np clamp internally
-                fut_pos = interp_np(obj_poses_ref[:, :3], fut_phase)
-                fut_quat = nlerp_np(obj_poses_ref[:, 3:], fut_phase)
-                futures.append(fut_pos - obj_pos_at_phase)
-                futures.append(quat_mul_np(fut_quat, inv_cur_quat))
-                if include_absolute_obs:
-                    futures.append(fut_pos)
-                    futures.append(fut_quat)
+                fut_phase = phase + float(k)
+                fut_pos   = interp_np(obj_poses_ref[:, :3], fut_phase)
+                fut_quat  = nlerp_np(obj_poses_ref[:, 3:],  fut_phase)
+                futures.append((fut_pos - obj_pos_at_phase).astype(np.float32))
+                futures.append(quat_mul_np(fut_quat, inv_cur_quat).astype(np.float32))
+                if include_absolute_obs or dual_arm:
+                    futures.append(fut_pos.astype(np.float32))
+                    futures.append(fut_quat.astype(np.float32))
             obs_parts.append(np.concatenate(futures).astype(np.float32))
 
-        # Previous raw residual action.
-        if include_prev_actions:
+        # New dual-arm boxlift env always appends prev_actions (hardcoded + 12 in actor_dim).
+        # Single-arm legacy envs use the include_prev_actions flag from env.yaml.
+        if dual_arm or include_prev_actions:
             obs_parts.append(prev_action)
 
-        obs = np.concatenate(obs_parts)[None, ...].astype(np.float32)
+        obs    = np.concatenate(obs_parts)[None, ...].astype(np.float32)
         output = session.run([output_name], {input_name: obs})[0][0]
 
-        raw_action = output[:6].astype(np.float32)
-        # Phase-slowdown action: when enabled the policy emits a 7th dim controlling dphase.
-        # dphase = (1 + (1 - dphase_min) * tanh(action[6])).clamp(dphase_min, 1).
+        raw_action = np.clip(output[:n_joints], -2.0, 2.0).astype(np.float32)  # clamp before applying; prevents runaway via prev_action feedback
+
         if args.use_ref:
-            # Reference-only baseline: phase advances at the planner's nominal rate.
             dphase = 1.0
-        elif enable_phase_slowdown and len(output) >= 7:
-            dphase = 1.0 + (1.0 - dphase_min) * float(np.tanh(output[6]))
+        elif enable_phase_slowdown and len(output) > n_joints:
+            dphase = 1.0 + (1.0 - dphase_min) * float(np.tanh(output[n_joints]))
             dphase = float(np.clip(dphase, dphase_min, 1.0))
         else:
             dphase = 1.0
 
-        if args.use_ref:
-            # Bypass action_mode entirely — command the planner's nominal target.
-            new_joint_targets = joints_target_at_phase
-        # Mode D applies the curriculum α to blend planner feedforward with the residual.
-        # eff_alpha is read from saved env.yaml (force_alpha if set, else 1.0). At α=1 mode D
-        # collapses to mode C. For modes A/B/C the formulas are α-independent.
-        elif action_mode == "A":
-            new_joint_targets = joints_target_at_phase + action_scale * raw_action
-        elif action_mode == "B":
-            new_joint_targets = joints_at_phase + action_scale * raw_action
-        elif action_mode == "C":
-            new_joint_targets = actual_q + action_scale * raw_action
-        elif action_mode == "D":
-            eps = action_alpha_floor
-            action_gain = eff_alpha + eps * (1.0 - eff_alpha)
-            planner_pd_error = joints_target_at_phase - joints_at_phase
-            new_joint_targets = (
-                actual_q
-                + (1.0 - eff_alpha) * planner_pd_error
-                + action_gain * action_scale * raw_action
-            )
-        else:
-            raise ValueError(f"Unknown action_mode: {action_mode!r}")
-
-        # Safety: clamp to joint limits, then clamp to be near current position
-        new_joint_targets = np.clip(new_joint_targets, joint_limits_lower, joint_limits_upper)
+        # Build per-arm targets and concatenate into a single (n_joints,) vector.
+        new_joint_targets_list = []
+        for i, arm in enumerate(arms):
+            a_slice = slice(i * 6, (i + 1) * 6)
+            arm_action = raw_action[a_slice]
+            q_i        = qs[i]
+            if args.use_ref:
+                t_i = ref_target[i]
+            elif action_mode == "A":
+                t_i = ref_target[i] + action_scale * arm_action
+            elif action_mode == "B":
+                t_i = ref_q[i] + action_scale * arm_action
+            elif action_mode == "C":
+                t_i = q_i + action_scale * arm_action
+            elif action_mode == "D":
+                eps  = action_alpha_floor
+                gain = eff_alpha + eps * (1.0 - eff_alpha)
+                pd   = ref_target[i] - ref_q[i]
+                t_i  = q_i + (1.0 - eff_alpha) * pd + gain * action_scale * arm_action
+            elif action_mode == "BC":
+                # B→C curriculum blend: (1-α)·q_ref + α·q_curr + scale·a
+                # At α=0 → mode B (residual on reference), at α=1 → mode C (residual on current).
+                # eff_alpha=1.0 when force_alpha<0 (training converged), collapsing to mode C.
+                t_i = (1.0 - eff_alpha) * ref_q[i] + eff_alpha * q_i + action_scale * arm_action
+            else:
+                raise ValueError(f"Unknown action_mode: {action_mode!r}")
+            t_i = np.clip(t_i, joint_limits_lower, joint_limits_upper)
+            new_joint_targets_list.append(t_i)
+        new_joint_targets = np.concatenate(new_joint_targets_list)
 
         with data_lock:
-            previous_target_q = current_target_q
             current_target_q = new_joint_targets
-            previous_phase = current_phase
-            current_phase = phase
+            current_phase    = phase
             if actual_obj_pos is not None:
-                current_actual_obj_pos = actual_obj_pos.copy()
+                current_actual_obj_pos  = actual_obj_pos.copy()
                 current_actual_obj_quat = actual_obj_quat.copy()
             else:
-                current_actual_obj_pos = np.full(3, np.nan, dtype=np.float32)
+                current_actual_obj_pos  = np.full(3, np.nan, dtype=np.float32)
                 current_actual_obj_quat = np.full(4, np.nan, dtype=np.float32)
             new_data_event.set()
 
         prev_action = raw_action
 
-        # Snapshot the 50 Hz policy I/O for analysis. obs is the exact float32 vector
-        # fed to ONNX (already includes history, future-obs lookups, prev_action,
-        # contact bool, etc. depending on flags). `output` is the full raw ONNX
-        # output (6 dims, or 7 dims under phase-slowdown). Phase/iter let the user
-        # align with the 500 Hz tracking_log by phase or by iter * policy_decimation.
         policy_log.append({
-            "iter": policy_iter,
-            "phase": float(phase),
-            "obs": obs[0].copy(),               # drop the batch axis added before session.run
+            "iter":       policy_iter,
+            "phase":      float(phase),
+            "obs":        obs[0].copy(),
             "raw_output": np.array(output, dtype=np.float32),
-            "dphase": float(dphase),
+            "dphase":     float(dphase),
         })
         policy_iter += 1
 
-        # Advance phase by dphase (≤ 1; deepens slowdown when policy commands a pause).
-        # Clamp at max_traj_idx so we don't index past the end of the trajectory.
         phase = min(phase + dphase, float(max_traj_idx))
 
 
 def control_thread():
     step_counter = 0
-    # Linear-ramp interpolation between previous_target_q and current_target_q over the
-    # policy_decimation servoJ ticks that span one policy step. alpha goes from 1/N to 1
-    # across those N ticks; resets to 1/N each time the policy publishes a new target.
-    alpha = 1.0 / policy_decimation
     try:
         # Wait for first target
         run_policy_event.set()
         while not new_data_event.is_set():
             pass
-        
-        # First target arrived
         new_data_event.clear()
+
         while True:
             t_start = rtde_c.initPeriod()
             t1 = time.perf_counter()
@@ -1082,34 +1078,21 @@ def control_thread():
 
             if new_data_event.is_set():
                 new_data_event.clear()
-                # Fresh target arrived — restart the ramp from the start of the window.
-                alpha = 1.0 / policy_decimation
 
             with data_lock:
-                # FOH: linearly interpolate between the previous target and the latest one
-                # across the decimation window so the joint target the robot sees evolves
-                # smoothly at 500Hz instead of stepping every 20ms.
-                # alpha = 1.0 # ZOH override
+                target_q    = current_target_q.copy()
+                target_phase = current_phase
 
-                interp_q = (1.0 - alpha) * previous_target_q + alpha * current_target_q
-                interp_phase = (1.0 - alpha) * previous_phase + alpha * current_phase
+                for i, arm in enumerate(arms):
+                    arm.rtde_c.servoJ(
+                        target_q[i * 6:(i + 1) * 6],
+                        velocity, acceleration, dt, lookahead_time, gain,
+                    )
+            log(step_counter, target_q, target_phase)
 
-                # 4. Command the robot
-                rtde_c.servoJ(
-                    interp_q,
-                    velocity,
-                    acceleration,
-                    dt,
-                    lookahead_time,
-                    gain,
-                )
-
-            log(step_counter, interp_q, interp_phase)
-
-            alpha = min(alpha + 1.0 / policy_decimation, 1.0)
             step_counter += 1
 
-            if interp_phase * policy_decimation > max_steps:
+            if target_phase * policy_decimation > max_steps:
                 break
 
             if step_counter > max_wallclock_steps:
@@ -1131,15 +1114,10 @@ def control_thread():
         raise
 
     finally:
-
         logger.info("Stopping servo", extra={"step": -1})
-        rtde_c.servoStop()
-        rtde_c.stopScript()
-
-        logger.info(
-            f"Execution finished. Log written to {log_path}",
-            extra={"step": -1},
-        )
+        for arm in arms:
+            arm.stop()
+        logger.info(f"Execution finished. Log written to {log_path}", extra={"step": -1})
 
 
 if args.isaacsim:
@@ -1351,6 +1329,8 @@ if args.isaacsim:
                     + (1.0 - eff_alpha) * planner_pd
                     + _gain * action_scale * raw_action_l
                 )
+            elif action_mode == "BC":
+                policy_target = (1.0 - eff_alpha) * joints_at_phase_l + eff_alpha * actual_q + action_scale * raw_action_l
             else:
                 raise ValueError(f"Unknown action_mode: {action_mode!r}")
             policy_target = np.clip(policy_target, joint_limits_lower, joint_limits_upper)
@@ -1416,12 +1396,11 @@ except KeyboardInterrupt:
 finally:
     # Stop the robot first (safety priority), then save, then tear down pose streaming.
     # Each step is wrapped so a failure in one doesn't prevent the others.
-    try:
-        rtde_c.stopJ()
-        rtde_c.servoStop()
-        rtde_c.stopScript()
-    except Exception as e:
-        logger.error(f"Error stopping robot: {e}", extra={"step": -1})
+    for arm in arms:
+        try:
+            arm.stop()
+        except Exception as e:
+            logger.error(f"Error stopping {arm.name} arm: {e}", extra={"step": -1})
 
     try:
         save_tracking_npz()

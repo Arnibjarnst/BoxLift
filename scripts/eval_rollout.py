@@ -1,11 +1,14 @@
-"""Evaluate the final-pose quality of a boxhinge rollout.
+"""Evaluate the final-pose quality of a rollout (boxhinge / boxlift / any task).
 
-Takes the rollout npz written by ur_rtde_real_time.py, finds the last valid box
-pose estimate, and compares it to the reference trajectory's goal pose (the end
-of obj_poses). Reports:
+Takes the rollout npz written by ur_rtde_real_time.py (real) or record.py (sim),
+finds the last valid box pose estimate, and compares it to the reference
+trajectory's goal pose (the end of ``obj_poses``). Reports:
 
-  - xy position error: ||(p_final_actual - p_goal_ref)[:2]||  (m), plus the
-    per-axis xy delta. z is ignored (the boxhinge task is evaluated in-plane).
+  - 3D position error:  ||p_final_actual - p_goal_ref||         (m)   ``pos_err_m``
+  - xy  position error: ||(p_final_actual - p_goal_ref)[:2]||   (m)   ``xy_err_m``
+    plus the per-axis xy delta. Both are kept so tasks that move in-plane
+    (boxhinge) can use xy_err while tasks where z matters (boxlift) can use
+    pos_err. ``init_*`` and ``*_at_phase_*`` variants follow the same pattern.
   - orientation error: geodesic angle between the two quaternions (deg)
   - mean corner pose error: mean Euclidean distance between corresponding box
     corners under actual vs reference pose (m). One scalar that combines
@@ -34,8 +37,13 @@ point at:
   - an experiment folder     (logs/rsl_rl/<exp>/ — every run under it is scanned)
 Explicitly named npz files are always evaluated, real or not.
 
+Companion modules:
+  - rollout_summary.py: multi-env sim rollouts. Same record schema via
+    ``to_records()`` so the plotters below work on either source.
+  - rollout_plots.py:   matplotlib plot functions consuming the record schema.
+
 Usage:
-    python scripts/eval_boxhinge_rollout.py <rollout.npz | folder> [more ...]
+    python scripts/eval_rollout.py <rollout.npz | folder> [more ...]
 """
 
 import argparse
@@ -241,7 +249,8 @@ def evaluate(npz_path: Path, verbose: bool = True) -> dict | None:
     init_phase = float(phase[i_first])
     init_ref_pos, init_ref_quat = _ref_at_phase(obj_poses, init_phase)
     init_pos_delta = init_pos - init_ref_pos
-    init_xy_err = float(np.linalg.norm(init_pos_delta[:2]))  # in-plane only
+    init_pos_err = float(np.linalg.norm(init_pos_delta))      # 3D norm
+    init_xy_err  = float(np.linalg.norm(init_pos_delta[:2]))  # in-plane only
     init_ori_err_deg = _quat_angle_deg(init_quat, init_ref_quat)
 
     final_pos = actual_pos[i_last]
@@ -249,7 +258,8 @@ def evaluate(npz_path: Path, verbose: bool = True) -> dict | None:
     final_phase = float(phase[i_last])
 
     pos_delta = final_pos - goal_pos
-    xy_err = float(np.linalg.norm(pos_delta[:2]))  # in-plane only; z ignored
+    pos_err   = float(np.linalg.norm(pos_delta))         # 3D norm — use for boxlift
+    xy_err    = float(np.linalg.norm(pos_delta[:2]))     # in-plane only — boxhinge
     ori_err_deg = _quat_angle_deg(final_quat, goal_quat)
 
     # Completion context: comparing to the goal only means "task success" if the
@@ -258,7 +268,9 @@ def evaluate(npz_path: Path, verbose: bool = True) -> dict | None:
     # large goal error isn't misread as bad tracking when it's just incomplete.
     completed = final_phase >= (T - 1) - 1e-3
     ref_at_phase_pos, ref_at_phase_quat = _ref_at_phase(obj_poses, final_phase)
-    xy_err_at_phase = float(np.linalg.norm((final_pos - ref_at_phase_pos)[:2]))
+    pos_delta_at_phase = final_pos - ref_at_phase_pos
+    pos_err_at_phase = float(np.linalg.norm(pos_delta_at_phase))
+    xy_err_at_phase  = float(np.linalg.norm(pos_delta_at_phase[:2]))
     ori_err_at_phase = _quat_angle_deg(final_quat, ref_at_phase_quat)
 
     # Mean corner distance — pos+ori in a single metres-valued scalar. Reported
@@ -277,20 +289,25 @@ def evaluate(npz_path: Path, verbose: bool = True) -> dict | None:
         print(f"  initial estimate: step idx {i_first}, phase {init_phase:.2f} / {T - 1} "
               f"(box placement / reset offset)")
         print(f"  vs reference AT INITIAL PHASE:")
-        print(f"    xy position err: {init_xy_err * 1000:8.2f} mm   "
-              f"(Δxy = [{init_pos_delta[0] * 1000:+.1f}, "
-              f"{init_pos_delta[1] * 1000:+.1f}] mm)")
+        print(f"    pos err (3D):    {init_pos_err * 1000:8.2f} mm   "
+              f"(Δ = [{init_pos_delta[0] * 1000:+.1f}, "
+              f"{init_pos_delta[1] * 1000:+.1f}, "
+              f"{init_pos_delta[2] * 1000:+.1f}] mm)")
+        print(f"    xy position err: {init_xy_err * 1000:8.2f} mm   (in-plane only)")
         print(f"    orientation err: {init_ori_err_deg:8.2f} deg")
         print(f"    mean corner err: {init_pose_err * 1000:8.2f} mm   (pos+ori combined)")
         print(f"  final estimate: step idx {i_last}, phase {final_phase:.2f} / {T - 1} "
               f"({'completed' if completed else 'INCOMPLETE — stopped early'})")
         print(f"  vs reference GOAL (end of trajectory):")
-        print(f"    xy position err: {xy_err * 1000:8.2f} mm   "
-              f"(Δxy = [{pos_delta[0] * 1000:+.1f}, {pos_delta[1] * 1000:+.1f}] mm)")
+        print(f"    pos err (3D):    {pos_err * 1000:8.2f} mm   "
+              f"(Δ = [{pos_delta[0] * 1000:+.1f}, {pos_delta[1] * 1000:+.1f}, "
+              f"{pos_delta[2] * 1000:+.1f}] mm)")
+        print(f"    xy position err: {xy_err * 1000:8.2f} mm")
         print(f"    orientation err: {ori_err_deg:8.2f} deg")
         print(f"    mean corner err: {pose_err * 1000:8.2f} mm")
         if not completed:
             print(f"  vs reference AT FINAL PHASE (tracking, not task success):")
+            print(f"    pos err (3D):    {pos_err_at_phase * 1000:8.2f} mm")
             print(f"    xy position err: {xy_err_at_phase * 1000:8.2f} mm")
             print(f"    orientation err: {ori_err_at_phase:8.2f} deg")
             print(f"    mean corner err: {pose_err_at_phase * 1000:8.2f} mm")
@@ -302,16 +319,22 @@ def evaluate(npz_path: Path, verbose: bool = True) -> dict | None:
         "gain": _npz_scalar(d, "gain"),
         "lookahead": _npz_scalar(d, "lookahead_time"),
         "init_phase": init_phase,
-        "init_xy_err_m": init_xy_err,
+        # Initial errors (vs reference at the FIRST valid pose's phase)
+        "init_pos_err_m": init_pos_err,        # 3D
+        "init_xy_err_m": init_xy_err,          # in-plane only
         "init_pos_delta_m": init_pos_delta,
         "init_ori_err_deg": init_ori_err_deg,
         "init_pose_err_m": init_pose_err,
+        # Final errors vs the GOAL pose (end of obj_poses)
         "final_phase": final_phase,
         "completed": completed,
-        "xy_err_m": xy_err,
+        "pos_err_m": pos_err,                  # 3D
+        "xy_err_m": xy_err,                    # in-plane only
         "pos_delta_m": pos_delta,
         "ori_err_deg": ori_err_deg,
         "pose_err_m": pose_err,
+        # Final errors vs reference AT the final reached phase (fairer for incompletes)
+        "pos_err_at_phase_m": pos_err_at_phase,
         "xy_err_at_phase_m": xy_err_at_phase,
         "ori_err_at_phase_deg": ori_err_at_phase,
         "pose_err_at_phase_m": pose_err_at_phase,
