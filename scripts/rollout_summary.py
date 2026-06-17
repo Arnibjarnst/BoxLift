@@ -106,9 +106,10 @@ def _load_traj_for_rollout(rollout_path: Path) -> tuple[dict | None, tuple[float
 def compute_rollout_summary(
     rollout_path,
     *,
+    max_pose_err: float | None = None,
     min_task_reward: float = 0.05,
     early_step_threshold: int | None = None,
-    task_reward_key: str = "extras_per_env__Rewards_task__total",
+    task_reward_key: str | None = "extras_per_env__Rewards_task__total",
     box_dims: tuple[float, float, float] | None = None,
     traj=None,
 ) -> dict:
@@ -116,13 +117,17 @@ def compute_rollout_summary(
 
     Args:
         rollout_path: path to record.py output.npz (must be multi-env: has `num_envs`).
-        min_task_reward: terminal task reward below which an env is counted as a failure.
-            Default 0.05 matches "the policy basically achieved nothing at the end."
+        max_pose_err: success threshold in metres on final_err_pose (mean corner
+            distance vs the trajectory's GOAL pose). When set, early termination alone
+            does not cause failure — an env succeeds if its final corner error vs goal
+            is below the threshold, regardless of when the episode ended. When None,
+            every env counts as a success and min_task_reward is ignored.
+        min_task_reward: fallback success criterion (terminal task reward) used only
+            when max_pose_err is None. Default 0.05.
         early_step_threshold: done_step strictly LESS than this counts as early
             termination. None → T - 5 (anything not at trajectory-end timeout).
-        task_reward_key: per-env extras key holding the task reward. Defaults to the
-            new `extras_per_env__Rewards_task__total` field (record.py with
-            `emit_per_env_extras=True`). Override if you want a different aggregate.
+        task_reward_key: per-env extras key holding the task reward. Pass None to skip
+            loading (fine when max_pose_err is set and you don't need reward reporting).
         box_dims, traj: usually auto-discovered via env.yaml; override if you want.
 
     Returns:
@@ -160,23 +165,20 @@ def compute_rollout_summary(
     else:
         early_thresh = T - 5
 
-    # --- terminal task reward per env ---
-    # `extras_per_env__*` values are NaN'd by record.py at done_step (along with the
-    # state arrays — both reflect post-reset garbage there). Last VALID per-env extras
-    # step is therefore done_step - 1. NOTE: the raw `rewards` field is NaN'd one step
-    # later (record.py keeps the death-step reward as the valid terminal reward) — but
-    # we want the task component specifically, which only lives in per-env extras, so
-    # the done_step-1 lookup is the right move here.
-    if task_reward_key not in d.files:
-        raise KeyError(
-            f"`{task_reward_key}` not in rollout npz. Re-record with "
-            f"`emit_per_env_extras=True` (record.py flips this for you), or pass "
-            f"`task_reward_key=` to point at an available per-env field."
-        )
-    task_reward = d[task_reward_key]                     # (T, N), NaN at done_step+
+    # --- terminal task reward per env (optional — skipped when task_reward_key is None) ---
     env_idx = np.arange(N)
     ds_for_metric = np.clip(done_step - 1, 0, T - 1).astype(np.int64)
-    final_task_reward = task_reward[ds_for_metric, env_idx]    # (N,)
+    if task_reward_key is not None:
+        if task_reward_key not in d.files:
+            raise KeyError(
+                f"`{task_reward_key}` not in rollout npz. Re-record with "
+                f"`emit_per_env_extras=True` (record.py flips this for you), or pass "
+                f"`task_reward_key=` to point at an available per-env field."
+            )
+        task_reward = d[task_reward_key]                 # (T, N), NaN at done_step+
+        final_task_reward = task_reward[ds_for_metric, env_idx]  # (N,)
+    else:
+        final_task_reward = np.full(N, float("nan"))
 
     # --- cube pose at first frame and last VALID frame ---
     # Per-env state arrays are NaN'd at done_step (post-reset garbage), so the last
@@ -260,13 +262,17 @@ def compute_rollout_summary(
 
     # --- success/failure classification ---
     early_term = done_step < early_thresh
-    low_reward = final_task_reward < min_task_reward
-    success = ~early_term & ~low_reward
-
     reason = np.full(N, "success", dtype=object)
-    reason[early_term & ~low_reward] = "early_term"
-    reason[~early_term & low_reward] = "low_reward"
-    reason[early_term & low_reward]  = "early_term+low_reward"
+    if max_pose_err is not None:
+        # Compare vs goal pose for all envs — early termination is informational only.
+        high_pose_err = final_err_pose > max_pose_err
+        success = ~high_pose_err
+        reason[early_term & ~high_pose_err] = "early_term"           # succeeded despite early stop
+        reason[~early_term & high_pose_err] = "high_pose_err"
+        reason[early_term & high_pose_err]  = "early_term+high_pose_err"
+    else:
+        # No threshold — everything succeeds.
+        success = np.ones(N, dtype=bool)
 
     # Per-env trajectory assignment from dataset-mode rollouts (None for single-traj).
     # `print_summary` uses this to emit a per-trajectory breakdown when present.
@@ -275,7 +281,8 @@ def compute_rollout_summary(
     return {
         # config echo
         "num_envs": N, "T": T, "box_dims": box_dims,
-        "early_step_threshold": early_thresh, "min_task_reward": min_task_reward,
+        "early_step_threshold": early_thresh,
+        "max_pose_err": max_pose_err, "min_task_reward": min_task_reward,
         "task_reward_key": task_reward_key,
         "rollout_path": str(Path(rollout_path)),
         # per-env outcomes
@@ -387,8 +394,11 @@ def print_summary(s: dict, title: str = "", *, error_frame: str = "phase") -> No
     # a compact range summary in the array case so the line stays readable.
     _et = s["early_step_threshold"]
     et_str = f"{int(_et)}" if np.ndim(_et) == 0 else f"per-env [{int(np.min(_et))}..{int(np.max(_et))}]"
-    print(f"  N={N}, early_step_threshold={et_str}, "
-          f"min_task_reward={s['min_task_reward']}")
+    if s.get("max_pose_err") is not None:
+        criterion_str = f"max_pose_err={s['max_pose_err'] * 1000:.1f} mm (vs goal)"
+    else:
+        criterion_str = "no threshold (all envs succeed)"
+    print(f"  N={N}, early_step_threshold={et_str}, {criterion_str}")
     print(f"  Success: {n_succ}/{N} ({100 * n_succ / N:.1f}%)")
     if n_fail > 0:
         c = Counter(s["reason"][~succ])
@@ -444,9 +454,15 @@ def _main():
                     "breakdown, mean final pose error over successes.",
     )
     p.add_argument("npz", type=Path,
-                   help="Path to record.py output.npz (must be multi-env — has `num_envs` field).")
+                   help="Path to a record.py output.npz, OR a folder produced by "
+                        "record_dataset.py (all *.npz files in the folder are summarised "
+                        "individually plus an aggregate line at the end).")
+    p.add_argument("--max-pose-err", type=float, default=None,
+                   help="Success threshold in mm: final pose error (mean corner dist) must be "
+                        "below this. When set, overrides --min-task-reward.")
     p.add_argument("--min-task-reward", type=float, default=0.05,
-                   help="Terminal task reward below which an env counts as a failure. Default 0.05.")
+                   help="Fallback success criterion (terminal task reward). Used only when "
+                        "--max-pose-err is not set. Default 0.05.")
     p.add_argument("--early-step-threshold", type=int, default=None,
                    help="done_step strictly less than this counts as early termination. "
                         "Default: T - 5.")
@@ -461,13 +477,54 @@ def _main():
                    help="Optional title to include in the printed summary header.")
     args = p.parse_args()
 
-    summary = compute_rollout_summary(
-        args.npz,
-        min_task_reward=args.min_task_reward,
-        early_step_threshold=args.early_step_threshold,
-        task_reward_key=args.task_reward_key,
-    )
-    print_summary(summary, title=args.title or str(args.npz), error_frame=args.error_frame)
+    if args.npz.is_dir():
+        files = sorted(args.npz.glob("*.npz"))
+        if not files:
+            print(f"No *.npz files found under {args.npz}")
+            return
+        summaries = []
+        for f in files:
+            try:
+                s = compute_rollout_summary(
+                    f,
+                    max_pose_err=args.max_pose_err / 1000 if args.max_pose_err is not None else None,
+                    min_task_reward=args.min_task_reward,
+                    early_step_threshold=args.early_step_threshold,
+                    task_reward_key=args.task_reward_key,
+                )
+                print_summary(s, title=f.stem, error_frame=args.error_frame)
+                print()
+                summaries.append(s)
+            except Exception as e:
+                print(f"[SKIP] {f.name}: {e}\n")
+
+        # Aggregate across all files.
+        if len(summaries) > 1:
+            all_succ = np.concatenate([s["success"] for s in summaries])
+            suffix = "_at_phase" if args.error_frame == "phase" else ""
+            n_total = int(all_succ.size)
+            n_succ  = int(all_succ.sum())
+            print(f"=== AGGREGATE ({len(summaries)} trajectories) ===")
+            print(f"  Success: {n_succ}/{n_total} ({100 * n_succ / n_total:.1f}%)")
+            for metric, unit, scale in [
+                (f"final_err_pos{suffix}",  "mm",  1000),
+                (f"final_err_quat{suffix}", "deg", 180 / np.pi),
+                (f"final_err_pose{suffix}", "mm",  1000),
+            ]:
+                vals = np.concatenate([s[metric] for s in summaries if metric in s])
+                succ = np.concatenate([s["success"] for s in summaries if metric in s])
+                if succ.any():
+                    print(f"  {metric.split('final_err_')[1]:12s}: "
+                          f"{vals[succ].mean() * scale:.1f} {unit}  (successes only)")
+    else:
+        summary = compute_rollout_summary(
+            args.npz,
+            max_pose_err=args.max_pose_err / 1000 if args.max_pose_err is not None else None,
+            min_task_reward=args.min_task_reward,
+            early_step_threshold=args.early_step_threshold,
+            task_reward_key=args.task_reward_key,
+        )
+        print_summary(summary, title=args.title or str(args.npz), error_frame=args.error_frame)
 
 
 if __name__ == "__main__":

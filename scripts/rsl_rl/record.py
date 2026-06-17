@@ -52,6 +52,10 @@ parser.add_argument("--voc_kp_pos", type=float, default=None,
 parser.add_argument("--keep_voc", action="store_true", default=False,
                     help="Record with the VOC gains saved at the end of training (loaded from <log_dir>/voc_state.npz). "
                          "If unset (default), VOC is forcibly disabled so the rollout matches deployment (kp=kv=0).")
+parser.add_argument("--zero_policy", action="store_true", default=False,
+                    help="Skip checkpoint loading and use zero actions (pure nominal controller baseline). "
+                         "Requires trajectory to be set via --trajectory_path or env.trajectory_path=. "
+                         "No log_dir or saved env.yaml is needed.")
 # append RSL-RL cli arguments
 cli_args.add_rsl_rl_args(parser)
 # append AppLauncher cli args
@@ -151,77 +155,85 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # specify directory for logging experiments
     log_root_path = os.path.join("logs", "rsl_rl", agent_cfg.experiment_name)
     log_root_path = os.path.abspath(log_root_path)
-    print(f"[INFO] Loading experiment from directory: {log_root_path}")
-    if args_cli.use_pretrained_checkpoint:
-        resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
-        if not resume_path:
-            print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
-            return
-    elif args_cli.checkpoint:
-        resume_path = retrieve_file_path(args_cli.checkpoint)
-    else:
-        resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
-
-    log_dir = os.path.dirname(resume_path)
-
-    # Load saved training config so obs/action layout matches the checkpoint
-    with open(os.path.join(log_dir, "params", "env.yaml"), "r") as f:
-        saved_env_cfg = yaml.unsafe_load(f)
-
-    # User-explicit CLI flag for trajectory_path wins over saved value (legacy non-Hydra arg).
-    if args_cli.trajectory_path is not None:
-        env_cfg.trajectory_path = args_cli.trajectory_path
-    elif "trajectory_path" not in _env_overrides:
-        env_cfg.trajectory_path = saved_env_cfg["trajectory_path"]
-    print(f"[INFO] Using trajectory: {env_cfg.trajectory_path}")
-
-    # All restorations below: only apply if the user didn't already set the field via a
-    # Hydra `env.<field>=...` override. Otherwise we'd silently clobber the override.
-    if "dataset_path" in saved_env_cfg and "dataset_path" not in _env_overrides:
-        env_cfg.dataset_path = saved_env_cfg["dataset_path"]
-    if getattr(env_cfg, "dataset_path", ""):
-        print(f"[INFO] Using dataset: {env_cfg.dataset_path}")
-
-    # Restore fields that affect obs/action layout from the trained run
-    if "obs_history_steps" in saved_env_cfg and "obs_history_steps" not in _env_overrides:
-        env_cfg.obs_history_steps = int(saved_env_cfg["obs_history_steps"])
-    if "action_mode" in saved_env_cfg and "action_mode" not in _env_overrides:
-        env_cfg.action_mode = saved_env_cfg["action_mode"]
-    if "observation_space" in saved_env_cfg and "observation_space" not in _env_overrides:
-        obs_space = saved_env_cfg["observation_space"]
-        env_cfg.observation_space = obs_space if isinstance(obs_space, dict) else int(obs_space)
-    # Phase slowdown determines action_space (7 if enabled, 6 otherwise) — must be set
-    # before env creation so __post_init__ allocates the correct action head shape, or
-    # checkpoint loading will fail with a size mismatch on actor.6.weight/bias.
-    if "enable_phase_slowdown" in saved_env_cfg and "enable_phase_slowdown" not in _env_overrides:
-        env_cfg.enable_phase_slowdown = bool(saved_env_cfg["enable_phase_slowdown"])
-    # Phase-mapping variants (only meaningful if enable_phase_slowdown is True). These
-    # control how action[6] is interpreted; mismatch between train and eval would make
-    # the policy's commanded dphase wrong even if shapes match.
-    for _phase_field in ("phase_mapping", "dphase_max", "dphase_min",
-                         "task_scale_by_dphase", "track_scale_by_dphase"):
-        if (_phase_field in saved_env_cfg and hasattr(env_cfg, _phase_field)
-                and _phase_field not in _env_overrides):
-            setattr(env_cfg, _phase_field, saved_env_cfg[_phase_field])
-    print(f"[INFO] obs_history_steps={getattr(env_cfg, 'obs_history_steps', None)}, "
-          f"action_mode={getattr(env_cfg, 'action_mode', None)}, "
-          f"observation_space={env_cfg.observation_space}, "
-          f"enable_phase_slowdown={getattr(env_cfg, 'enable_phase_slowdown', None)}")
-
-    # Pin curriculum α to the value the policy was trained at (see play.py for rationale).
-    m = re.search(r"model_(\d+)\.pt", os.path.basename(resume_path))
-    ckpt_iter = int(m.group(1)) if m else 0
-    num_steps_per_env = int(getattr(agent_cfg, "num_steps_per_env", 24))
-    warmup = int(saved_env_cfg.get("alpha_warmup_steps", 0) or 0)
-    if warmup > 0:
-        env_cfg.force_alpha = min(1.0, ckpt_iter * num_steps_per_env / warmup)
-    else:
+    if args_cli.zero_policy:
+        resume_path = None
+        log_dir = None
+        if args_cli.trajectory_path is not None:
+            env_cfg.trajectory_path = args_cli.trajectory_path
+        print(f"[INFO] --zero_policy: skipping checkpoint. Trajectory: {getattr(env_cfg, 'trajectory_path', '(from Hydra)')}")
         env_cfg.force_alpha = 1.0
-    print(f"[INFO] Pinning curriculum α = {env_cfg.force_alpha:.3f} "
-          f"(ckpt_iter={ckpt_iter}, num_steps_per_env={num_steps_per_env}, warmup={warmup})")
+    else:
+        print(f"[INFO] Loading experiment from directory: {log_root_path}")
+        if args_cli.use_pretrained_checkpoint:
+            resume_path = get_published_pretrained_checkpoint("rsl_rl", train_task_name)
+            if not resume_path:
+                print("[INFO] Unfortunately a pre-trained checkpoint is currently unavailable for this task.")
+                return
+        elif args_cli.checkpoint:
+            resume_path = retrieve_file_path(args_cli.checkpoint)
+        else:
+            resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
 
-    # set the log directory for the environment (works for all environment types)
-    env_cfg.log_dir = log_dir
+        log_dir = os.path.dirname(resume_path)
+
+        # Load saved training config so obs/action layout matches the checkpoint
+        with open(os.path.join(log_dir, "params", "env.yaml"), "r") as f:
+            saved_env_cfg = yaml.unsafe_load(f)
+
+        # User-explicit CLI flag for trajectory_path wins over saved value (legacy non-Hydra arg).
+        if args_cli.trajectory_path is not None:
+            env_cfg.trajectory_path = args_cli.trajectory_path
+        elif "trajectory_path" not in _env_overrides:
+            env_cfg.trajectory_path = saved_env_cfg["trajectory_path"]
+        print(f"[INFO] Using trajectory: {env_cfg.trajectory_path}")
+
+        # All restorations below: only apply if the user didn't already set the field via a
+        # Hydra `env.<field>=...` override. Otherwise we'd silently clobber the override.
+        if "dataset_path" in saved_env_cfg and "dataset_path" not in _env_overrides:
+            env_cfg.dataset_path = saved_env_cfg["dataset_path"]
+        if getattr(env_cfg, "dataset_path", ""):
+            print(f"[INFO] Using dataset: {env_cfg.dataset_path}")
+
+        # Restore fields that affect obs/action layout from the trained run
+        if "obs_history_steps" in saved_env_cfg and "obs_history_steps" not in _env_overrides:
+            env_cfg.obs_history_steps = int(saved_env_cfg["obs_history_steps"])
+        if "action_mode" in saved_env_cfg and "action_mode" not in _env_overrides:
+            env_cfg.action_mode = saved_env_cfg["action_mode"]
+        if "observation_space" in saved_env_cfg and "observation_space" not in _env_overrides:
+            obs_space = saved_env_cfg["observation_space"]
+            env_cfg.observation_space = obs_space if isinstance(obs_space, dict) else int(obs_space)
+        # Phase slowdown determines action_space (7 if enabled, 6 otherwise) — must be set
+        # before env creation so __post_init__ allocates the correct action head shape, or
+        # checkpoint loading will fail with a size mismatch on actor.6.weight/bias.
+        if "enable_phase_slowdown" in saved_env_cfg and "enable_phase_slowdown" not in _env_overrides:
+            env_cfg.enable_phase_slowdown = bool(saved_env_cfg["enable_phase_slowdown"])
+        # Phase-mapping variants (only meaningful if enable_phase_slowdown is True). These
+        # control how action[6] is interpreted; mismatch between train and eval would make
+        # the policy's commanded dphase wrong even if shapes match.
+        for _phase_field in ("phase_mapping", "dphase_max", "dphase_min",
+                             "task_scale_by_dphase", "track_scale_by_dphase"):
+            if (_phase_field in saved_env_cfg and hasattr(env_cfg, _phase_field)
+                    and _phase_field not in _env_overrides):
+                setattr(env_cfg, _phase_field, saved_env_cfg[_phase_field])
+        print(f"[INFO] obs_history_steps={getattr(env_cfg, 'obs_history_steps', None)}, "
+              f"action_mode={getattr(env_cfg, 'action_mode', None)}, "
+              f"observation_space={env_cfg.observation_space}, "
+              f"enable_phase_slowdown={getattr(env_cfg, 'enable_phase_slowdown', None)}")
+
+        # Pin curriculum α to the value the policy was trained at (see play.py for rationale).
+        m = re.search(r"model_(\d+)\.pt", os.path.basename(resume_path))
+        ckpt_iter = int(m.group(1)) if m else 0
+        num_steps_per_env = int(getattr(agent_cfg, "num_steps_per_env", 24))
+        warmup = int(saved_env_cfg.get("alpha_warmup_steps", 0) or 0)
+        if warmup > 0:
+            env_cfg.force_alpha = min(1.0, ckpt_iter * num_steps_per_env / warmup)
+        else:
+            env_cfg.force_alpha = 1.0
+        print(f"[INFO] Pinning curriculum α = {env_cfg.force_alpha:.3f} "
+              f"(ckpt_iter={ckpt_iter}, num_steps_per_env={num_steps_per_env}, warmup={warmup})")
+
+        # set the log directory for the environment (works for all environment types)
+        env_cfg.log_dir = log_dir
 
     # create isaac environment
     env = gym.make(args_cli.task, cfg=env_cfg, render_mode="rgb_array" if args_cli.video else None)
@@ -289,40 +301,46 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # wrap around environment for rsl-rl
     env = RslRlVecEnvWrapper(env, clip_actions=agent_cfg.clip_actions)
 
-    print(f"[INFO]: Loading model checkpoint from: {resume_path}")
-    # load previously trained model
-    if agent_cfg.class_name == "OnPolicyRunner":
-        runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
-    elif agent_cfg.class_name == "DistillationRunner":
-        runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+    if args_cli.zero_policy:
+        print("[INFO] --zero_policy: using zero-action baseline (no checkpoint).")
+        _action_shape = env.action_space.shape
+        _device = env.unwrapped.device
+        policy = lambda obs: torch.zeros(_action_shape, device=_device)  # noqa: E731
     else:
-        raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
-    runner.load(resume_path)
+        print(f"[INFO]: Loading model checkpoint from: {resume_path}")
+        # load previously trained model
+        if agent_cfg.class_name == "OnPolicyRunner":
+            runner = OnPolicyRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        elif agent_cfg.class_name == "DistillationRunner":
+            runner = DistillationRunner(env, agent_cfg.to_dict(), log_dir=None, device=agent_cfg.device)
+        else:
+            raise ValueError(f"Unsupported runner class: {agent_cfg.class_name}")
+        runner.load(resume_path)
 
-    # obtain the trained policy for inference
-    policy = runner.get_inference_policy(device=env.unwrapped.device)
+        # obtain the trained policy for inference
+        policy = runner.get_inference_policy(device=env.unwrapped.device)
 
-    # extract the neural network module
-    # we do this in a try-except to maintain backwards compatibility.
-    try:
-        # version 2.3 onwards
-        policy_nn = runner.alg.policy
-    except AttributeError:
-        # version 2.2 and below
-        policy_nn = runner.alg.actor_critic
+        # extract the neural network module
+        # we do this in a try-except to maintain backwards compatibility.
+        try:
+            # version 2.3 onwards
+            policy_nn = runner.alg.policy
+        except AttributeError:
+            # version 2.2 and below
+            policy_nn = runner.alg.actor_critic
 
-    # extract the normalizer
-    if hasattr(policy_nn, "actor_obs_normalizer"):
-        normalizer = policy_nn.actor_obs_normalizer
-    elif hasattr(policy_nn, "student_obs_normalizer"):
-        normalizer = policy_nn.student_obs_normalizer
-    else:
-        normalizer = None
+        # extract the normalizer
+        if hasattr(policy_nn, "actor_obs_normalizer"):
+            normalizer = policy_nn.actor_obs_normalizer
+        elif hasattr(policy_nn, "student_obs_normalizer"):
+            normalizer = policy_nn.student_obs_normalizer
+        else:
+            normalizer = None
 
-    # export policy to onnx/jit
-    export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
-    export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
-    export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
+        # export policy to onnx/jit
+        export_model_dir = os.path.join(os.path.dirname(resume_path), "exported")
+        export_policy_as_jit(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.pt")
+        export_policy_as_onnx(policy_nn, normalizer=normalizer, path=export_model_dir, filename="policy.onnx")
 
 
     dt = env.unwrapped.step_dt
