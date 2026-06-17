@@ -177,7 +177,7 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # Include a single thresholded contact bool (EE ↔ cube) in the per-step observation.
     # 1.0 when the EE contact sensor reports |force| > contact_threshold, else 0.0.
     # Real-side analog: thresholded delta of getActualTCPForce() vs a baseline.
-    include_contact_obs = False
+    include_contact_obs = True
     # Force magnitude threshold (N) for the contact bool. ~0.5–2N is reasonable for the
     # sphere EE on the cube; tune by inspecting force-magnitude histograms in obvious
     # contact vs free motion.
@@ -663,7 +663,7 @@ class BoxhingeEnvCfg(DirectRLEnvCfg):
     # majority dominate the mean). 0.65 is calibrated so a small completion-rate dip
     # (≈95%) brings the mean below threshold and pauses decay, giving the policy time
     # to adapt to the kp level before VOC weakens further.
-    voc_threshold_task: float = 0.7     # task reward (obj_pos · obj_quat or sum form)
+    voc_threshold_task: float = 0.8     # task reward (obj_pos · obj_quat or sum form)
     voc_threshold_track: float = 0.0    # tracking reward (eef_box_rel + eef_pos + ...)
     # Warmup period (in env steps via common_step_counter) before any decay can fire.
     # common_step_counter increments by 1 per env step (not per env*step), so this

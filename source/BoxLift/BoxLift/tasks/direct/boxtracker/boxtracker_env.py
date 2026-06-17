@@ -597,6 +597,17 @@ class BoxtrackerEnv(DirectRLEnv):
         """Residual on current joint positions. Pair with feedforward obs."""
         return self._get_joint_pos() + self._action_scale * self.actions[:, :6]
 
+    def get_joint_targets_BC(self):
+        """B→C curriculum blend driven by _bc_alpha():
+            q_target = ((1-α)·joints[t] + α·curr_joints) + scale·a
+        At α=0: pure mode B (reference trajectory positions as base).
+        At α=1: pure mode C (current joint positions as base)."""
+        alpha = self._bc_alpha()
+        ref_pos = self._interp(self.joints)
+        cur_pos = self._get_joint_pos()
+        blend = (1.0 - alpha) * ref_pos + alpha * cur_pos
+        return blend + self._action_scale * self.actions[:, :6]
+
     def get_joint_targets_D(self):
         """Residual on current position shifted by planner's intended PD error, blended
         with a curriculum α ∈ [0, 1]:
@@ -616,6 +627,8 @@ class BoxtrackerEnv(DirectRLEnv):
             return self.get_joint_targets_A()
         if mode == "B":
             return self.get_joint_targets_B()
+        if mode == "BC":
+            return self.get_joint_targets_BC()
         if mode == "C":
             return self.get_joint_targets_C()
         if mode == "D":
@@ -693,12 +706,84 @@ class BoxtrackerEnv(DirectRLEnv):
 
         return rel_pos, rel_quat, obj_pos, obj_quat
 
+    def _get_observations_agnostic(self) -> dict:
+        """Reference-agnostic obs: absolute-only per-step features + goal conditioning.
+
+        Drops all reference-relative terms (relative_q, relative_obj, future waypoints).
+        Appends a 14-dim goal obs: rel_pos(3) + rel_quat(4) + abs_pos(3) + abs_quat(4),
+        where the goal is the trajectory's final object pose for each env.
+        """
+        feature_parts = [
+            self._get_joint_pos(relative=False),
+            self._get_joint_vel(relative=False),
+        ]
+
+        obj_abs_pos = obj_abs_quat = None
+        if self.cfg.include_object_obs:
+            _, _, obj_abs_pos, obj_abs_quat = self._get_noisy_obj_obs()
+            feature_parts.extend([obj_abs_pos, obj_abs_quat])
+
+        if self.cfg.include_contact_obs:
+            ee_force_mag = self.ee_contact_sensor.data.force_matrix_w.norm(dim=-1)
+            total_force_mag = ee_force_mag.sum(dim=(-1, -2))
+            in_contact = (total_force_mag > self.cfg.contact_threshold).float()
+            self.ee_contact_delay_buf = torch.roll(self.ee_contact_delay_buf, shifts=-1, dims=1)
+            self.ee_contact_delay_buf[:, -1] = in_contact
+            delayed = self.ee_contact_delay_buf[:, :1]
+            if self.cfg.contact_obs_flip_prob > 0.0:
+                flip_mask = torch.rand_like(delayed) < self.cfg.contact_obs_flip_prob
+                delayed = torch.where(flip_mask, 1.0 - delayed, delayed)
+            feature_parts.append(delayed)
+
+        if self.cfg.include_ee_box_obs:
+            EE_pos_a  = self._get_EE_pos(relative=False)
+            EE_quat_a = self._get_EE_quat(relative=False)
+            if obj_abs_pos is not None:
+                cur_obj_pos, cur_obj_quat = obj_abs_pos, obj_abs_quat
+            else:
+                cur_obj_pos  = self._get_obj_pos(relative=False)
+                cur_obj_quat = self._get_obj_quat(relative=False)
+            inv_obj = quat_inv(cur_obj_quat)
+            feature_parts.append(quat_apply(inv_obj, EE_pos_a - cur_obj_pos))  # abs EE-in-box pos (3)
+            feature_parts.append(quat_mul(inv_obj, EE_quat_a))                 # abs EE-in-box quat (4)
+
+        current_features = torch.cat(feature_parts, dim=-1)
+        self.obs_history = torch.roll(self.obs_history, shifts=-1, dims=1)
+        self.obs_history[:, -1] = current_features
+        obs_parts = [self.obs_history.flatten(start_dim=1)]
+
+        # Goal conditioning: each env's trajectory end-pose, relative to current obj + absolute.
+        env_arange = torch.arange(self.num_envs, device=self.device)
+        goal_idx  = (self.segment_length - 1).clamp(min=0)
+        goal_pos  = self.obj_poses[env_arange, goal_idx, :3]   # (N, 3) env-frame
+        goal_quat = self.obj_poses[env_arange, goal_idx, 3:]   # (N, 4) wxyz
+        if obj_abs_pos is not None:
+            cur_pos, cur_quat = obj_abs_pos, obj_abs_quat
+        else:
+            cur_pos  = self._get_obj_pos(relative=False)
+            cur_quat = self._get_obj_quat(relative=False)
+        obs_parts.extend([
+            goal_pos - cur_pos,                        # rel goal pos  (3)
+            quat_mul(goal_quat, quat_inv(cur_quat)),   # rel goal quat (4)
+            goal_pos,                                  # abs goal pos  (3)
+            goal_quat,                                 # abs goal quat (4)
+        ])
+
+        if self.cfg.include_prev_actions:
+            obs_parts.append(self.prev_actions)
+
+        obs = torch.cat(obs_parts, dim=-1)
+        return {"policy": obs, "privileged": self._get_privileged_obs()}
+
     def _get_observations(self) -> dict:
         # Advance phase post-physics so obs/rewards reference the new step. For envs that
         # were just reset, dphase=0 (set in _reset_idx) makes this a no-op. Clamp per-env
         # to that env's own segment length (segments vary in length).
         last = (self.segment_length - 1).clamp(min=0).float()
         self.phase = torch.minimum((self.phase + self.dphase).clamp(min=0.0), last)
+
+        if self.cfg.reference_agnostic:
+            return self._get_observations_agnostic()
 
         feature_parts = [self._get_joint_pos(relative=True), self._get_joint_vel(relative=True)]
 
@@ -948,14 +1033,29 @@ class BoxtrackerEnv(DirectRLEnv):
         self.EE_poses[eids]           = self._pool["EE_poses"][new_seg]
         self.eef_box_gate_mask[eids]  = self._pool_gate[new_seg]
 
-        # Always start the segment from the beginning (phase 0). The policy must be
-        # phase-agnostic and generalize across segments, so there is no RSI / failure
-        # resampling / reset_to_zero here. fixed_value (eval/play) is still honored for
-        # determinism but is normally 0.
+        # Phase initialisation. eval/play passes fixed_value=0 for determinism.
+        # Training uses RSI: uniform random start within each env's own segment,
+        # with reset_to_zero_prob chance of forcing phase=0 to keep the trajectory
+        # start well-trained (deployment always starts at 0).
         if fixed_value is not None:
             self.phase[eids] = float(fixed_value)
         else:
-            self.phase[eids] = 0.0
+            T_per_env = self.segment_length[eids].float()            # (n,) per-env lengths
+            if self.cfg.max_episode_steps > 0:
+                max_phase = (T_per_env - 1 - self.cfg.max_episode_steps).clamp(min=1.0)
+            else:
+                max_phase = (T_per_env - 2).clamp(min=0.0)
+            sampled = (torch.rand(n, device=self.device) * max_phase).floor()
+            if self.cfg.enable_failure_resampling:
+                # Override with failure-weighted phases per-env (uses global segment_scores).
+                # Each env's segment was already freshly sampled above; reuse T of that seg.
+                T_scalar = int(T_per_env.float().mean().item())  # approximate; failure sampling is coarse
+                sampled = self._sample_phase_failure_weighted(n, T_scalar)
+            # Boost phase=0 exposure to match deployment start.
+            if self.cfg.reset_to_zero_prob > 0.0:
+                force_zero = torch.rand(n, device=self.device) < self.cfg.reset_to_zero_prob
+                sampled = torch.where(force_zero, torch.zeros_like(sampled), sampled)
+            self.phase[eids] = sampled
         self.episode_start_phase[eids] = self.phase[eids]
         # dphase=0 so the immediately-following _get_observations advance is a no-op for
         # the freshly-reset env; _pre_physics_step overwrites it from the next action.
@@ -1105,6 +1205,19 @@ class BoxtrackerEnv(DirectRLEnv):
                 print(f"[boxtracker] _reset_idx: DR cache readback failed: {e!r}.")
                 self._dr_readback_warned = True
 
+    def _bc_alpha(self) -> float:
+        """α for the BC curriculum: 0 = pure B, 1 = pure C.
+        Linear ramp from bc_start_steps to bc_end_steps (env steps).
+        Returns 0 if bc_end_steps == 0 (disabled — stays at pure B)."""
+        if self.cfg.bc_end_steps <= 0:
+            return 0.0
+        t = self.common_step_counter
+        if t <= self.cfg.bc_start_steps:
+            return 0.0
+        if t >= self.cfg.bc_end_steps:
+            return 1.0
+        return (t - self.cfg.bc_start_steps) / (self.cfg.bc_end_steps - self.cfg.bc_start_steps)
+
     def _curriculum_alpha(self) -> float:
         """α ∈ [0, 1] schedule used by the reward curriculum, the mode-D action blend, and
         the policy-authored regularization scaling. alpha_warmup_steps=0 disables (α=1).
@@ -1161,12 +1274,15 @@ class BoxtrackerEnv(DirectRLEnv):
             rew_obj_vel = rew_obj_lin_vel + rew_obj_ang_vel
             rew_task_unweighted = rew_obj_pos + rew_obj_quat + rew_obj_vel
 
-        # Curriculum α drives (1) the reward-weight ramp, (2) the mode-D action blend, and
-        # (3) the mode-D policy-regularization scaling. common_step_counter increments once
-        # per env step and is maintained by DirectRLEnv.
+        # Reward-weight alpha: BC mode uses its own timed schedule; other modes use the
+        # D-mode curriculum alpha (or 1.0 when that curriculum is disabled).
         alpha = self._curriculum_alpha()
-        w_task_eff  = self.cfg.w_task_start  + (self.cfg.w_task  - self.cfg.w_task_start)  * alpha
-        w_track_eff = self.cfg.w_track_start + (self.cfg.w_track - self.cfg.w_track_start) * alpha
+        if self.cfg.action_mode == "BC":
+            reward_alpha = self._bc_alpha()
+        else:
+            reward_alpha = alpha
+        w_task_eff  = self.cfg.w_task_start  + (self.cfg.w_task  - self.cfg.w_task_start)  * reward_alpha
+        w_track_eff = self.cfg.w_track_start + (self.cfg.w_track - self.cfg.w_track_start) * reward_alpha
 
         rew_task = w_task_eff * rew_task_unweighted
         if self.cfg.task_scale_by_dphase:
@@ -1339,6 +1455,8 @@ class BoxtrackerEnv(DirectRLEnv):
 
         self.extras["log"] = {
             "Curriculum/alpha": torch.tensor(alpha, device=self.device),
+            "Curriculum/bc_alpha": torch.tensor(self._bc_alpha(), device=self.device),
+            "Curriculum/reward_alpha": torch.tensor(reward_alpha, device=self.device),
             "Curriculum/rate_reg_scale": torch.tensor(rate_reg_scale, device=self.device),
             "Curriculum/norm_reg_scale": torch.tensor(norm_reg_scale, device=self.device),
             "Rewards_task/obj_pos": rew_obj_pos.mean(),

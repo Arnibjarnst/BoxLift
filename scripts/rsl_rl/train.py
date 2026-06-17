@@ -77,6 +77,7 @@ if version.parse(installed_version) < version.parse(RSL_RL_VERSION):
 
 import gymnasium as gym
 import logging
+import numpy as np
 import os
 import time
 import torch
@@ -178,6 +179,17 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     # save resume path before creating a new log_dir
     if agent_cfg.resume or agent_cfg.algorithm.class_name == "Distillation":
         resume_path = get_checkpoint_path(log_root_path, agent_cfg.load_run, agent_cfg.load_checkpoint)
+
+    # restore VOC curriculum gains so decay continues from where the previous run left off
+    if agent_cfg.resume:
+        _direct_env = env.unwrapped
+        if hasattr(_direct_env, "apply_voc_state"):
+            _voc_state_path = os.path.join(os.path.dirname(resume_path), "voc_state.npz")
+            if os.path.exists(_voc_state_path):
+                _direct_env.apply_voc_state(np.load(_voc_state_path))
+                print(f"[INFO] Resumed VOC state from: {_voc_state_path}")
+            else:
+                print(f"[WARN] --resume set but {_voc_state_path} not found; VOC uses cfg initial values")
 
     # wrap for video recording
     if args_cli.video:

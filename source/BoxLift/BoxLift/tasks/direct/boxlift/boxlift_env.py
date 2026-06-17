@@ -108,6 +108,32 @@ class BoxliftEnv(DirectRLEnv):
         self.prev_actions = torch.zeros((self.num_envs, 12), device=self.device)
         self.prev_joint_vel = torch.zeros((self.num_envs, 12), device=self.device)
 
+        # Per-env constant robot base pose offsets (sampled once, held for full training run).
+        # Applied in _reset_idx to teleport each arm's fixed root; EE reference lookups use
+        # _robot_ee_ref_pos / _robot_ee_ref_quat to keep rewards and obs consistent.
+        _pos_std = self.cfg.robot_pos_randomization_xyz_std
+        _yaw_std = self.cfg.robot_ori_randomization_yaw_std
+        self.robot_base_offset_l = torch.zeros(self.num_envs, 3, device=self.device)
+        self.robot_base_offset_r = torch.zeros(self.num_envs, 3, device=self.device)
+        # Yaw quats: wxyz convention, identity by default.
+        self.robot_yaw_quat_l = torch.zeros(self.num_envs, 4, device=self.device)
+        self.robot_yaw_quat_l[:, 0] = 1.0
+        self.robot_yaw_quat_r = torch.zeros(self.num_envs, 4, device=self.device)
+        self.robot_yaw_quat_r[:, 0] = 1.0
+        if _pos_std > 0.0:
+            self.robot_base_offset_l = _pos_std * torch.randn(self.num_envs, 3, device=self.device)
+            self.robot_base_offset_r = _pos_std * torch.randn(self.num_envs, 3, device=self.device)
+        if _yaw_std > 0.0:
+            _yaw_l = _yaw_std * torch.randn(self.num_envs, device=self.device)
+            _yaw_r = _yaw_std * torch.randn(self.num_envs, device=self.device)
+            _zeros = torch.zeros(self.num_envs, device=self.device)
+            self.robot_yaw_quat_l = torch.stack(
+                [torch.cos(0.5 * _yaw_l), _zeros, _zeros, torch.sin(0.5 * _yaw_l)], dim=-1
+            )
+            self.robot_yaw_quat_r = torch.stack(
+                [torch.cos(0.5 * _yaw_r), _zeros, _zeros, torch.sin(0.5 * _yaw_r)], dim=-1
+            )
+
         # Per-arm thresholded contact-bool delay buffer (newest-last). Shape
         # (num_envs, delay+1, 2): last dim is [left, right]. Push current bool to [:, -1],
         # read [:, 0] for the delayed value. delay_steps=0 → buffer length 1, no delay.
@@ -336,8 +362,8 @@ class BoxliftEnv(DirectRLEnv):
         # Apply VOC wrench on the cube (zero short-circuit when disabled/decayed).
         self._apply_voc()
 
-        EE_pos_l = self.EE_poses_l[self.episode_length_buf, :3] + self.scene.env_origins
-        EE_pos_r = self.EE_poses_r[self.episode_length_buf, :3] + self.scene.env_origins
+        EE_pos_l = self._robot_ee_ref_pos(self.EE_poses_l[self.episode_length_buf, :3], "l") + self.scene.env_origins
+        EE_pos_r = self._robot_ee_ref_pos(self.EE_poses_r[self.episode_length_buf, :3], "r") + self.scene.env_origins
 
         # Visualize EE markers
         ee_marker_pos = torch.stack([EE_pos_l, EE_pos_r], dim=1).view(-1, 3)
@@ -604,20 +630,35 @@ class BoxliftEnv(DirectRLEnv):
         obj_rel_pos, obj_rel_quat, obj_abs_pos, obj_abs_quat = self._get_noisy_obj_obs()
 
         # === Per-step feature (layout must match cfg.per_step_feature_dim) =============
+        # Joint obs: sample noise once so abs and relative use the same noisy read.
+        # Rewards and privileged obs use raw .data values and are unaffected.
+        _q_l  = self.ur5e_l.data.joint_pos.clone()
+        _q_r  = self.ur5e_r.data.joint_pos.clone()
+        _qd_l = self.ur5e_l.data.joint_vel.clone()
+        _qd_r = self.ur5e_r.data.joint_vel.clone()
+        if self.cfg.obs_joint_pos_noise_std > 0.0:
+            _q_l  += self.cfg.obs_joint_pos_noise_std * torch.randn_like(_q_l)
+            _q_r  += self.cfg.obs_joint_pos_noise_std * torch.randn_like(_q_r)
+        if self.cfg.obs_joint_vel_noise_std > 0.0:
+            _qd_l += self.cfg.obs_joint_vel_noise_std * torch.randn_like(_qd_l)
+            _qd_r += self.cfg.obs_joint_vel_noise_std * torch.randn_like(_qd_r)
+        _eidx  = self.episode_length_buf
+        _abs_q  = torch.cat([_q_l,  _q_r],  dim=1)
+        _abs_qd = torch.cat([_qd_l, _qd_r], dim=1)
+        _rel_q  = _abs_q  - torch.cat([self.joints_l[_eidx],    self.joints_r[_eidx]],    dim=1)
+        _rel_qd = _abs_qd - torch.cat([self.joint_vel_l[_eidx], self.joint_vel_r[_eidx]], dim=1)
+
         if self.cfg.use_reference_obs:
             current_features = torch.cat([
-                self._get_joint_pos(relative=True),   # q - q_ref
-                self._get_joint_vel(relative=True),   # qd - qd_ref
-                obj_rel_pos, obj_rel_quat,            # box error vs reference
-                self._get_joint_pos(relative=False),
-                self._get_joint_vel(relative=False),
+                _rel_q, _rel_qd,                      # q - q_ref, qd - qd_ref (noisy)
+                obj_rel_pos, obj_rel_quat,
+                _abs_q, _abs_qd,                      # abs q, qd (same noise as rel)
                 obj_abs_pos, obj_abs_quat,
                 delayed_contact,
             ], dim=-1)
         else:
             current_features = torch.cat([
-                self._get_joint_pos(relative=False),
-                self._get_joint_vel(relative=False),
+                _abs_q, _abs_qd,
                 obj_abs_pos, obj_abs_quat,
                 delayed_contact,
             ], dim=-1)
@@ -710,8 +751,14 @@ class BoxliftEnv(DirectRLEnv):
         # between the expected joint state (joints) and the commanded target.
         planner_pd_l = ref_joints_target_l - ref_joints_l
         planner_pd_r = ref_joints_target_r - ref_joints_r
-        ref_EE_pose_l = self.EE_poses_l[idx_clamped]                                    # (N, 7)
-        ref_EE_pose_r = self.EE_poses_r[idx_clamped]
+        ref_EE_pose_l = torch.cat([                                                       # (N, 7)
+            self._robot_ee_ref_pos(self.EE_poses_l[idx_clamped, :3], "l"),
+            self._robot_ee_ref_quat(self.EE_poses_l[idx_clamped, 3:], "l"),
+        ], dim=-1)
+        ref_EE_pose_r = torch.cat([                                                       # (N, 7)
+            self._robot_ee_ref_pos(self.EE_poses_r[idx_clamped, :3], "r"),
+            self._robot_ee_ref_quat(self.EE_poses_r[idx_clamped, 3:], "r"),
+        ], dim=-1)
         ref_block = torch.cat([
             ref_obj_pos, ref_obj_quat, ref_obj_vel,                                     # 13
             ref_joints_l, ref_joints_r,                                                 # 12
@@ -861,6 +908,25 @@ class BoxliftEnv(DirectRLEnv):
         initial_joint_pos_r += pos_noise_std * torch.randn_like(initial_joint_pos_r)
         initial_joint_vel_r += vel_noise_std * torch.randn_like(initial_joint_vel_r)
         self.ur5e_r.write_joint_state_to_sim(initial_joint_pos_r, initial_joint_vel_r, env_ids=env_ids)
+
+        # Teleport robot bases to their per-env offset positions. Needed every reset because
+        # super()._reset_idx snaps articulations back to init_state (no offset).
+        base_pos_l = (self.arm_l_pose[:3].unsqueeze(0).expand(n, -1)
+                      + self.scene.env_origins[env_ids]
+                      + self.robot_base_offset_l[env_ids])
+        base_quat_l = quat_mul(self.robot_yaw_quat_l[env_ids],
+                               self.arm_l_pose[3:7].unsqueeze(0).expand(n, -1))
+        self.ur5e_l.write_root_pose_to_sim(
+            torch.cat([base_pos_l, base_quat_l], dim=-1), env_ids=env_ids
+        )
+        base_pos_r = (self.arm_r_pose[:3].unsqueeze(0).expand(n, -1)
+                      + self.scene.env_origins[env_ids]
+                      + self.robot_base_offset_r[env_ids])
+        base_quat_r = quat_mul(self.robot_yaw_quat_r[env_ids],
+                               self.arm_r_pose[3:7].unsqueeze(0).expand(n, -1))
+        self.ur5e_r.write_root_pose_to_sim(
+            torch.cat([base_pos_r, base_quat_r], dim=-1), env_ids=env_ids
+        )
 
         # Reset Object — base pose + per-axis noise (xy pos, yaw rot, xy lin_vel, z ang_vel).
         initial_object_pose = self.obj_poses[idx].clone()
@@ -1437,11 +1503,13 @@ class BoxliftEnv(DirectRLEnv):
             return pos_err, quat_err
 
         pos_err_l, quat_err_l = _per_arm(
-            self.EE_poses_l[idx, :3], self.EE_poses_l[idx, 3:],
+            self._robot_ee_ref_pos(self.EE_poses_l[idx, :3], "l"),
+            self._robot_ee_ref_quat(self.EE_poses_l[idx, 3:], "l"),
             EE_pos_lr[:, :3], EE_quat_lr[:, :4],
         )
         pos_err_r, quat_err_r = _per_arm(
-            self.EE_poses_r[idx, :3], self.EE_poses_r[idx, 3:],
+            self._robot_ee_ref_pos(self.EE_poses_r[idx, :3], "r"),
+            self._robot_ee_ref_quat(self.EE_poses_r[idx, 3:], "r"),
             EE_pos_lr[:, 3:], EE_quat_lr[:, 4:],
         )
         return pos_err_l, quat_err_l, pos_err_r, quat_err_r
@@ -1596,13 +1664,27 @@ class BoxliftEnv(DirectRLEnv):
             penalty += proximity.square()
         return self.cfg.w_proximity_to_contact * penalty
 
+    def _robot_ee_ref_pos(self, nominal_pos: torch.Tensor, arm: str) -> torch.Tensor:
+        """Apply per-env robot base offset+yaw to a batch of nominal EE positions (env-frame).
+        EE_ref = base_pos + offset + R_yaw * (nominal_pos - base_pos)
+        """
+        base_pos = self.arm_l_pose[:3] if arm == "l" else self.arm_r_pose[:3]
+        offset   = self.robot_base_offset_l if arm == "l" else self.robot_base_offset_r
+        yaw_q    = self.robot_yaw_quat_l    if arm == "l" else self.robot_yaw_quat_r
+        return base_pos + offset + quat_apply(yaw_q, nominal_pos - base_pos)
+
+    def _robot_ee_ref_quat(self, nominal_quat: torch.Tensor, arm: str) -> torch.Tensor:
+        """Rotate nominal EE quats by the per-env robot yaw."""
+        yaw_q = self.robot_yaw_quat_l if arm == "l" else self.robot_yaw_quat_r
+        return quat_mul(yaw_q, nominal_quat)
+
     def _get_EE_pos(self, relative=True) -> torch.Tensor:
         EE_pos_l = self.ur5e_l.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
         EE_pos_r = self.ur5e_r.data.body_pos_w[:, self.EE_link_idx].clone() - self.scene.env_origins
 
         if relative:
-            EE_pos_l -= self.EE_poses_l[self.episode_length_buf, :3]
-            EE_pos_r -= self.EE_poses_r[self.episode_length_buf, :3]
+            EE_pos_l -= self._robot_ee_ref_pos(self.EE_poses_l[self.episode_length_buf, :3], "l")
+            EE_pos_r -= self._robot_ee_ref_pos(self.EE_poses_r[self.episode_length_buf, :3], "r")
 
         return torch.cat((EE_pos_l, EE_pos_r), 1)
     
@@ -1622,9 +1704,9 @@ class BoxliftEnv(DirectRLEnv):
         EE_quat_r = self.ur5e_r.data.body_quat_w[:, self.EE_link_idx].clone()
 
         if relative:
-            desired_quat_l = self.EE_poses_l[self.episode_length_buf, 3:]
+            desired_quat_l = self._robot_ee_ref_quat(self.EE_poses_l[self.episode_length_buf, 3:], "l")
             EE_quat_l = quat_mul(desired_quat_l, quat_inv(EE_quat_l))
-            desired_quat_r = self.EE_poses_r[self.episode_length_buf, 3:]
+            desired_quat_r = self._robot_ee_ref_quat(self.EE_poses_r[self.episode_length_buf, 3:], "r")
             EE_quat_r = quat_mul(desired_quat_r, quat_inv(EE_quat_r))
 
         return torch.cat((EE_quat_l, EE_quat_r), 1)
@@ -1634,8 +1716,8 @@ class BoxliftEnv(DirectRLEnv):
         EE_quat_l = self.ur5e_l.data.body_quat_w[:, self.EE_link_idx].clone()
         EE_quat_r = self.ur5e_r.data.body_quat_w[:, self.EE_link_idx].clone()
 
-        desired_quat_l = self.EE_poses_l[self.episode_length_buf, 3:]
-        desired_quat_r = self.EE_poses_r[self.episode_length_buf, 3:]
+        desired_quat_l = self._robot_ee_ref_quat(self.EE_poses_l[self.episode_length_buf, 3:], "l")
+        desired_quat_r = self._robot_ee_ref_quat(self.EE_poses_r[self.episode_length_buf, 3:], "r")
 
         error_l = torch.abs(quat_error_magnitude(EE_quat_l, desired_quat_l))
         error_r = torch.abs(quat_error_magnitude(EE_quat_r, desired_quat_r))

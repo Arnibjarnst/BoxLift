@@ -463,6 +463,8 @@ current_actual_obj_pos = np.full(3, np.nan, dtype=np.float32)
 current_actual_obj_quat = np.full(4, np.nan, dtype=np.float32)
 
 
+print("hieohfioeh")
+
 def save_tracking_npz():
     """Snapshot tracking_log + policy_log and write the .npz. Safe to call multiple
     times — the write is idempotent (overwrite). Used by both the normal-exit path

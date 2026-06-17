@@ -72,4 +72,7 @@ tests/
 .aider*
 
 # Claude stuff
-.mpc.json
+.mcp.json
+
+# Experiment results
+experiments/comparison_results/

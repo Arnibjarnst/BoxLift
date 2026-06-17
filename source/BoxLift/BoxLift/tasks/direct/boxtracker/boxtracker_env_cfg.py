@@ -159,11 +159,17 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
     # - spaces definition (single arm: 6 actions, reduced obs)
     # action_space is recomputed in __post_init__: 6 residual + 1 phase if enable_phase_slowdown.
     action_space = 6
-    # obs = stacked per-step features * obs_history_steps + phase (1)
-    #       [+ (7 or 14) * len(future_obs_steps)  future ref obj pose deltas (+ absolute fut ref if include_absolute_obs)]
-    #       [+ 6                                  previous raw action]
-    # per-step features = relative_q (6) + relative_qd (6)  [+ relative_obj_pos (3) + relative_obj_quat (4) if include_object_obs]
-    #                     [+ absolute_q (6) + absolute_qd (6)  [+ absolute_obj_pos (3) + absolute_obj_quat (4) if include_object_obs] if include_absolute_obs]
+    # obs = stacked per-step features * obs_history_steps
+    #       [+ (7 or 14) * len(future_obs_steps)  future ref obj pose deltas]   (reference mode)
+    #       [+ 14                                  goal pose rel(7) + abs(7)]    (reference_agnostic mode)
+    #       [+ 6                                   previous raw action]
+    # per-step features (reference mode):
+    #   relative_q (6) + relative_qd (6)  [+ relative_obj_pos (3) + relative_obj_quat (4) if include_object_obs]
+    #   [+ absolute_q (6) + absolute_qd (6)  [+ absolute_obj_pos (3) + absolute_obj_quat (4)] if include_absolute_obs]
+    # per-step features (reference_agnostic mode):
+    #   absolute_q (6) + absolute_qd (6)  [+ absolute_obj_pos (3) + absolute_obj_quat (4) if include_object_obs]
+    # When reference_agnostic=True, future_obs_steps is ignored and a 14-dim goal obs
+    # (rel_pos 3 + rel_quat 4 + abs_pos 3 + abs_quat 4) is appended instead.
     obs_history_steps = 3
     # Toggle object (box) state (pose only — pos 3 + quat 4 = 7 dims) in the observation
     # history. The policy is expected to recover implicit velocity from the pose history;
@@ -179,13 +185,13 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
     # as (pos_delta (3) + quat_delta (4)) relative to the reference at the current phase.
     # If include_absolute_obs, also appends absolute (pos (3) + quat (4)) per offset.
     # Empty tuple = disabled.
-    future_obs_steps = (1,2,3,4,5)
+    future_obs_steps = (1,2,3,4,5,10,15,20,40)
     # Include previous raw residual action (6 dims) in the observation.
     include_prev_actions = True
     # Include a single thresholded contact bool (EE ↔ cube) in the per-step observation.
     # 1.0 when the EE contact sensor reports |force| > contact_threshold, else 0.0.
     # Real-side analog: thresholded delta of getActualTCPForce() vs a baseline.
-    include_contact_obs = False
+    include_contact_obs = True
     # Force magnitude threshold (N) for the contact bool. ~0.5–2N is reasonable for the
     # sphere EE on the cube; tune by inspecting force-magnitude histograms in obvious
     # contact vs free motion.
@@ -204,6 +210,12 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
     # Helps the policy with relative tracking since the box frame is the natural one
     # for contact-rich manipulation. The reward path's EE-box-relative term is unchanged.
     include_ee_box_obs = False
+    # Reference-agnostic mode: drop all reference-relative obs (relative_q, relative_obj,
+    # future waypoints) and replace them with absolute-only per-step features + a 14-dim
+    # goal conditioning obs (trajectory end-pose: rel_pos 3 + rel_quat 4 + abs_pos 3 + abs_quat 4).
+    # Enables training a generalized policy that conditions on a goal pose rather than a
+    # reference trajectory. include_absolute_obs and future_obs_steps are ignored when True.
+    reference_agnostic: bool = False
     observation_space = {"policy": 13, "privileged": 85}  # recomputed in __post_init__
     state_space = 0
 
@@ -262,6 +274,16 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
 
     @property
     def per_step_feature_dim(self) -> int:
+        if self.reference_agnostic:
+            # Absolute-only features — no reference to subtract from.
+            dim = 12  # abs_q (6) + abs_qd (6)
+            if self.include_object_obs:
+                dim += 7  # abs obj pos (3) + quat (4)
+            if self.include_contact_obs:
+                dim += 1
+            if self.include_ee_box_obs:
+                dim += 7  # abs EE-in-box only (pos 3 + quat 4)
+            return dim
         # 12: relative joint pos (6) + relative joint vel (6) — always present.
         # If include_object_obs: + 7 (obj pos 3 + obj quat 4).
         # If include_absolute_obs: doubles the whole thing (joint and obj parts mirrored).
@@ -286,8 +308,11 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
         # policy must be phase-agnostic so it generalizes across arbitrary segments),
         # so there is no "+ 1" here unlike boxhinge.
         actor_dim = self.per_step_feature_dim * self.obs_history_steps
-        future_dim = 14 if self.include_absolute_obs else 7
-        actor_dim += future_dim * len(self.future_obs_steps)
+        if self.reference_agnostic:
+            actor_dim += 14  # goal: rel_pos (3) + rel_quat (4) + abs_pos (3) + abs_quat (4)
+        else:
+            future_dim = 14 if self.include_absolute_obs else 7
+            actor_dim += future_dim * len(self.future_obs_steps)
         if self.include_prev_actions:
             actor_dim += 6
         self.observation_space = {"policy": actor_dim, "privileged": 85}
@@ -373,9 +398,9 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
 
     # Box reset noise: xy-plane for translation / linear vel; small 3-axis rotation + ang vel.
     reset_obj_pos_xy_noise = 0.02        # m, std on box x,y position (z unchanged)
-    reset_obj_lin_vel_xy_noise = 0.05    # m/s, std on box linear x,y velocity (z unchanged)
-    reset_obj_ori_noise = 0.1            # rad, axis-angle std for small orientation perturbation
-    reset_obj_ang_vel_noise = 0.1        # rad/s, std on box angular velocity (z axis)
+    reset_obj_lin_vel_xy_noise = 0.0     # m/s, std on box linear x,y velocity (z unchanged)
+    reset_obj_ori_noise = 0.05           # rad, axis-angle std for small orientation perturbation
+    reset_obj_ang_vel_noise = 0.0        # rad/s, std on box angular velocity (z axis)
 
     # Box observation noise (sim2real). Sampled fresh each step, applied ONLY to the
     # observation path — rewards still see the clean ground-truth box state. Same noise
@@ -451,6 +476,18 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
     # in the same regime it was trained at (critical for mode D, where α controls the
     # action blend between planner feedforward and learned residual).
     force_alpha: float = -1
+
+    # BC curriculum (action_mode == "BC" only). α ramps linearly 0→1 over the window
+    # [bc_start_steps, bc_end_steps] (in common_step_counter units, i.e. env steps).
+    # At α=0: pure mode B (residual on trajectory positions).
+    # At α=1: pure mode C (residual on current joint positions).
+    # Before bc_start_steps: α=0 (pure B). After bc_end_steps: α=1 (pure C).
+    # bc_end_steps=0 disables the curriculum (stays at α=0, pure B always).
+    # Tracking reward decays in sync: w_track interpolates w_track_start→w_track over α.
+    # With 1024 envs and 24 steps/iter: 1 iter ≈ 24 env steps.
+    # Example: start at 10k iters, ramp over 10k iters → bc_start_steps=240_000, bc_end_steps=480_000
+    bc_start_steps: int = 0
+    bc_end_steps: int = 0
 
     # === Task reward aggregation form ===
     # "sum"     — legacy: rew_task = w_pos·exp(-d²/σ²) + w_quat·exp(-d²/σ²) + vel terms.
@@ -685,8 +722,8 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
     # majority dominate the mean). 0.65 is calibrated so a small completion-rate dip
     # (≈95%) brings the mean below threshold and pauses decay, giving the policy time
     # to adapt to the kp level before VOC weakens further.
-    voc_threshold_task: float = 0.5     # task reward (obj_pos · obj_quat or sum form)
-    voc_threshold_track: float = 0.4    # tracking reward (eef_box_rel + eef_pos + ...)
+    voc_threshold_task: float = 0.7     # task reward (obj_pos · obj_quat or sum form)
+    voc_threshold_track: float = 0.0    # tracking reward (eef_box_rel + eef_pos + ...)
     # Warmup period (in env steps via common_step_counter) before any decay can fire.
     # common_step_counter increments by 1 per env step (not per env*step), so this
     # divides by num_steps_per_env=24 to get "iterations": 5000 / 24 ≈ 208 iters.
@@ -701,7 +738,7 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
     # segment. When False (default), the original global scalar VOC behavior is preserved
     # — a single kp/kv decays in lockstep across all segments. Per-segment ring buffer
     # is sized (S, voc_reward_window_size); per-seg decay gating uses the same thresholds.
-    voc_per_segment: bool = False
+    voc_per_segment: bool = True
 
 
 def get_ur5e_cfg(

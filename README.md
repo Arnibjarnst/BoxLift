@@ -1,135 +1,184 @@
-# Template for Isaac Lab Projects
+# BoxLift
+
+Residual reinforcement learning for contact-rich dual-arm manipulation in
+[NVIDIA IsaacLab](https://github.com/isaac-sim/IsaacLab). A PPO policy learns
+joint-space corrections on top of a pre-computed nominal trajectory, enabling a
+pair of UR5e robots to reliably lift a box off a table in spite of contact
+dynamics the nominal planner cannot model exactly.
 
 ## Overview
 
-This project/repository serves as a template for building projects or extensions based on Isaac Lab.
-It allows you to develop in an isolated environment, outside of the core Isaac Lab repository.
+The core idea is **residual policy learning**: rather than learning a
+manipulation policy from scratch, the RL agent outputs small corrections
+(`action_scale * π(obs)`) that are added to a reference joint trajectory. 
+```
+q_target[t] = q_nominal[t] + action_scale * π_residual(obs[t])
+```
 
-**Key Features:**
+## Repository structure
 
-- `Isolation` Work outside the core Isaac Lab repository, ensuring that your development efforts remain self-contained.
-- `Flexibility` This template is set up to allow your code to be run as an extension in Omniverse.
+```
+BoxLift/
+├── scripts/
+│   ├── rsl_rl/
+│   │   ├── train.py              # main training entry point
+│   │   ├── play.py               # evaluation; exports ONNX + TorchScript
+│   │   ├── record.py             # record rollout data to JSON
+│   │   └── cli_args.py           # shared argument parsing
+│   ├── ur_rtde_real_time.py           # deploy ONNX policy on real UR5e (main deployment script)
+│   ├── ur_rtde_fixed_traj.py          # replay fixed trajectory on real robot (sysid / baseline)
+│   ├── ur_rtde_test.py                # harmonic oscillation test for motor delay measurement
+│   ├── ur_rtde_estimate_pose_delay.py # estimate latency of the pose-estimation pipeline
+│   ├── log_robot_pose.py              # log TCP pose + joints while jogging from teach pendant
+│   ├── visualize_traj.py              # visualize a trajectory .npz in Isaac Sim
+│   ├── follow_joint_targets.py        # simple trajectory playback in sim
+│   ├── record_dataset.py              # run record.py once per .npz in a dataset folder
+│   ├── rollout_summary.py             # per-env success analysis for multi-env rollouts
+│   ├── rollout_plots.py               # plot rollout summaries (sim + real-robot batches)
+│   ├── plot_rollout_rewards.py        # plot per-step rewards / errors from a rollout NPZ
+│   ├── eval_rollout.py                # evaluate final-pose quality of a recorded rollout
+│   ├── add_noise_to_traj.py           # add Gaussian noise to joint reference fields of a .npz
+│   ├── ursim_step_response.py         # capture step-response transient from URSim / real robot
+│   ├── match_step_response.py         # check whether IsaacSim PD reproduces URSim step response
+│   ├── match_ursim_dynamics.py        # one-step prediction error: IsaacSim vs URSim/real
+│   ├── sweep_kp_kd_per_joint.py       # per-joint kp/kd sweep against a URSim rollout (single IsaacSim session)
+│   ├── sysid_actuator_sweep.py        # full actuator / gain system-identification sweep
+│   └── zero_agent.py / random_agent.py # baseline agents for environment testing
+│
+├── source/BoxLift/BoxLift/tasks/direct/
+│   ├── boxlift/                  # ★ main task: dual-arm box lifting
+│   ├── boxhinge/                 # single-arm box hinge manipulation
+│   ├── boxpush/                  # single-arm box pushing
+│   ├── boxtracker/               # single-arm task with multi-trajectory pool + continuous phase
+│   ├── boxmagic/                 # box lifting with modified collision properties
+│   ├── boxliftpool/              # dual-arm lifting with multi-trajectory pool (experimental)
+│   └── jointtarget/              # simple joint-target tracking (diagnostics / sysid)
+│
+├── reference_trajectories/       # pre-computed nominal trajectories (.npz)
+│   ├── box_lift_ur5e/
+│   ├── box_hinge_ur5e/
+│   ├── box_push_ur5e/
+│   └── box_rotate_ur5e/
+│
+├── experiments/                  # hyperparameter sweep shell scripts
+├── notebooks/                    # analysis notebooks
+├── stubs/                        # type stubs for ur_rtde (rtde_control, rtde_receive, …)
+├── robots/                       # USD robot assets (ur5e.usd)
+└── tag_pose_estimation/          # AprilTag-based cube pose estimation (separate package)
+```
 
-**Keywords:** extension, template, isaaclab
+## Environments
+
+All environments follow the IsaacLab `DirectRLEnv` pattern. The main task is
+**`Template-Boxlift-Direct-v0`**; the others are either earlier single-arm
+variants or experimental environments.
+
+| Task ID | Description |
+|---|---|
+| `Template-Boxlift-Direct-v0` | **Primary.** Dual-arm UR5e box lifting with VOC curriculum |
+| `Template-Boxhinge-Direct-v0` | Single-arm hinge manipulation |
+| `Template-Boxpush-Direct-v0` | Single-arm box pushing |
+| `Template-Boxtracker-Direct-v0` | Single-arm; multi-traj pool, continuous phase, adaptive playback speed |
+| `Template-Boxmagic-Direct-v0` | Dual-arm lift with modified collision properties (experimental) |
+| `Boxliftpool-Direct-v0` | Dual-arm lift with multi-trajectory pool (experimental) |
+| `Follow-Joint-Targets` | Joint-target tracking (diagnostics) |
+
+### boxlift (primary)
+
+The dual-arm environment. Key design points:
+
+- **Action space (12D):** Joint position residuals, 6 per arm. Added to the
+  nominal trajectory target after scaling by `action_scale` and clamped to
+  joint limits.
+- **Action modes:** Several formulations are supported (`A`–`D`, `BC`), ranging
+  from residual-on-planner-target to residual-on-current-position, with optional
+  curriculum blending between modes.
+- **Observations (actor):** Relative and absolute joint positions/velocities,
+  box pose error vs reference (delayed + sub-rate tracker model), contact bools,
+  trajectory phase, future box waypoints, previous action. A history of the last
+  `obs_history_steps` steps is stacked.
+- **Privileged observations (critic):** Clean box state, DR sample values
+  (friction, mass, actuator gains), full reference state at current phase, EE
+  contact forces, EE-in-box-frame errors, VOC/curriculum context.
+- **Rewards:** Task (box position + orientation vs reference), tracking
+  (EE position, EE-in-box-frame during contact), regularization (joint
+  acceleration, torque, action rate/norm, joint limits, illegal contact,
+  flange-forearm proximity).
+- **VOC curriculum:** A virtual PD wrench drives the box along its reference
+  trajectory while the policy learns. The gain decays segment-by-segment as
+  reward thresholds are met, handing full control to the policy progressively.
+- **Domain randomisation:** EE and object friction, actuator gains (±50%),
+  object mass, gravity noise, robot base pose (XYZ + yaw, fixed per env for the
+  full training run), joint observation noise.
+- **Reset:** Random State Initialisation (RSI) — resets to a random phase of
+  the trajectory. Configurable bias toward phase 0 and toward segments still
+  under VOC assist.
 
 ## Installation
 
-- Install Isaac Lab by following the [installation guide](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html).
-  We recommend using the conda or uv installation as it simplifies calling Python scripts from the terminal.
-
-- Clone or copy this project/repository separately from the Isaac Lab installation (i.e. outside the `IsaacLab` directory):
-
-- Using a python interpreter that has Isaac Lab installed, install the library in editable mode using:
-
-    ```bash
-    # use 'PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-    python -m pip install -e source/BoxLift
-
-- Verify that the extension is correctly installed by:
-
-    - Listing the available tasks:
-
-        Note: It the task name changes, it may be necessary to update the search pattern `"Template-"`
-        (in the `scripts/list_envs.py` file) so that it can be listed.
-
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/list_envs.py
-        ```
-
-    - Running a task:
-
-        ```bash
-        # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-        python scripts/<RL_LIBRARY>/train.py --task=<TASK_NAME>
-        ```
-
-    - Running a task with dummy agents:
-
-        These include dummy agents that output zero or random agents. They are useful to ensure that the environments are configured correctly.
-
-        - Zero-action agent
-
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/zero_agent.py --task=<TASK_NAME>
-            ```
-        - Random-action agent
-
-            ```bash
-            # use 'FULL_PATH_TO_isaaclab.sh|bat -p' instead of 'python' if Isaac Lab is not installed in Python venv or conda
-            python scripts/random_agent.py --task=<TASK_NAME>
-            ```
-
-### Set up IDE (Optional)
-
-To setup the IDE, please follow these instructions:
-
-- Run VSCode Tasks, by pressing `Ctrl+Shift+P`, selecting `Tasks: Run Task` and running the `setup_python_env` in the drop down menu.
-  When running this task, you will be prompted to add the absolute path to your Isaac Sim installation.
-
-If everything executes correctly, it should create a file .python.env in the `.vscode` directory.
-The file contains the python paths to all the extensions provided by Isaac Sim and Omniverse.
-This helps in indexing all the python modules for intelligent suggestions while writing code.
-
-### Setup as Omniverse Extension (Optional)
-
-We provide an example UI extension that will load upon enabling your extension defined in `source/BoxLift/BoxLift/ui_extension_example.py`.
-
-To enable your extension, follow these steps:
-
-1. **Add the search path of this project/repository** to the extension manager:
-    - Navigate to the extension manager using `Window` -> `Extensions`.
-    - Click on the **Hamburger Icon**, then go to `Settings`.
-    - In the `Extension Search Paths`, enter the absolute path to the `source` directory of this project/repository.
-    - If not already present, in the `Extension Search Paths`, enter the path that leads to Isaac Lab's extension directory directory (`IsaacLab/source`)
-    - Click on the **Hamburger Icon**, then click `Refresh`.
-
-2. **Search and enable your extension**:
-    - Find your extension under the `Third Party` category.
-    - Toggle it to enable your extension.
-
-## Code formatting
-
-We have a pre-commit template to automatically format your code.
-To install pre-commit:
+Install [IsaacLab](https://isaac-sim.github.io/IsaacLab/main/source/setup/installation/index.html)
+first, then:
 
 ```bash
-pip install pre-commit
+# Clone this repo outside the IsaacLab directory
+git clone <repo-url> BoxLift
+cd BoxLift
+
+# Install in editable mode using the IsaacLab Python environment
+python -m pip install -e source/BoxLift
 ```
 
-Then you can run pre-commit with:
+Verify the install:
 
 ```bash
-pre-commit run --all-files
+python scripts/list_envs.py          # should list all registered tasks
 ```
 
-## Troubleshooting
+## Usage
 
-### Pylance Missing Indexing of Extensions
+### Recording rollouts
 
-In some VsCode versions, the indexing of part of the extensions is missing.
-In this case, add the path to your extension in `.vscode/settings.json` under the key `"python.analysis.extraPaths"`.
-
-```json
-{
-    "python.analysis.extraPaths": [
-        "<path-to-ext-repo>/source/BoxLift"
-    ]
-}
+```bash
+python scripts/rsl_rl/record.py \
+    --task Template-Boxlift-Direct-v0 \
+    --trajectory_path <path> \
+    --num_envs 16 \
+    --checkpoint <path-to-model.pt>
 ```
 
-### Pylance Crash
+### Deployment on real UR5e
 
-If you encounter a crash in `pylance`, it is probable that too many files are indexed and you run out of memory.
-A possible solution is to exclude some of omniverse packages that are not used in your project.
-To do so, modify `.vscode/settings.json` and comment out packages under the key `"python.analysis.extraPaths"`
-Some examples of packages that can likely be excluded are:
-
-```json
-"<path-to-isaac-sim>/extscache/omni.anim.*"         // Animation packages
-"<path-to-isaac-sim>/extscache/omni.kit.*"          // Kit UI tools
-"<path-to-isaac-sim>/extscache/omni.graph.*"        // Graph UI tools
-"<path-to-isaac-sim>/extscache/omni.services.*"     // Services tools
-...
+```bash
+python scripts/ur_rtde_real_time.py \
+    --onnx_model_path logs/rsl_rl/boxlift/<run>/exported/policy.onnx \
+    --reference_trajectory_path reference_trajectories/box_lift_ur5e/<traj>.npz \
+    --real_robot
 ```
+
+The deployment script runs two threads: a policy thread (50 Hz) and a control
+thread (500 Hz) that linearly interpolates between policy targets and sends them
+via `servoJ()`. It aborts immediately on any safety or robot-mode fault.
+
+Robot IP defaults: `192.168.1.100` (real), `192.168.56.1` (Linux URSim),
+`172.29.144.1` (Windows URSim).
+
+## Trajectory file format
+
+Trajectories are `.npz` files with the following arrays:
+
+| Key | Shape | Description |
+|---|---|---|
+| `joints_l` / `joints_r` | `(T, 6)` | Joint positions per timestep |
+| `joints_target_l` / `joints_target_r` | `(T, 6)` | Planner joint targets (residual is added to these) |
+| `joint_vel_l` / `joint_vel_r` | `(T, 6)` | Joint velocities |
+| `EE_poses_l` / `EE_poses_r` | `(T, 7)` | End-effector poses `[pos_xyz, quat_xyzw]` |
+| `obj_poses` | `(T, 7)` | Object poses `[pos_xyz, quat_xyzw]` |
+| `obj_vel` | `(T, 6)` | Object linear + angular velocity |
+| `arm_l_pose` / `arm_r_pose` | `(7,)` | Robot base poses `[pos_xyz, quat_xyzw]` |
+| `dt` | scalar | Timestep (must equal `physics_dt * decimation = 0.02 s`) |
+
+## Related
+
+`tag_pose_estimation/` is a separate package in this repository for
+AprilTag-based cube pose estimation used during real-robot experiments. See its
+own [README](tag_pose_estimation/README.md).

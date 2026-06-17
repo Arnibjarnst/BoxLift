@@ -238,6 +238,13 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     obs_obj_pos_bias_std: float = 0.005  # m, std on per-episode constant pos offset
     obs_obj_ori_bias_std: float = 0.005  # rad, std on per-episode constant ori offset
 
+    # Per-step Gaussian noise on joint position/velocity observations. The same noise
+    # sample is used for both the absolute and relative obs so the difference (rel = abs -
+    # ref) reflects a single consistent noisy reading, not two independent samples.
+    # Privileged obs and reward paths read raw .data values and are unaffected.
+    obs_joint_pos_noise_std: float = 0.005   # rad
+    obs_joint_vel_noise_std: float = 0.05   # rad/s
+
     def __post_init__(self) -> None:
         # Idempotent: must be safe to call twice (the env's __init__ calls it again
         # after Hydra CLI overrides land on the cfg).
@@ -374,6 +381,12 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     reset_obj_lin_vel_xy_noise = 0.0     # m/s, std on box linear x,y velocity
     reset_obj_ori_noise = 0.03           # rad, axis-angle std for small yaw perturbation
     reset_obj_ang_vel_noise = 0.0        # rad/s, std on box angular velocity (z axis)
+
+    # Per-env robot base pose randomization, sampled once at startup and held fixed for the
+    # entire training run. Models real-robot placement uncertainty; the RL residual compensates.
+    # With 1024 envs a 1-2 cm XYZ std and 2-5° yaw std give broad coverage.
+    robot_pos_randomization_xyz_std: float = 0.01   # m, std on XYZ base position offset (independent per arm)
+    robot_ori_randomization_yaw_std: float = 0.02   # rad, std on yaw (Z-axis rotation) offset (independent per arm)
 
     # Probability that a reset overrides random RSI and starts the episode at phase=0
     # instead. Pure RSI samples phase=0 with prob ~1/T (often <1%) — far too low for
