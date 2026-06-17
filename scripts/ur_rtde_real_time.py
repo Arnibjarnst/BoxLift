@@ -61,9 +61,6 @@ POSE_ESTIMATION_PORT = 5555
 BOX_BOARD_ID = "0"
 POSE_FIRST_POSE_TIMEOUT_S = 5.0
 
-MEASURED_OFFSET = np.array([-0.013, -0.013, 0])
-
-
 # ---------------------------
 # Argument parsing
 # ---------------------------
@@ -252,6 +249,10 @@ output_name = session.get_outputs()[0].name
 logger.info("Loading reference trajectory file", extra={"step": -1})
 traj = np.load(reference_trajectory_path)
 
+vel_threshold = 0.05
+first_contact_i = np.where(np.linalg.norm(traj["obj_vel"], axis=1) > vel_threshold)[0][0]
+
+
 # Detect single vs dual arm trajectory
 dual_arm = "joints_l" in traj
 
@@ -261,10 +262,18 @@ if dual_arm:
     joints_target = traj["joints_target_l"]
     joints_r      = traj["joints_r"]
     joint_vel_r   = traj["joint_vel_r"]
+    joints_target_r = traj["joints_target_r"]
 else:
     joints        = traj["joints"]
     joint_vel_ref = traj["joint_vel"]
     joints_target = traj["joints_target"]
+
+JOINT_OFFSET = np.array([np.pi, 0, 0, 0, 0, 0])
+joints += JOINT_OFFSET
+joints_target += JOINT_OFFSET
+if dual_arm:
+    joints_r += JOINT_OFFSET
+    joints_target_r += JOINT_OFFSET
 
 # Reference object pose trajectory. Assumed to always be present and the same length as
 # `joints` (i.e. one entry per trajectory step).
@@ -320,13 +329,21 @@ IDENTITY_QUAT_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 # trained against sim coordinates. Apply this to the pose before feeding it to the
 # policy and before logging, so saved obj poses are directly comparable to the
 # reference trajectory in `obj_poses`.
+# REAL_TO_SIM_R = np.array(
+#     [[-1.0, 0.0, 0.0],
+#      [ 0.0,-1.0, 0.0],
+#      [ 0.0, 0.0, 1.0]], dtype=np.float32,
+# )
 REAL_TO_SIM_R = np.array(
-    [[-1.0, 0.0, 0.0],
-     [ 0.0,-1.0, 0.0],
-     [ 0.0, 0.0, 1.0]], dtype=np.float32,
+    [[1.0, 0.0, 0.0],
+     [0.0, 1.0, 0.0],
+     [0.0, 0.0, 1.0]], dtype=np.float32,
 )
 # 180° about z in (w, x, y, z); used as q_R * q_in_world = q_in_sim.
-REAL_TO_SIM_Q_WXYZ = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+# REAL_TO_SIM_Q_WXYZ = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+REAL_TO_SIM_Q_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+
+MEASURED_OFFSET = np.array([0.04, -0.073, 0])
 
 
 def real_to_sim_pose(pose):
@@ -403,8 +420,8 @@ if args.real_robot:
         robot_ip_l = "192.168.1.33"
         robot_ip_r = "192.168.1.66"
 elif os_used == "win32":
-    robot_ip_l = "172.29.144.1"
-    robot_ip_r = "172.29.144.2"
+    robot_ip_l = "172.29.144.101"
+    robot_ip_r = "172.29.144.102"
 else:
     robot_ip_l = "192.168.56.101"
     robot_ip_r = "192.168.56.102"
@@ -414,6 +431,7 @@ dt = 1 / rtde_frequency
 policy_decimation = 10
 max_steps = (len(joints) - 2) * policy_decimation
 max_wallclock_steps = max_steps * 2
+# max_wallclock_steps = first_contact_i * policy_decimation
 
 # Global arms list (1 or 2 RTDEArm objects). All non-IsaacSim control goes through this.
 arms: list[RTDEArm] = []
@@ -426,7 +444,7 @@ if not args.isaacsim:
 
     if dual_arm:
         logger.info(f"Connecting to right arm at {robot_ip_r}", extra={"step": -1})
-        arm_r = RTDEArm("right", robot_ip_r, joints_r, traj["joints_target_r"], joint_vel_r, rtde_frequency)
+        arm_r = RTDEArm("right", robot_ip_r, joints_r, joints_target_r, joint_vel_r, rtde_frequency)
         arms.append(arm_r)
         logger.info("Right arm connected", extra={"step": -1})
 
@@ -488,17 +506,23 @@ def save_tracking_npz():
         return
     tracking_npz_path = os.path.join(log_dir, f"{run_tag}.npz")
 
+    # Subtract the +π base-joint offset that was applied at load time so saved
+    # joint arrays are back in the planner/policy frame and can be visualized
+    # against the original arm_l_pose / arm_r_pose without modification.
+    _n_joints = 12 if dual_arm else 6
+    _log_joint_offset = np.tile(JOINT_OFFSET, _n_joints // 6)
+
     arrays = {}
     if snapshot:
         arrays.update(
             steps=np.array([d["step"] for d in snapshot]),
             phase=np.array([d["phase"] for d in snapshot]),
-            actual_q=np.array([d["actual_q"] for d in snapshot]),
+            actual_q=np.array([d["actual_q"] for d in snapshot]) - _log_joint_offset,
             actual_qd=np.array([
                 d.get("actual_qd", np.full(6, np.nan, dtype=np.float32)) for d in snapshot
             ]),
-            expected_q=np.array([d["expected_q"] for d in snapshot]),
-            target_q=np.array([d["target_q"] for d in snapshot]),
+            expected_q=np.array([d["expected_q"] for d in snapshot]) - _log_joint_offset,
+            target_q=np.array([d["target_q"] for d in snapshot]) - _log_joint_offset,
             actual_obj_pos=np.array([d["actual_obj_pos"] for d in snapshot]),
             actual_obj_quat=np.array([d["actual_obj_quat"] for d in snapshot]),
             # External TCP wrench [Fx, Fy, Fz, Tx, Ty, Tz] in UR base frame.
@@ -915,7 +939,9 @@ def policy_thread():
                 contact_dims = [0.0, 0.0]
             contact_arr = np.array(contact_dims, dtype=np.float32)
 
-            abs_q  = np.concatenate([q.astype(np.float32)  for q  in qs])
+            # Subtract the base-joint offset so abs_q is in the planner/policy frame,
+            # matching what the sim saw during training. rel_q is unaffected (offset cancels).
+            abs_q  = np.concatenate([(q - JOINT_OFFSET).astype(np.float32) for q in qs])
             abs_qd = np.concatenate([qd.astype(np.float32) for qd in qds])
             rel_q  = np.concatenate([(qs[i]  - ref_q[i]).astype(np.float32)  for i in range(len(arms))])
             rel_qd = np.concatenate([(qds[i] - ref_qd[i]).astype(np.float32) for i in range(len(arms))])
@@ -934,6 +960,8 @@ def policy_thread():
         else:
             actual_q  = qs[0]
             actual_qd = qds[0]
+            # ref_q[0] is in offset frame (joints += JOINT_OFFSET at load); physical reading
+            # is also in offset frame, so the offset cancels and rel_q is correct as-is.
             relative_q  = (actual_q  - ref_q[0]).astype(np.float32)
             relative_qd = (actual_qd - ref_qd[0]).astype(np.float32)
             feature_parts = [relative_q, relative_qd]
@@ -941,7 +969,8 @@ def policy_thread():
                 feature_parts.append(rel_obj_pos.astype(np.float32))
                 feature_parts.append(rel_obj_quat.astype(np.float32))
             if include_absolute_obs:
-                feature_parts.append(actual_q.astype(np.float32))
+                # De-offset so abs_q is in the planner/policy frame, matching training.
+                feature_parts.append((actual_q - JOINT_OFFSET).astype(np.float32))
                 feature_parts.append(actual_qd.astype(np.float32))
                 if include_object_obs:
                     feature_parts.append(abs_obj_pos.astype(np.float32))
