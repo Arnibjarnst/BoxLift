@@ -102,10 +102,21 @@ import gymnasium as gym
 import numpy as np
 import os
 import re
+import sys
 import time
 import torch
 import yaml
+from pathlib import Path
 
+# isaaclab_rl, isaaclab_tasks and rsl_rl live alongside isaaclab in the source tree.
+# When running with plain `python` (not isaaclab.sh) they may not be on sys.path yet.
+# Derive their location from the isaaclab package that AppLauncher already loaded.
+import isaaclab as _isaaclab_pkg
+_isaaclab_src_root = Path(_isaaclab_pkg.__file__).resolve().parent.parent.parent
+for _pkg_name in ("isaaclab_rl", "isaaclab_tasks", "rsl_rl"):
+    _pkg_path = str(_isaaclab_src_root / _pkg_name)
+    if Path(_pkg_path).exists() and _pkg_path not in sys.path:
+        sys.path.insert(0, _pkg_path)
 
 from rsl_rl.runners import DistillationRunner, OnPolicyRunner
 
@@ -414,10 +425,29 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         "actual_obj_pos": [],    # (T, N, 3)
         "actual_obj_quat": [],   # (T, N, 4)
         "joint_torques": [],     # (T, N, J)
+        "ee_force": [],          # (T, N, S, 3) net contact-force vector per EE sensor (world frame)
+        "ee_force_mag": [],      # (T, N, S)   scalar total contact magnitude per EE sensor
         "rewards": [],           # (T, N) per-env reward; mean over alive envs derived at save
         "alive_mask": [],        # (T, N) bool: True if env was alive going INTO this step
         "done_this_step": [],    # (T, N) bool: True iff env's `done` fired at this step
     }
+
+    # EE contact sensors (boxlift/boxhinge/boxtracker have them; absent on simpler envs).
+    _ee_sensors = getattr(direct_env, "ee_contact_sensors", [])
+
+    def _ee_forces_all():
+        """Returns (N, S, 3) net force and (N, S) magnitude; zeros if no sensors."""
+        if not _ee_sensors:
+            return (np.zeros((num_envs, 0, 3), dtype=np.float32),
+                    np.zeros((num_envs, 0),    dtype=np.float32))
+        vecs = []
+        mags = []
+        for sensor in _ee_sensors:
+            f = sensor.data.force_matrix_w          # (N, n_bodies, n_filter, 3)
+            vecs.append(f.sum(dim=(1, 2)).detach().cpu().numpy())           # (N, 3)
+            mags.append(f.norm(dim=-1).sum(dim=(-1, -2)).detach().cpu().numpy())  # (N,)
+        return (np.stack(vecs, axis=1).astype(np.float32),   # (N, S, 3)
+                np.stack(mags, axis=1).astype(np.float32))   # (N, S)
     extras_log = []          # per-step dicts of {metric_key: float} — already env-mean
     extras_per_env_log = []  # per-step dicts of {metric_key: (N,) numpy array} — when the env
                              # exposes `extras["log_per_env"]` (boxlift does). Lets downstream
@@ -510,6 +540,9 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             rollout["actual_obj_pos"].append(obj_pos_all)
             rollout["actual_obj_quat"].append(obj_quat_all)
             rollout["joint_torques"].append(_applied_torques_all())
+            _ef_vec, _ef_mag = _ee_forces_all()
+            rollout["ee_force"].append(_ef_vec)
+            rollout["ee_force_mag"].append(_ef_mag)
             rollout["rewards"].append(rewards.detach().cpu().numpy().astype(np.float32))
             rollout["alive_mask"].append(alive_now)
             newly_done = (dones & alive)
@@ -547,7 +580,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
             already_dead = ~alive_now                        # were already dead at start
             if dead_after.any():
                 for k in ("phase", "actual_q", "expected_q", "target_q",
-                          "actual_obj_pos", "actual_obj_quat", "joint_torques"):
+                          "actual_obj_pos", "actual_obj_quat", "joint_torques",
+                          "ee_force", "ee_force_mag"):
                     arr = rollout[k][-1]
                     arr[dead_after, ...] = np.nan
                 if log_pe_entry:
@@ -612,6 +646,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
     actual_obj_pos_arr  = np.stack(rollout["actual_obj_pos"], axis=0)  # (T, N, 3)
     actual_obj_quat_arr = np.stack(rollout["actual_obj_quat"],axis=0)  # (T, N, 4)
     joint_torques_arr   = np.stack(rollout["joint_torques"],  axis=0)
+    ee_force_arr        = np.stack(rollout["ee_force"],       axis=0)   # (T, N, S, 3)
+    ee_force_mag_arr    = np.stack(rollout["ee_force_mag"],   axis=0)   # (T, N, S)
     rewards_arr         = np.stack(rollout["rewards"],        axis=0).astype(np.float32)  # (T, N)
     alive_mask_arr      = np.stack(rollout["alive_mask"],     axis=0).astype(np.bool_)    # (T, N)
     done_this_step_arr  = np.stack(rollout["done_this_step"], axis=0).astype(np.bool_)
@@ -646,6 +682,8 @@ def main(env_cfg: ManagerBasedRLEnvCfg | DirectRLEnvCfg | DirectMARLEnvCfg, agen
         actual_obj_pos=actual_obj_pos_arr,
         actual_obj_quat=actual_obj_quat_arr,
         joint_torques=joint_torques_arr,
+        ee_force=ee_force_arr,         # (T, N, S, 3) net contact-force vector per EE, world frame
+        ee_force_mag=ee_force_mag_arr, # (T, N, S)   scalar total contact magnitude per EE
         rewards=rewards_arr,                  # per-env raw rewards
         rewards_mean_alive=rewards_mean_alive, # convenience: alive-masked mean per step
         alive_mask=alive_mask_arr,             # True iff env was alive going INTO that step
