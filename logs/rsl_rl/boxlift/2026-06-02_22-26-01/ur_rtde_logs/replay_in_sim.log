@@ -1,0 +1,7 @@
+Traceback (most recent call last):
+  File "C:\Users\ArniB\ETH\Thesis\BoxLift\scripts\replay_in_sim.py", line 214, in <module>
+    main()
+  File "C:\Users\ArniB\ETH\Thesis\BoxLift\scripts\replay_in_sim.py", line 150, in main
+    dummy_action = torch.zeros(1, de.num_actions, device=device)
+                                  ^^^^^^^^^^^^^^
+AttributeError: 'BoxliftEnv' object has no attribute 'num_actions'
