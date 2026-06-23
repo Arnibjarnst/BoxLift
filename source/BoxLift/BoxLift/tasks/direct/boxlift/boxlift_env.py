@@ -801,12 +801,10 @@ class BoxliftEnv(DirectRLEnv):
             self._voc_buf_task_seg[s, slots]  = norm_task_s
             self._voc_buf_track_seg[s, slots] = norm_track_s
             self._voc_buf_idx_seg[s] = (self._voc_buf_idx_seg[s] + n_s) % W
-        # Zero per-env per-segment accumulators for the new episode.
         self._voc_ep_rew_task_seg[eids_t]  = 0.0
         self._voc_ep_rew_track_seg[eids_t] = 0.0
         self._voc_ep_steps_seg[eids_t]     = 0
 
-        # === BC alpha ring-buffer push ===
         steps_a = self._alpha_ep_steps[eids_t].clamp(min=1).float()
         norm_task_a = self._alpha_ep_rew_task[eids_t] / steps_a
         n_a = eids_t.numel()
@@ -817,28 +815,15 @@ class BoxliftEnv(DirectRLEnv):
         self._alpha_ep_rew_task[eids_t] = 0.0
         self._alpha_ep_steps[eids_t]    = 0
 
-        # Reset prev variables. prev_actions tracks the previous RAW residual action
-        # (units: policy output, ≈ [-1, 1]), NOT joint positions — reset to 0 so the
-        # first-step action_rate penalty isn't a giant spike from the unit mismatch.
+        # Reset to 0: prev_actions is raw residual (≈[-1,1]), not joint pos; avoids first-step rate spike.
         self.prev_actions[env_ids] = 0.0
         self.prev_joint_vel[env_ids, :6] = initial_joint_vel_l
         self.prev_joint_vel[env_ids, 6:] = initial_joint_vel_r
 
-        # Contact-bool delay buffer: zero on reset so the freshly-reset env doesn't
-        # carry the previous episode's contact history into its first few obs. At
-        # episode start the EE may or may not already be against the cube (depends on
-        # the RSI phase); 0 is the safe default and the buffer refills in <delay_steps.
         self.ee_contact_delay_buf[env_ids] = 0.0
 
-        # === Reset cube-tracker state ================================================
-        # Warm the delay buffers with the post-reset cube pose (and the RSI starting
-        # phase) so a delayed read returns sensible, temporally consistent values from
-        # step 1 onward. Set counter == period so a fresh fire happens on the very
-        # first post-reset step (which then writes the properly delayed pose into
-        # obj_obs_last_*).
-        # NOTE: obj_poses stores env-frame poses; initial_object_pose has had
-        # env_origins added back in for write_root_pose_to_sim. Subtract them out so
-        # the tracker buffer stays in env-frame (matches what _get_noisy_obj_obs reads).
+        # Warm delay buffers with post-reset pose; counter=period triggers a fire on step 1.
+        # Subtract env_origins: obj_poses is env-frame, but initial_object_pose has origins added.
         init_pose_env = initial_object_pose.clone()
         init_pose_env[:, :3] -= self.scene.env_origins[env_ids]
         self.obj_pose_delay_buf[env_ids]  = init_pose_env.unsqueeze(1)
@@ -850,10 +835,7 @@ class BoxliftEnv(DirectRLEnv):
         self.obj_obs_last_rel[env_ids, 3]  = 1.0  # identity quat (wxyz)
         self.obj_obs_counter[env_ids] = self.cfg.obs_obj_update_period
 
-        # Sample fresh per-episode constant bias for the cube tracker. Held for the
-        # whole episode, applied in _get_noisy_obj_obs's fire branch BEFORE per-fire
-        # noise. Position bias is direct additive; orientation bias is a small-angle
-        # quat (so direct quat_mul). std == 0 → bias is identity (no-op).
+        # Per-episode constant tracker bias (held for full episode, applied before per-fire noise).
         n_b = len(env_ids)
         if self.cfg.obs_obj_pos_bias_std > 0.0:
             self.obj_obs_bias_pos[env_ids] = (
@@ -870,19 +852,8 @@ class BoxliftEnv(DirectRLEnv):
             self.obj_obs_bias_ori_quat[env_ids, 0] = 1.0
             self.obj_obs_bias_ori_quat[env_ids, 1:] = 0.0
 
-        # Per-step feature history: zero on reset. Earliest history slots are zeros
-        # until obs_history_steps env steps have elapsed; acceptable since the policy
-        # sees this same convention at training time.
         self.obs_history[env_ids] = 0.0
 
-        # === Refresh privileged DR cache for the just-reset envs =====================
-        # By this point super()._reset_idx has fired all reset-mode events (object_mass,
-        # object_physics_material, etc.), so the asset's PhysX view reflects the new
-        # per-env samples. get_masses returns (N_total, 1); get_material_properties
-        # returns (N_total, num_shapes, 3) with [static, dynamic, restitution] — cube
-        # has one shape so we take index 0. Both come back as CPU tensors → move to GPU.
-        # joint_stiffness / joint_damping live on .data and update via the actuator's
-        # set_dof_stiffnesses path — read directly in _get_privileged_obs, no cache.
         try:
             masses = self.object.root_physx_view.get_masses().to(self.device)
             self._dr_obj_mass[env_ids] = masses[env_ids]
@@ -893,8 +864,7 @@ class BoxliftEnv(DirectRLEnv):
             # log once and continue with stale (zeros / last good) cache values rather
             # than crash. The critic will see slightly stale DR info but training continues.
             if not getattr(self, "_dr_readback_warned", False):
-                print(f"[boxlift] _reset_idx: DR cache readback failed: {e!r}. "
-                      f"Privileged critic will see zero/stale DR samples.")
+                print(f"[boxlift] DR cache readback failed: {e!r}. Critic sees stale DR samples.")
                 self._dr_readback_warned = True
 
     def _reward_track(self, error, sigma, tolerance=0.0):
@@ -903,7 +873,6 @@ class BoxliftEnv(DirectRLEnv):
         return reward
 
     def _get_rewards(self) -> torch.Tensor:
-        # Task Reward
         obj_pos_error = self._get_obj_pos_error()
         rew_obj_pos = self.cfg.w_obj_pos * self._reward_track(obj_pos_error ** 2, self.cfg.sigma_obj_pos, self.cfg.tol_obj_pos)
 
@@ -917,18 +886,13 @@ class BoxliftEnv(DirectRLEnv):
         self._alpha_ep_rew_task += rew_task_unweighted
         self._alpha_ep_steps    += 1
 
-        # Tracking — phase-exclusive: absolute (EE/joint) when the reference is OUT of
-        # contact (abs_gate=1), relative EE-in-box-frame when IN contact (gate=1). No
-        # gradient competition between trackers, mirrors boxhinge.
+        # Phase-exclusive tracking: absolute EE when out-of-contact, EE-in-box-frame when in contact.
         T = self.eef_box_gate_mask.shape[0]
         phase_idx = self.episode_length_buf.clamp(max=T - 1)
         gate = self.eef_box_gate_mask[phase_idx].float()
         abs_gate = 1.0 - gate
 
-        # L+R tracking kernels are averaged (not summed) so the reward is bounded in
-        # [0, w_eef_pos] regardless of arm count — matches boxhinge's per-arm scale,
-        # restores threshold calibration, and avoids the dual-arm 2× scale that was
-        # making voc_threshold_track effectively a quarter-saturation gate.
+        # Averaged (not summed) across arms: keeps reward in [0, w_eef_pos] matching single-arm scale.
         EE_pos_error_l, EE_pos_error_r = self._get_EE_pos_error()
         rew_EE_pos_l = self._reward_track(EE_pos_error_l ** 2, self.cfg.sigma_eef_pos, self.cfg.tol_eef_pos)
         rew_EE_pos_r = self._reward_track(EE_pos_error_r ** 2, self.cfg.sigma_eef_pos, self.cfg.tol_eef_pos)
@@ -939,18 +903,13 @@ class BoxliftEnv(DirectRLEnv):
         rew_EE_quat_r = self._reward_track(eef_quat_error_r ** 2, self.cfg.sigma_eef_quat, self.cfg.tol_eef_quat)
         rew_EE_quat = abs_gate * self.cfg.w_eef_quat * 0.5 * (rew_EE_quat_l + rew_EE_quat_r)
 
-        # BC-style joint tracking (DexMachina r_bc): per-joint kernel, then mean across
-        # all 12 joints (both arms). Each joint's deviation enters its own exp; bounded
-        # in [0, 1]. Different from the legacy "sum-then-kernel" — that hid one bad joint
-        # behind the others.
+        # Per-joint kernel then mean: one bad joint can't hide behind the others.
         joint_pos_err_per_joint = self._get_joint_pos(relative=True) ** 2  # (N, 12)
         joint_pos_kernels = self._reward_track(
             joint_pos_err_per_joint, self.cfg.sigma_joint_pos, self.cfg.tol_joint_pos
         )  # (N, 12) — broadcasts over the trailing axis
         rew_joint_pos = abs_gate * self.cfg.w_joint_pos * joint_pos_kernels.mean(dim=-1)
 
-        # Relative EE-in-box-frame tracking, summed across arms (mutually exclusive with
-        # the absolute trackers above via the gate).
         eef_box_rel_pos_err_l, eef_box_rel_quat_err_l, eef_box_rel_pos_err_r, eef_box_rel_quat_err_r = (
             self._compute_eef_box_rel_errors()
         )
@@ -966,7 +925,6 @@ class BoxliftEnv(DirectRLEnv):
 
         rew_track = self.cfg.w_track * (rew_EE_pos + rew_EE_quat + rew_joint_pos + rew_eef_box_rel_pos + rew_eef_box_rel_quat)
 
-        # Regularization Reward
         joint_acc = (self._get_joint_vel() - self.prev_joint_vel) / self.dt
         joint_acc *= torch.abs(joint_acc) > self.cfg.tol_joint_acc
         joint_acc_penalty = joint_acc.square().sum(dim=-1)
@@ -977,12 +935,7 @@ class BoxliftEnv(DirectRLEnv):
         torque_penalty = torque.square().sum(dim=-1)
         rew_torque = self.cfg.w_joint_torque * torque_penalty
 
-        # Action-authority scaling for the policy-authored regularization terms. In
-        # mode D the policy's effective gain on the joint command is α + ε(1-α), so
-        # penalizing a unit-norm action the same way at α=0 (10% authority) as at α=1
-        # (100% authority) would overweight the rate/norm penalties exactly when the
-        # policy can least afford them. Mode-D only — other modes keep full action
-        # authority across α and are unaffected.
+        # Mode D: scale rate/norm penalties by actual policy authority (α + ε(1-α)).
         if self.cfg.action_mode == "D":
             alpha = self._curriculum_alpha()
             eps = float(self.cfg.action_alpha_floor)
@@ -995,16 +948,11 @@ class BoxliftEnv(DirectRLEnv):
         action_rate_penalty = action_rate_error.square().sum(dim=-1)
         rew_action_rate = action_authority_scale * self.cfg.w_action_rate * action_rate_penalty
 
-        # Residual action magnitude penalty: bias toward zero residual when the nominal
-        # plan is already good (important for VOC since the VOC wrench is the actor early).
         action_norm_error = self.actions.clone()
         action_norm_error *= torch.abs(action_norm_error) > self.cfg.tol_action_norm
         action_norm_penalty = action_norm_error.square().sum(dim=-1)
         rew_action_norm = action_authority_scale * self.cfg.w_action_norm * action_norm_penalty
 
-        # Joint limit penalty — read from the cached (already-clamped) joint target to
-        # match what _apply_action commanded. joint_limit_eps insets the soft band slightly
-        # so the penalty starts before the hard limit and the limit clamp doesn't mask it.
         q_l, q_r = self._cached_joint_target
         q_limits_l = self.ur5e_l.data.joint_pos_limits
         q_limits_r = self.ur5e_r.data.joint_pos_limits
@@ -1038,7 +986,6 @@ class BoxliftEnv(DirectRLEnv):
         flange_to_forearm_dist_l = self._get_flange_to_forearm_distance(self.ur5e_l)
         flange_to_forearm_dist_r = self._get_flange_to_forearm_distance(self.ur5e_r)
 
-        # Boolean (binary) penalty for breaching the safety zone
         is_too_close_l = (flange_to_forearm_dist_l < self.cfg.max_flange_forearm_distance).float()
         is_too_close_r = (flange_to_forearm_dist_r < self.cfg.max_flange_forearm_distance).float()
 
@@ -1049,11 +996,6 @@ class BoxliftEnv(DirectRLEnv):
             + rew_joint_limit + rew_illegal_contact + rew_proximity + rew_flange_forearm_dist
         )
 
-        # Build a per-env dict of (num_envs,) tensors first, then derive the env-mean log
-        # the runner consumes for W&B / TensorBoard. The per-env dict is stashed under
-        # `extras["log_per_env"]` so record.py can collect it for per-env post-processing
-        # (e.g. "what did env 12's joint_torque penalty look like at the spike?"). The
-        # training logger ignores it — it only reads `extras["log"]`.
         per_env_log = {
             "Rewards_task/obj_pos": rew_obj_pos,
             "Rewards_task/obj_quat": rew_obj_quat,
@@ -1079,20 +1021,11 @@ class BoxliftEnv(DirectRLEnv):
             "Extra/mean_EE_force": mean_ee_force,
         }
         self.extras["log"] = {k: v.mean() for k, v in per_env_log.items()}
-        # Per-env tensors are opt-in via cfg.emit_per_env_extras (default False). Keeps the
-        # training-time `extras` payload identical to the pre-refactor layout so the runner
-        # can't accidentally pick the dict up or pay extra GPU→CPU transfer costs.
         if getattr(self.cfg, "emit_per_env_extras", False):
             self.extras["log_per_env"] = per_env_log
 
         total_reward = rew_task + rew_track - rew_regularization
 
-        # === VOC: per-segment accumulation for the decay check ===
-        # Track the *unweighted* task/tracking signals so thresholds correspond directly
-        # to per-step kernel values in [0, 1] rather than to weighted sums whose scale
-        # would shift with w_task/w_track etc. Route this step's per-env contribution
-        # into the segment corresponding to the current trajectory phase — each
-        # (env, segment) tracks an independent partial sum.
         rew_track_unweighted_per_step = (
             rew_EE_pos + rew_EE_quat + rew_joint_pos + rew_eef_box_rel_pos + rew_eef_box_rel_quat
         )
@@ -1104,10 +1037,7 @@ class BoxliftEnv(DirectRLEnv):
         self._voc_ep_rew_track_seg[env_arange, seg_idx] += rew_track_unweighted_per_step
         self._voc_ep_steps_seg[env_arange, seg_idx]     += 1
 
-        # Decay check rate-limited to avoid hammering it every step. Uses the tensor
-        # max() directly (not the property mean) so we keep checking until the LAST
-        # segment decays — in per-segment mode, the mean drops as easy segments zero
-        # out but hard segments may still be active.
+        # Rate-limited; uses max() not mean() so we keep checking until the last segment decays.
         self._voc_decay_step_counter += 1
         if (self.cfg.voc_enabled
                 and float(self._voc_kp_pos_seg.max().item()) > 0.0
@@ -1124,9 +1054,6 @@ class BoxliftEnv(DirectRLEnv):
             self._alpha_check_counter = 0
             self._alpha_increase_check()
 
-        # VOC logging — headline values are cross-segment mean / min / max so you can
-        # see the distribution at a glance, plus per-segment kp and recent task/track
-        # means for spotting which segment is the bottleneck.
         self.extras["log"]["VOC/kp_pos_mean"] = self._voc_kp_pos_seg.mean()
         self.extras["log"]["VOC/kp_pos_min"]  = self._voc_kp_pos_seg.min()
         self.extras["log"]["VOC/kp_pos_max"]  = self._voc_kp_pos_seg.max()
@@ -1138,9 +1065,6 @@ class BoxliftEnv(DirectRLEnv):
             self._alpha_buf_task[valid_a].mean() if valid_a.any() else torch.tensor(0.0, device=self.device)
         )
 
-        # Per-segment recent trailing means and current gain. If seg2_task_mean plateaus
-        # low while others are at 0.8, that segment is the bottleneck — address with
-        # kernel widening, focused RSI, etc. without touching global thresholds.
         valid_ts = ~torch.isnan(self._voc_buf_task_seg)
         valid_ks = ~torch.isnan(self._voc_buf_track_seg)
         cnt_ts = valid_ts.sum(dim=-1).clamp(min=1).float()
@@ -1154,10 +1078,6 @@ class BoxliftEnv(DirectRLEnv):
             self.extras["log"][f"VOC/seg{s}_task_mean"]  = means_ts[s]
             self.extras["log"][f"VOC/seg{s}_track_mean"] = means_ks[s]
 
-        # Focused-RSI sampling distribution (computed identically to _reset_idx so the
-        # logged probs match what's actually sampled). Useful for watching the curriculum
-        # shift: lift segment's prob should start uniform and grow toward 1.0 as other
-        # segments decay (their weights drop and lift dominates by relative growth).
         if self.cfg.reset_segment_focus_prob > 0 and self._voc_n_segments > 1:
             w_log = self._voc_kp_pos_seg.clamp(min=0) ** float(self.cfg.segment_focus_beta)
             if w_log.sum().item() <= 0.0:
@@ -1166,19 +1086,12 @@ class BoxliftEnv(DirectRLEnv):
             for s in range(self._voc_n_segments):
                 self.extras["log"][f"RSI/seg{s}_focus_prob"] = probs_log[s]
 
-        # Update prev variables (action_rate already read above)
         self.prev_actions[:] = self.actions[:]
         self.prev_joint_vel[:] = self._get_joint_vel()
 
         return total_reward
 
     def _voc_decay_check(self):
-        """Per-segment VOC decay. Each segment passes its OWN sample-count + threshold
-        gates and decays its own gains independently. Easy segments (free motion, no
-        contact) clear thresholds early and lose assist quickly; hard segments (contact)
-        keep assist until they're actually learned. Below `voc_kp_min` a segment's gains
-        snap to zero — _apply_voc then short-circuits the per-env wrench wherever that
-        env's current segment is zero."""
         if self.common_step_counter < self.cfg.voc_decay_warmup_steps:
             return
         min_samples = self.cfg.voc_reward_window_size // 2
@@ -1186,9 +1099,6 @@ class BoxliftEnv(DirectRLEnv):
         phi_v = self.cfg.voc_decay_phi_v
         kp_min = self.cfg.voc_kp_min
 
-        # Per-segment independent decay. Each segment passes its OWN sample-count gate
-        # and its own threshold gate. Segments that pass get their gain multiplied by
-        # phi; others are unchanged. Below kp_min the segment's gains snap to zero.
         valid_t = ~torch.isnan(self._voc_buf_task_seg)      # (N_s, W)
         valid_k = ~torch.isnan(self._voc_buf_track_seg)
         cnt_t = valid_t.sum(dim=-1)                          # (N_s,)
@@ -1211,8 +1121,7 @@ class BoxliftEnv(DirectRLEnv):
         self._voc_kp_rot_seg.mul_(kp_scale)
         self._voc_kv_pos_seg.mul_(kv_scale)
         self._voc_kv_rot_seg.mul_(kv_scale)
-        # Snap per-segment kp below the floor to zero (and zero the matching kv); `_apply_voc`
-        # then short-circuits the per-env wrench wherever that env's current segment is zero.
+        # Snap below floor to zero; _apply_voc short-circuits per-env wrench when segment is zero.
         below = self._voc_kp_pos_seg < kp_min
         if bool(below.any().item()):
             self._voc_kp_pos_seg[below] = 0.0
@@ -1222,10 +1131,7 @@ class BoxliftEnv(DirectRLEnv):
         self._save_voc_state()
 
     def _alpha_increase_check(self):
-        """Phi-based alpha increase: (1-alpha) *= phi when task reward exceeds threshold.
-        Mirrors _voc_decay_check — phi < 1 so (1-alpha) decays exponentially toward 0,
-        snapping to alpha=1 when support < alpha_min_support. Buffer is cleared after
-        each increase so the policy re-qualifies at the new (harder) alpha level."""
+        """(1-alpha) *= phi when task reward exceeds threshold; snaps to 1 below alpha_min_support."""
         if self.common_step_counter < self.cfg.alpha_decay_warmup_steps:
             return
         valid = ~torch.isnan(self._alpha_buf_task)
@@ -1241,10 +1147,7 @@ class BoxliftEnv(DirectRLEnv):
         print(f"[BC-alpha] alpha → {self._alpha_value:.4f}  (mean_task={mean_task:.3f})")
 
     def _save_voc_state(self):
-        """Persist current per-segment VOC runtime gains to <log_dir>/voc_state.npz so
-        play.py / record.py can resume eval at the trained-end VOC level (via --keep_voc)
-        instead of the cfg's initial values. Saves as (N_s,) arrays — apply_voc_state on
-        load handles both array and scalar legacy formats. Best-effort write."""
+        """Best-effort write of per-segment VOC gains to voc_state.npz for --keep_voc eval."""
         log_dir = getattr(self.cfg, "log_dir", None)
         if not log_dir:
             return
@@ -1260,14 +1163,7 @@ class BoxliftEnv(DirectRLEnv):
             pass
 
     def set_voc_strength(self, kp_pos: float) -> None:
-        """Eval-time override: set a single scalar VOC kp_pos and derive kp_rot, kv_pos,
-        kv_rot from the same formulas used at env init.
-          * kp_rot scales proportionally to kp_pos (preserves the cfg's trans/rot ratio).
-          * kv_pos / kv_rot are critically damped from the new kp_* values.
-        Applied uniformly across all segments. Use this from play.py / record.py to
-        recreate the VOC strength a policy was trained against (lookup kp_pos from W&B,
-        pass it here). 0.0 disables VOC entirely. Per-segment differences during training
-        are flattened — this is a single-scalar approximation, not a full snapshot."""
+        """Set uniform VOC kp_pos and derive kp_rot, kv_pos, kv_rot (critically damped). 0.0 disables."""
         mass = float(self.cfg.cube_cfg.spawn.mass_props.mass)
         d_max = float(max(self.cfg.cube_cfg.spawn.size))
         inertia_est = mass * (d_max ** 2) / 12.0
@@ -1275,7 +1171,6 @@ class BoxliftEnv(DirectRLEnv):
         kp_rot_init = float(self.cfg.voc_kp_rot)
         scale = (kp_pos / kp_pos_init) if kp_pos_init > 0 else 0.0
         kp_rot = kp_rot_init * scale
-        # Critical-damping derivation matches _setup_scene.
         kv_pos = float(self.cfg.voc_kv_pos_scale) * max(kp_pos * mass, 0.0) ** 0.5
         kv_rot = float(self.cfg.voc_kv_rot_scale) * max(kp_rot * inertia_est, 0.0) ** 0.5
         self._voc_kp_pos_seg.fill_(float(kp_pos))
@@ -1287,13 +1182,7 @@ class BoxliftEnv(DirectRLEnv):
               f"(uniform across {self._voc_n_segments} segments)")
 
     def apply_voc_state(self, state) -> None:
-        """Restore VOC gains from a saved `voc_state.npz` (dict-like with `voc_kp_pos`,
-        `voc_kp_rot`, `voc_kv_pos`, `voc_kv_rot`). Accepts both formats:
-          - scalar (legacy single-VOC) → broadcast across all per-seg entries;
-          - (N_s,) array (per-segment) → assign element-wise. Pool size at restore time
-            must match saved N_s; otherwise the array is broadcast via mean with a warning
-            so loading doesn't hard-fail across re-segmentations.
-        Called by play.py / record.py when --keep_voc is passed."""
+        """Restore VOC gains from voc_state.npz. Accepts scalar (broadcast) or (N_s,) array."""
         for key, dst in (
             ("voc_kp_pos", self._voc_kp_pos_seg),
             ("voc_kp_rot", self._voc_kp_rot_seg),
@@ -1311,12 +1200,7 @@ class BoxliftEnv(DirectRLEnv):
                 dst[:] = float(v.mean())
 
     def _compute_eef_box_rel_errors(self):
-        """Per-arm error between actual and reference EE pose expressed in the box's frame
-        ("keep the EE at the same offset from the box as the planner expected"). Caller
-        applies the gate and reward kernel.
-
-        Returns (pos_err_l, quat_err_l, pos_err_r, quat_err_r), each (num_envs,).
-        """
+        """EE error vs reference expressed in the box frame. Returns (pos_l, quat_l, pos_r, quat_r)."""
         idx = self.episode_length_buf
         obj_pos_ref  = self.obj_poses[idx, :3]
         obj_quat_ref = self.obj_poses[idx, 3:]
@@ -1350,12 +1234,8 @@ class BoxliftEnv(DirectRLEnv):
         )
         return pos_err_l, quat_err_l, pos_err_r, quat_err_r
 
-    
-    # === VOC gain properties (back-compat shim over the per-seg tensors) ===
-    # Getter returns the mean across segments — equals the legacy scalar when all
-    # segments share a value (e.g. at init). Setter broadcasts a scalar to every
-    # segment, so existing external code like `env.voc_kp_pos = 0.0` (play.py /
-    # record.py / ur_rtde_real_time.py) keeps working unchanged.
+
+    # Back-compat shim: getter returns mean across segments; setter broadcasts scalar to all segments.
     @property
     def voc_kp_pos(self) -> float:
         return float(self._voc_kp_pos_seg.mean().item())
@@ -1410,65 +1290,30 @@ class BoxliftEnv(DirectRLEnv):
         return torch.cat((ur5e_l_joint_vel, ur5e_r_joint_vel), 1)
     
     def _get_forearm_endpoints(self, robot: Articulation):
-        # Height of the forearm cylinder is ~0.4225.
-        forearm_length = 0.4225
-        # Local offset of the Cylinder center relative to forearm_link
+        forearm_length = 0.4225  # forearm cylinder height in USD
         p2_local = torch.tensor([-forearm_length, 0.0, 0.0], device=self.device)
-
         forearm_pos = robot.data.body_pos_w[:, self.forearm_link_idx]
         forearm_quat = robot.data.body_quat_w[:, self.forearm_link_idx]
-
-        # Map link frame to world frame
         p2 = forearm_pos + quat_apply(forearm_quat, p2_local.repeat(self.num_envs, 1))
         return forearm_pos, p2
     
     def _get_closest_point_on_forearm(self, robot: Articulation):
         flange_pos = robot.data.body_pos_w[:, self.flange_idx]
         p1, p2 = self._get_forearm_endpoints(robot)
-
-        # Calculate distance from flange_pos to line segment [p1, p2]
         line_vec = p2 - p1
-        p1_to_flange = flange_pos - p1
-        
-        line_len_sq = torch.sum(line_vec**2, dim=-1)
-        # Project flange_pos onto the line segment, clamped between 0 and 1
-        t = torch.sum(p1_to_flange * line_vec, dim=-1) / line_len_sq
-        t = torch.clamp(t, 0.0, 1.0)
-        
-        closest_point = p1 + t.unsqueeze(-1) * line_vec
-
-        return closest_point
+        t = torch.clamp(torch.sum((flange_pos - p1) * line_vec, dim=-1) / torch.sum(line_vec**2, dim=-1), 0.0, 1.0)
+        return p1 + t.unsqueeze(-1) * line_vec
 
     def _get_flange_to_forearm_distance(self, robot: Articulation):
         flange_pos = robot.data.body_pos_w[:, self.flange_idx]
         p1, p2 = self._get_forearm_endpoints(robot)
-
-        # Calculate distance from flange_pos to line segment [p1, p2]
         line_vec = p2 - p1
-        p1_to_flange = flange_pos - p1
-        
-        line_len_sq = torch.sum(line_vec**2, dim=-1)
-        # Project flange_pos onto the line segment, clamped between 0 and 1
-        t = torch.sum(p1_to_flange * line_vec, dim=-1) / line_len_sq
-        t = torch.clamp(t, 0.0, 1.0)
-        
-        closest_point = p1 + t.unsqueeze(-1) * line_vec
-        distance = torch.norm(flange_pos - closest_point, dim=-1)
-        
-        return distance
+        t = torch.clamp(torch.sum((flange_pos - p1) * line_vec, dim=-1) / torch.sum(line_vec**2, dim=-1), 0.0, 1.0)
+        return torch.norm(flange_pos - (p1 + t.unsqueeze(-1) * line_vec), dim=-1)
     
     def _compute_proximity_penalty(self) -> torch.Tensor:
-        """Penalize links approaching illegal contact surfaces based on PhysX separation distance.
-
-        Buffer-overflow handling: PhysX caps the per-prim contact buffer at
-        `max_contact_data_count_per_prim` (set in `illegal_contact_sensor_cfgs`). When
-        more contacts occur than fit, `separation` is truncated to the buffer size but
-        `contact_count_per_link` still reports the *real* count. The resulting length
-        mismatch crashes `index_reduce_` (expected indices == source length). We clamp
-        `env_ids` to the actual separation length so the overflow contacts are silently
-        dropped from the penalty — the alternative is to crash mid-training. If you see
-        the `[proximity-overflow]` warning a lot, bump `max_contact_data_count_per_prim`.
-        """
+        """PhysX separation-distance proximity penalty. Silently drops contacts when buffer overflows
+        (index_reduce_ crashes if separation length < real contact count; bump max_contact_data_count_per_prim)."""
         penalty = torch.zeros(self.num_envs, device=self.device)
         for name, sensor in self.illegal_contact_sensors.items():
             _, _, _, separation, contact_count_per_link, _ = sensor.contact_physx_view.get_contact_data(self.dt)
@@ -1479,10 +1324,7 @@ class BoxliftEnv(DirectRLEnv):
             if total_count > n_buf:
                 # Throttle the warning so it doesn't spam every step under sustained overflow.
                 if not getattr(self, "_proximity_overflow_warned", False):
-                    print(f"[proximity-overflow] {name} sensor: {total_count} contacts > "
-                          f"buffer {n_buf} (max_contact_data_count_per_prim*num_envs). "
-                          f"Overflow contacts dropped from the proximity penalty. Bump "
-                          f"`max_contact_data_count_per_prim` if you want full coverage.")
+                    print(f"[proximity-overflow] {name}: {total_count} contacts > buffer {n_buf}; overflow dropped.")
                     self._proximity_overflow_warned = True
                 total_count = n_buf
             separation = separation[:total_count, 0]
@@ -1490,8 +1332,6 @@ class BoxliftEnv(DirectRLEnv):
             env_ids = torch.repeat_interleave(
                 torch.arange(self.num_envs, device=self.device), contact_count_per_env
             )
-            # If the buffer overflowed, env_ids reflects the real per-env counts and is
-            # longer than the truncated separation. Drop the tail of env_ids to match.
             if env_ids.shape[0] > total_count:
                 env_ids = env_ids[:total_count]
             min_sep = torch.full((self.num_envs,), self.cfg.max_proximity * 2, device=self.device)
