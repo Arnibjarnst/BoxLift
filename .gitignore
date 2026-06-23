@@ -57,6 +57,7 @@ _build
 **/runs/*
 **/logs/*
 **/recordings/*
+logs/
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
@@ -73,6 +74,7 @@ tests/
 
 # Claude stuff
 .mcp.json
+CLAUDE.md
 
 # Experiment results
 experiments/comparison_results/

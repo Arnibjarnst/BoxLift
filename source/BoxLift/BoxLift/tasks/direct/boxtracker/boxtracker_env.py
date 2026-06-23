@@ -853,23 +853,27 @@ class BoxtrackerEnv(DirectRLEnv):
         # it generalizes across arbitrary-length segments).
         obs_parts = [self.obs_history.flatten(start_dim=1)]
 
-        # Future reference obj pose look-ahead: (future_ref - current_ref) for each configured offset,
-        # plus the absolute future ref pose if include_absolute_obs.
+        # Future reference look-ahead.
         if self.cfg.future_obs_steps:
             cur_pos = self._interp(self.obj_poses[..., :3])
             cur_quat = self._nlerp(self.obj_poses[..., 3:])
             inv_cur_quat = quat_inv(cur_quat)
+            cur_joints = self._interp(self.joints) if self.cfg.future_obs_joints else None
             futures = []
             for k in self.cfg.future_obs_steps:
                 fut_phase = self.phase + float(k)
                 fut_pos = self._interp(self.obj_poses[..., :3], phase=fut_phase)
                 fut_quat = self._nlerp(self.obj_poses[..., 3:], phase=fut_phase)
                 futures.append(fut_pos - cur_pos)
-                # World-frame delta (matches _get_obj_quat's `desired * inv(actual)` convention).
                 futures.append(quat_mul(fut_quat, inv_cur_quat))
-                if self.cfg.include_absolute_obs:
+                if self.cfg.future_obs_absolute:
                     futures.append(fut_pos)
                     futures.append(fut_quat)
+                if self.cfg.future_obs_joints:
+                    fut_joints = self._interp(self.joints, phase=fut_phase)
+                    futures.append(fut_joints - cur_joints)
+                    if self.cfg.future_obs_absolute:
+                        futures.append(fut_joints)
             obs_parts.append(torch.cat(futures, dim=-1))
 
         # Previous raw policy action (pre-scale).
@@ -880,13 +884,14 @@ class BoxtrackerEnv(DirectRLEnv):
         return {"policy": obs, "privileged": self._get_privileged_obs()}
 
     def _get_privileged_obs(self) -> torch.Tensor:
-        """85-dim privileged critic obs. Layout:
+        """Privileged critic obs. Layout:
           13  clean obj state   (pos 3 + quat 4 + lin_vel 3 + ang_vel 3)
           16  DR samples        (mass 1 + friction 3 + stiff 6 + damp 6)
           44  reference @ phase (ref_obj 13 + ref_joints 6 + ref_jvel 6 + ref_jtgt 6 + planner_pd 6 + ref_EE 7)
            6  force/contact     (EE force mag 1 + dir 3 + illegal 1 + flange-forearm 1)
            2  eef-box rel       (pos_err 1 + quat_err 1)
            4  VOC/curriculum    (kp_pos 1 + kp_rot 1 + alpha 1 + phase_norm 1)
+          +N  future lookahead  (same offsets as actor: obj_pos_delta 3 + obj_quat_delta 4 + joint_delta 6 per step)
         """
         # (1) clean obj state
         clean_pos = self.object.data.root_pos_w.clone() - self.scene.env_origins
@@ -933,7 +938,31 @@ class BoxtrackerEnv(DirectRLEnv):
         phase_norm = (self.phase / max(self._T_max - 1, 1)).unsqueeze(-1)
         voc_block = torch.cat([kp_pos_t, kp_rot_t, alpha_t, phase_norm], dim=-1)  # (N, 4)
 
-        return torch.cat([obj_block, dr_block, ref_block, force_block, eef_block, voc_block], dim=-1)  # (N, 85)
+        base = torch.cat([obj_block, dr_block, ref_block, force_block, eef_block, voc_block], dim=-1)  # (N, 85)
+
+        if not self.cfg.future_obs_steps or self.cfg.reference_agnostic or not self.cfg.future_obs_in_privileged:
+            return base
+
+        cur_pos = self._interp(self.obj_poses[..., :3])
+        cur_quat = self._nlerp(self.obj_poses[..., 3:])
+        inv_cur_quat = quat_inv(cur_quat)
+        cur_joints = self._interp(self.joints) if self.cfg.future_obs_joints else None
+        fut_parts = []
+        for k in self.cfg.future_obs_steps:
+            fut_phase = self.phase + float(k)
+            fut_pos = self._interp(self.obj_poses[..., :3], phase=fut_phase)
+            fut_quat = self._nlerp(self.obj_poses[..., 3:], phase=fut_phase)
+            fut_parts.append(fut_pos - cur_pos)
+            fut_parts.append(quat_mul(fut_quat, inv_cur_quat))
+            if self.cfg.future_obs_absolute:
+                fut_parts.append(fut_pos)
+                fut_parts.append(fut_quat)
+            if self.cfg.future_obs_joints:
+                fut_joints = self._interp(self.joints, phase=fut_phase)
+                fut_parts.append(fut_joints - cur_joints)
+                if self.cfg.future_obs_absolute:
+                    fut_parts.append(fut_joints)
+        return torch.cat([base, *fut_parts], dim=-1)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
         # Per-env segment completion: each env reaches the end of its own (variable-length)

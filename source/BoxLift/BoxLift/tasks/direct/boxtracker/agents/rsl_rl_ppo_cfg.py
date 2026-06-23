@@ -12,7 +12,7 @@ from isaaclab_rl.rsl_rl import RslRlOnPolicyRunnerCfg, RslRlPpoActorCriticCfg, R
 class PPORunnerCfg(RslRlOnPolicyRunnerCfg):
     num_steps_per_env = 24
     max_iterations = 1000
-    save_interval = 100
+    save_interval = 5000
     experiment_name = "boxtracker"
     logger = "wandb"
     obs_groups = {"policy": ["policy"], "critic": ["policy", "privileged"]}

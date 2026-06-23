@@ -160,9 +160,9 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
     # action_space is recomputed in __post_init__: 6 residual + 1 phase if enable_phase_slowdown.
     action_space = 6
     # obs = stacked per-step features * obs_history_steps
-    #       [+ (7 or 14) * len(future_obs_steps)  future ref obj pose deltas]   (reference mode)
-    #       [+ 14                                  goal pose rel(7) + abs(7)]    (reference_agnostic mode)
-    #       [+ 6                                   previous raw action]
+    #       [+ (7..26) * len(future_obs_steps)  future obj delta(7) [+abs_obj(7)] [+jnt_delta(6) [+abs_jnt(6)]]  (reference mode)
+    #       [+ 14                          goal pose rel(7) + abs(7)]    (reference_agnostic mode)
+    #       [+ 6                           previous raw action]
     # per-step features (reference mode):
     #   relative_q (6) + relative_qd (6)  [+ relative_obj_pos (3) + relative_obj_quat (4) if include_object_obs]
     #   [+ absolute_q (6) + absolute_qd (6)  [+ absolute_obj_pos (3) + absolute_obj_quat (4)] if include_absolute_obs]
@@ -181,11 +181,15 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
     # per-step feature dim and adds (pos (3) + quat (4)) per future_obs_steps entry for the
     # absolute future reference obj pose.
     include_absolute_obs = True
-    # Future reference obj pose look-ahead: list of phase offsets (in env steps) to include
-    # as (pos_delta (3) + quat_delta (4)) relative to the reference at the current phase.
-    # If include_absolute_obs, also appends absolute (pos (3) + quat (4)) per offset.
+    # Future reference look-ahead: list of phase offsets (in env steps).
+    # Per offset always includes obj pos+quat delta (7). Additional components:
+    #   future_obs_absolute=True  → also append absolute future obj pos+quat (7)
+    #   future_obs_joints=True    → also append future joint delta (6) [+ abs joints (6) if future_obs_absolute]
     # Empty tuple = disabled.
     future_obs_steps = (1,2,3,4,5,10,15,20,40)
+    future_obs_absolute: bool = True       # include absolute future obj pose (and joints if future_obs_joints)
+    future_obs_joints: bool = True         # include future reference joint positions
+    future_obs_in_privileged: bool = False  # add future block to privileged (critic) obs
     # Include previous raw residual action (6 dims) in the observation.
     include_prev_actions = True
     # Include a single thresholded contact bool (EE ↔ cube) in the per-step observation.
@@ -310,12 +314,20 @@ class BoxtrackerEnvCfg(DirectRLEnvCfg):
         actor_dim = self.per_step_feature_dim * self.obs_history_steps
         if self.reference_agnostic:
             actor_dim += 14  # goal: rel_pos (3) + rel_quat (4) + abs_pos (3) + abs_quat (4)
+            priv_dim = 85
         else:
-            future_dim = 14 if self.include_absolute_obs else 7
-            actor_dim += future_dim * len(self.future_obs_steps)
+            future_per_step = 7  # obj delta always
+            if self.future_obs_absolute:
+                future_per_step += 7  # abs obj pos+quat
+            if self.future_obs_joints:
+                future_per_step += 6  # joint delta
+                if self.future_obs_absolute:
+                    future_per_step += 6  # abs joints
+            actor_dim += future_per_step * len(self.future_obs_steps)
+            priv_dim = 85 + (future_per_step * len(self.future_obs_steps) if self.future_obs_in_privileged else 0)
         if self.include_prev_actions:
             actor_dim += 6
-        self.observation_space = {"policy": actor_dim, "privileged": 85}
+        self.observation_space = {"policy": actor_dim, "privileged": priv_dim}
 
     # simulation
     sim: SimulationCfg = SimulationCfg(dt=physics_dt, render_interval=decimation, gravity=(0,0,-9.8))

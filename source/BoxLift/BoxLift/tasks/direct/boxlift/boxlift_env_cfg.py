@@ -67,8 +67,6 @@ class EventCfg:
             "asset_cfg": SceneEntityCfg("ur5e_left", body_names="wrist_3_link"),
             "static_friction_range": (0.7, 1.3),
             "dynamic_friction_range": (0.7, 1.3),
-            # Lowered from (0.7, 0.9) — bouncy EE was triggering contact chatter against
-            # the cube during VOC bring-up; matches boxhinge's calmer-contact setting.
             "restitution_range": (0.1, 0.3),
             "num_buckets": 250,
         },
@@ -301,6 +299,7 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     kp = 150.0
     kd = 22.5
     actuator_type = "Implicit"  # or "IdealPD"
+    disable_robot_gravity: bool = False
     velocity_limit = 3.14
     effort_limit = {
         "shoulder_pan_joint": 150.0,
@@ -664,7 +663,7 @@ def get_ur5e_cfg(
         spawn=sim_utils.UsdFileCfg(
             usd_path=ROBOT_PATH,
             rigid_props=sim_utils.RigidBodyPropertiesCfg(
-                disable_gravity=False,
+                disable_gravity=box_lift_cfg.disable_robot_gravity,
                 max_depenetration_velocity=10.0,
                 enable_gyroscopic_forces=True,
             ),
