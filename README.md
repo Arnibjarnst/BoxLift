@@ -51,7 +51,6 @@ BoxLift/
 │   ├── boxpush/                  # single-arm box pushing
 │   ├── boxtracker/               # single-arm task with multi-trajectory pool + continuous phase
 │   ├── boxmagic/                 # box lifting with modified collision properties
-│   ├── boxliftpool/              # dual-arm lifting with multi-trajectory pool (experimental)
 │   └── jointtarget/              # simple joint-target tracking (diagnostics / sysid)
 │
 ├── reference_trajectories/       # pre-computed nominal trajectories (.npz)
@@ -80,7 +79,6 @@ variants or experimental environments.
 | `Template-Boxpush-Direct-v0` | Single-arm box pushing |
 | `Template-Boxtracker-Direct-v0` | Single-arm; multi-traj pool, continuous phase, adaptive playback speed |
 | `Template-Boxmagic-Direct-v0` | Dual-arm lift with modified collision properties (experimental) |
-| `Boxliftpool-Direct-v0` | Dual-arm lift with multi-trajectory pool (experimental) |
 | `Follow-Joint-Targets` | Joint-target tracking (diagnostics) |
 
 ### boxlift (primary)
