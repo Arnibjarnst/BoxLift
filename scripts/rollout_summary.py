@@ -1,30 +1,4 @@
-"""Per-env success analysis for multi-env rollouts.
-
-For each env in a record.py rollout we compute:
-  - success / failure (based on early-termination AND terminal-task-reward thresholds)
-  - cube pose at first frame and at the last VALID frame (= done_step - 1, since the
-    death-step state is NaN'd by record.py)
-  - reference cube pose at the same trajectory phases (from the .npz traj file)
-  - three error metrics, each in two reference frames:
-      * pos  — ||p_actual − p_ref||                                (m)
-      * xy   — ||(p_actual − p_ref)[:2]||                          (m)   in-plane only
-      * quat — smallest rotation angle between the two quaternions  (rad)
-      * pose — mean Euclidean distance over the 8 cube corners      (m)
-    Final errors are computed BOTH vs the env's last-reached phase
-    (``final_err_*_at_phase``) AND vs the trajectory's goal pose (``final_err_*``).
-
-`to_records(summary)` flattens the per-env arrays into the same per-rollout dict
-schema produced by ``eval_rollout.evaluate``, so the plotters in
-``rollout_plots.py`` work on either source.
-
-Typical use from the notebook:
-
-    from scripts.rollout_summary import compute_rollout_summary, print_summary, to_records
-    from scripts.rollout_plots import plot_init_vs_final, plot_error
-    s = compute_rollout_summary("logs/.../rollout/output.npz", min_task_reward=0.05)
-    print_summary(s, title="some run")
-    plot_init_vs_final(to_records(s), x="pose", y="pose", metric="pos")
-"""
+"""Per-env success and final-pose error analysis for multi-env record.py rollouts."""
 from __future__ import annotations
 
 from collections import Counter

@@ -134,25 +134,6 @@ class EventCfg:
             "distribution": "uniform"
         },
     )
-    # object_scale = EventTermCfg(
-    #     func=mdp.randomize_rigid_body_scale,
-    #     mode="prestartup",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("object"),
-    #         "scale_range": (0.975, 1.025)
-    #     },
-    # )
-    # object_com = EventTermCfg(
-    #     func=mdp.randomize_rigid_body_com,
-    #     mode="startup",
-    #     params={
-    #         "asset_cfg": SceneEntityCfg("object"),
-    #         "com_range": {
-    #             "x": (-0.1, 0.1), # not relative to scale but absolute addition uniformly sampled
-    #             "y": (-0.1, 0.1),
-    #         }
-    #     },
-    # )
     reset_gravity = EventTermCfg(
         func=mdp.randomize_physics_scene_gravity,
         mode="reset",
@@ -194,40 +175,25 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     obs_joint_vel_noise_std: float = 0.05    # rad/s
 
     def __post_init__(self) -> None:
-        base_pose = 3 + 4                       # obj pos + quat
+        base_pose = 3 + 4
         if self.use_reference_obs:
-            per_step = 12 + 12 + base_pose      # rel_q + rel_qd + rel_obj
-            per_step += 12 + 12 + base_pose     # abs_q + abs_qd + abs_obj
-            per_step += 2                       # contact bools
+            per_step = 12 + 12 + base_pose
+            per_step += 12 + 12 + base_pose
+            per_step += 2
             phase_dim = 1
         else:
-            per_step = 12 + 12 + base_pose      # abs_q + abs_qd + abs_obj only
-            per_step += 2                       # contact bools
-            phase_dim = 0                       # no trajectory clock
+            per_step = 12 + 12 + base_pose
+            per_step += 2
+            phase_dim = 0
         self.per_step_feature_dim = per_step
 
-        future_dim_per_offset = 2 * base_pose   # (rel pos+quat) + (abs pos+quat) per offset
+        future_dim_per_offset = 2 * base_pose
         actor_dim = (
             per_step * self.obs_history_steps
             + phase_dim
             + future_dim_per_offset * len(self.future_obs_steps)
-            + 12                                         # prev_actions
+            + 12
         )
-
-        # Privileged-extras layout (concatenated by _get_privileged_obs in this order):
-        #   13  clean obj state           (pos 3 + quat 4 + lin_vel 3 + ang_vel 3)
-        #   28  DR samples                (obj_mass 1 + obj_friction 3 + stiff_L 6 +
-        #                                  stiff_R 6 + damp_L 6 + damp_R 6)
-        #   75  reference state @ phase   (ref_obj_pos 3 + quat 4 + lin_vel 3 + ang_vel 3
-        #                                  + ref_joints_L 6 + R 6 + ref_joint_vels_L 6 + R 6
-        #                                  + ref_joints_target_L 6 + R 6
-        #                                  + planner_pd_err_L 6 + R 6
-        #                                  + ref_EE_pose_L 7 + R 7)
-        #   12  force/contact             (EE force mag L 1 + R 1 + EE force dir L 3 + R 3
-        #                                  + illegal_contact cube 1 + table 1
-        #                                  + flange-forearm dist L 1 + R 1)
-        #    4  eef-box rel scalars       (pos_err_L + quat_err_L + pos_err_R + quat_err_R)
-        #    4  voc / curriculum context  (current_seg kp_pos + kp_rot + alpha + seg_idx)
         priv_dim = 13 + 28 + 75 + 12 + 4 + 4
 
         self.observation_space = {"policy": actor_dim, "privileged": priv_dim}
@@ -257,8 +223,7 @@ class BoxliftEnvCfg(DirectRLEnvCfg):
     replicate_physics = bool(np.all([event["mode"] != "prestartup" and event["mode"] != "startup" for event in events.to_dict().values()])) # type: ignore
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=4.0, replicate_physics=replicate_physics)
 
-    # Action mode: A=residual on planner target, B=on trajectory pos, C=on current pos,
-    # BC=(1-α)·traj+α·current, D=current+(1-α)·PD_error+(α+ε(1-α))·scale·action
+    # A: planner target; B: traj pos; C: current pos; BC: blend B/C; D: current + PD_err + residual
     action_mode = "A"
 
     force_alpha: float = -1           # pin α to fixed value (-1 = use schedule)

@@ -70,7 +70,6 @@ class BoxliftEnv(DirectRLEnv):
         self.ur5e_l = Articulation(ur5e_l_cfg)
         self.ur5e_r = Articulation(ur5e_r_cfg)
         
-        # add ground plane
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(), translation=(0,0,-0.5))
 
         self.object = RigidObject(cfg=self.cfg.cube_cfg)
@@ -98,11 +97,10 @@ class BoxliftEnv(DirectRLEnv):
         _yaw_std = self.cfg.robot_ori_randomization_yaw_std
         self.robot_base_offset_l = torch.zeros(self.num_envs, 3, device=self.device)
         self.robot_base_offset_r = torch.zeros(self.num_envs, 3, device=self.device)
-        # wxyz convention, identity by default
         self.robot_yaw_quat_l = torch.zeros(self.num_envs, 4, device=self.device)
         self.robot_yaw_quat_l[:, 0] = 1.0
         self.robot_yaw_quat_r = torch.zeros(self.num_envs, 4, device=self.device)
-        self.robot_yaw_quat_r[:, 0] = 1.0  # identity quat
+        self.robot_yaw_quat_r[:, 0] = 1.0
         if _pos_std > 0.0:
             self.robot_base_offset_l = _pos_std * torch.randn(self.num_envs, 3, device=self.device)
             self.robot_base_offset_r = _pos_std * torch.randn(self.num_envs, 3, device=self.device)
@@ -154,9 +152,6 @@ class BoxliftEnv(DirectRLEnv):
         self._dr_obj_mass = torch.zeros((self.num_envs, 1), device=self.device)
         self._dr_obj_friction = torch.zeros((self.num_envs, 3), device=self.device)
 
-        # VOC: per-segment gains, each decaying independently. Legacy scalar properties
-        # (voc_kp_pos etc.) are kept as @property shims for back-compat with play.py/record.py.
-        # Critical-damping defaults: I ≈ m·d_max²/12 (uniform cube).
         mass = float(self.cfg.cube_cfg.spawn.mass_props.mass)
         d_max = float(max(self.cfg.cube_cfg.spawn.size))
         inertia_est = mass * (d_max ** 2) / 12.0
@@ -181,7 +176,6 @@ class BoxliftEnv(DirectRLEnv):
                 torch.tensor(T, device=self.device, dtype=torch.long),
             )
         elif seg_mode == "contact":
-            # Use a separate gate from the reward gate (which may be all-True via huge dilation).
             obj_vel_mag = self.obj_vel[:, :3].norm(dim=-1) + self.obj_vel[:, 3:].norm(dim=-1)
             seg_moving = (obj_vel_mag > self.cfg.eef_box_gate_obj_vel_eps).float()
             dil = int(self.cfg.voc_segment_dilation_steps)
@@ -326,9 +320,7 @@ class BoxliftEnv(DirectRLEnv):
         return q_l, q_r
 
     def get_joint_targets_D(self):
-        """q_target = q_curr + (1-α)·(joints_target[t]-joints[t]) + (α+ε(1-α))·scale·a.
-        At α=0: planner PD error applied from current position. At α=1: collapses to mode C.
-        """
+        """Planner PD error from current position + scaled residual, blended by curriculum α."""
         alpha = self._curriculum_alpha()
         eps = float(self.cfg.action_alpha_floor)
         action_gain = alpha + eps * (1.0 - alpha)
@@ -342,7 +334,7 @@ class BoxliftEnv(DirectRLEnv):
         return q_l, q_r
 
     def get_joint_targets_BC(self):
-        """q_target = (1-α)·q_ref + α·q_curr + scale·a. At α=0 → mode B, at α=1 → mode C."""
+        """Linear blend between mode B (ref position) and mode C (current position) via curriculum α."""
         alpha = self._curriculum_alpha()
         q_curr = self._get_joint_pos()
         q_ref_l = self.joints_l[self.episode_length_buf]
@@ -515,17 +507,13 @@ class BoxliftEnv(DirectRLEnv):
 
         if self.cfg.use_reference_obs:
             current_features = torch.cat([
-                _rel_q, _rel_qd,                      # q - q_ref, qd - qd_ref (noisy)
-                obj_rel_pos, obj_rel_quat,
-                _abs_q, _abs_qd,                      # abs q, qd (same noise as rel)
-                obj_abs_pos, obj_abs_quat,
+                _rel_q, _rel_qd, obj_rel_pos, obj_rel_quat,
+                _abs_q, _abs_qd, obj_abs_pos, obj_abs_quat,
                 delayed_contact,
             ], dim=-1)
         else:
             current_features = torch.cat([
-                _abs_q, _abs_qd,
-                obj_abs_pos, obj_abs_quat,
-                delayed_contact,
+                _abs_q, _abs_qd, obj_abs_pos, obj_abs_quat, delayed_contact,
             ], dim=-1)
 
         self.obs_history = torch.roll(self.obs_history, shifts=-1, dims=1)
@@ -560,10 +548,6 @@ class BoxliftEnv(DirectRLEnv):
         return {"policy": obs, "privileged": self._get_privileged_obs()}
 
     def _get_privileged_obs(self) -> torch.Tensor:
-        """Privileged critic tensor (136 dims):
-          13 clean obj state | 28 DR samples | 75 ref state @ phase | 12 force/contact |
-           4 eef-box rel errors | 4 VOC/curriculum context.
-        """
         idx = self.episode_length_buf
         T = self.obj_poses.shape[0]
         idx_clamped = idx.clamp(max=T - 1)
@@ -573,19 +557,19 @@ class BoxliftEnv(DirectRLEnv):
         clean_obj_vel = self.object.data.root_vel_w.clone()                             # (N, 6) lin+ang
         clean_obj_block = torch.cat([clean_obj_pos, clean_obj_quat, clean_obj_vel], dim=-1)  # (N, 13)
 
-        stiff_l = self.ur5e_l.data.joint_stiffness                                      # (N, 6)
-        stiff_r = self.ur5e_r.data.joint_stiffness                                      # (N, 6)
-        damp_l  = self.ur5e_l.data.joint_damping                                        # (N, 6)
-        damp_r  = self.ur5e_r.data.joint_damping                                        # (N, 6)
+        stiff_l = self.ur5e_l.data.joint_stiffness
+        stiff_r = self.ur5e_r.data.joint_stiffness
+        damp_l  = self.ur5e_l.data.joint_damping
+        damp_r  = self.ur5e_r.data.joint_damping
         dr_block = torch.cat([
             self._dr_obj_mass, self._dr_obj_friction,
             stiff_l, stiff_r, damp_l, damp_r,
-        ], dim=-1)                                                                       # (N, 28)
+        ], dim=-1)
 
-        ref_obj_pos = self.obj_poses[idx_clamped, :3]                                   # (N, 3)
-        ref_obj_quat = self.obj_poses[idx_clamped, 3:]                                  # (N, 4)
-        ref_obj_vel = self.obj_vel[idx_clamped]                                         # (N, 6)
-        ref_joints_l = self.joints_l[idx_clamped]                                       # (N, 6)
+        ref_obj_pos = self.obj_poses[idx_clamped, :3]
+        ref_obj_quat = self.obj_poses[idx_clamped, 3:]
+        ref_obj_vel = self.obj_vel[idx_clamped]
+        ref_joints_l = self.joints_l[idx_clamped]
         ref_joints_r = self.joints_r[idx_clamped]
         ref_joint_vels_l = self.joint_vel_l[idx_clamped]
         ref_joint_vels_r = self.joint_vel_r[idx_clamped]
@@ -593,22 +577,22 @@ class BoxliftEnv(DirectRLEnv):
         ref_joints_target_r = self.joints_target_r[idx_clamped]
         planner_pd_l = ref_joints_target_l - ref_joints_l
         planner_pd_r = ref_joints_target_r - ref_joints_r
-        ref_EE_pose_l = torch.cat([                                                       # (N, 7)
+        ref_EE_pose_l = torch.cat([
             self._robot_ee_ref_pos(self.EE_poses_l[idx_clamped, :3], "l"),
             self._robot_ee_ref_quat(self.EE_poses_l[idx_clamped, 3:], "l"),
         ], dim=-1)
-        ref_EE_pose_r = torch.cat([                                                       # (N, 7)
+        ref_EE_pose_r = torch.cat([
             self._robot_ee_ref_pos(self.EE_poses_r[idx_clamped, :3], "r"),
             self._robot_ee_ref_quat(self.EE_poses_r[idx_clamped, 3:], "r"),
         ], dim=-1)
         ref_block = torch.cat([
-            ref_obj_pos, ref_obj_quat, ref_obj_vel,                                     # 13
-            ref_joints_l, ref_joints_r,                                                 # 12
-            ref_joint_vels_l, ref_joint_vels_r,                                         # 12
-            ref_joints_target_l, ref_joints_target_r,                                   # 12
-            planner_pd_l, planner_pd_r,                                                 # 12
-            ref_EE_pose_l, ref_EE_pose_r,                                               # 14
-        ], dim=-1)                                                                       # (N, 75)
+            ref_obj_pos, ref_obj_quat, ref_obj_vel,
+            ref_joints_l, ref_joints_r,
+            ref_joint_vels_l, ref_joint_vels_r,
+            ref_joints_target_l, ref_joints_target_r,
+            planner_pd_l, planner_pd_r,
+            ref_EE_pose_l, ref_EE_pose_r,
+        ], dim=-1)
 
         ee_force_vecs = []
         ee_force_mags = []
@@ -618,8 +602,8 @@ class BoxliftEnv(DirectRLEnv):
             dir_ = f / mag.clamp(min=1e-6)                                              # (N, 3) unit (or 0)
             ee_force_mags.append(mag)
             ee_force_vecs.append(dir_)
-        ee_force_mag_l, ee_force_mag_r = ee_force_mags[0], ee_force_mags[1]             # (N, 1) each
-        ee_force_dir_l, ee_force_dir_r = ee_force_vecs[0], ee_force_vecs[1]             # (N, 3) each
+        ee_force_mag_l, ee_force_mag_r = ee_force_mags[0], ee_force_mags[1]
+        ee_force_dir_l, ee_force_dir_r = ee_force_vecs[0], ee_force_vecs[1]
 
         illegal_cube = torch.zeros((self.num_envs, 1), device=self.device)
         illegal_table = torch.zeros((self.num_envs, 1), device=self.device)
@@ -634,34 +618,28 @@ class BoxliftEnv(DirectRLEnv):
                 .norm(dim=-1).sum(dim=-1).flatten()
             )
 
-        fl = self._get_flange_to_forearm_distance(self.ur5e_l).unsqueeze(-1)            # (N, 1)
-        fr = self._get_flange_to_forearm_distance(self.ur5e_r).unsqueeze(-1)            # (N, 1)
+        fl = self._get_flange_to_forearm_distance(self.ur5e_l).unsqueeze(-1)
+        fr = self._get_flange_to_forearm_distance(self.ur5e_r).unsqueeze(-1)
 
         force_block = torch.cat([
-            ee_force_mag_l, ee_force_mag_r,                                             # 2
-            ee_force_dir_l, ee_force_dir_r,                                             # 6
-            illegal_cube, illegal_table,                                                # 2
-            fl, fr,                                                                     # 2
-        ], dim=-1)                                                                       # (N, 12)
+            ee_force_mag_l, ee_force_mag_r,
+            ee_force_dir_l, ee_force_dir_r,
+            illegal_cube, illegal_table,
+            fl, fr,
+        ], dim=-1)
 
-        # --- (5) Eef-box relative tracking errors (scalars from reward path) --------
         pos_err_l, quat_err_l, pos_err_r, quat_err_r = self._compute_eef_box_rel_errors()
-        eef_box_block = torch.stack(
-            [pos_err_l, quat_err_l, pos_err_r, quat_err_r], dim=-1
-        )                                                                                # (N, 4)
+        eef_box_block = torch.stack([pos_err_l, quat_err_l, pos_err_r, quat_err_r], dim=-1)
 
-        # --- (6) VOC / curriculum context -------------------------------------------
-        # Per-env current-segment VOC gains. Tells the critic "this env is getting this
-        # much assist right now" — V should reflect outcomes under the active kp.
         seg_idx_per_env = self.phase_to_segment[
             idx_clamped.clamp(max=self.phase_to_segment.shape[0] - 1)
-        ]                                                                                # (N,) long
-        cur_kp_pos = self._voc_kp_pos_seg[seg_idx_per_env].unsqueeze(-1)                # (N, 1)
-        cur_kp_rot = self._voc_kp_rot_seg[seg_idx_per_env].unsqueeze(-1)                # (N, 1)
+        ]
+        cur_kp_pos = self._voc_kp_pos_seg[seg_idx_per_env].unsqueeze(-1)
+        cur_kp_rot = self._voc_kp_rot_seg[seg_idx_per_env].unsqueeze(-1)
         alpha_scalar = float(self._curriculum_alpha())
         alpha_t = torch.full((self.num_envs, 1), alpha_scalar, device=self.device)
-        seg_t = seg_idx_per_env.float().unsqueeze(-1)                                   # (N, 1)
-        voc_block = torch.cat([cur_kp_pos, cur_kp_rot, alpha_t, seg_t], dim=-1)         # (N, 4)
+        seg_t = seg_idx_per_env.float().unsqueeze(-1)
+        voc_block = torch.cat([cur_kp_pos, cur_kp_rot, alpha_t, seg_t], dim=-1)
 
         return torch.cat([
             clean_obj_block, dr_block, ref_block, force_block, eef_box_block, voc_block
@@ -782,11 +760,7 @@ class BoxliftEnv(DirectRLEnv):
         self.object.write_root_pose_to_sim(initial_object_pose, env_ids)
         self.object.write_root_velocity_to_sim(initial_object_vel, env_ids)
 
-        # === Per-segment VOC ring-buffer push ===
-        # For each completing env, push the per-segment normalized reward mean (where
-        # steps>0) to that segment's ring buffer. Different envs visited different
-        # segment sets (RSI sample + episode length determine coverage), so per-segment
-        # write pointers advance independently. Must run BEFORE we zero the trackers.
+        # Must run BEFORE we zero the per-segment trackers below.
         W = self.cfg.voc_reward_window_size
         eids_t = torch.as_tensor(env_ids, device=self.device, dtype=torch.long)
         for s in range(self._voc_n_segments):
@@ -815,7 +789,6 @@ class BoxliftEnv(DirectRLEnv):
         self._alpha_ep_rew_task[eids_t] = 0.0
         self._alpha_ep_steps[eids_t]    = 0
 
-        # Reset to 0: prev_actions is raw residual (≈[-1,1]), not joint pos; avoids first-step rate spike.
         self.prev_actions[env_ids] = 0.0
         self.prev_joint_vel[env_ids, :6] = initial_joint_vel_l
         self.prev_joint_vel[env_ids, 6:] = initial_joint_vel_r
@@ -835,7 +808,6 @@ class BoxliftEnv(DirectRLEnv):
         self.obj_obs_last_rel[env_ids, 3]  = 1.0  # identity quat (wxyz)
         self.obj_obs_counter[env_ids] = self.cfg.obs_obj_update_period
 
-        # Per-episode constant tracker bias (held for full episode, applied before per-fire noise).
         n_b = len(env_ids)
         if self.cfg.obs_obj_pos_bias_std > 0.0:
             self.obj_obs_bias_pos[env_ids] = (
@@ -886,7 +858,6 @@ class BoxliftEnv(DirectRLEnv):
         self._alpha_ep_rew_task += rew_task_unweighted
         self._alpha_ep_steps    += 1
 
-        # Phase-exclusive tracking: absolute EE when out-of-contact, EE-in-box-frame when in contact.
         T = self.eef_box_gate_mask.shape[0]
         phase_idx = self.episode_length_buf.clamp(max=T - 1)
         gate = self.eef_box_gate_mask[phase_idx].float()
@@ -1235,7 +1206,6 @@ class BoxliftEnv(DirectRLEnv):
         return pos_err_l, quat_err_l, pos_err_r, quat_err_r
 
 
-    # Back-compat shim: getter returns mean across segments; setter broadcasts scalar to all segments.
     @property
     def voc_kp_pos(self) -> float:
         return float(self._voc_kp_pos_seg.mean().item())
@@ -1312,8 +1282,7 @@ class BoxliftEnv(DirectRLEnv):
         return torch.norm(flange_pos - (p1 + t.unsqueeze(-1) * line_vec), dim=-1)
     
     def _compute_proximity_penalty(self) -> torch.Tensor:
-        """PhysX separation-distance proximity penalty. Silently drops contacts when buffer overflows
-        (index_reduce_ crashes if separation length < real contact count; bump max_contact_data_count_per_prim)."""
+        """PhysX separation-distance proximity penalty; silently clips overflow contacts."""
         penalty = torch.zeros(self.num_envs, device=self.device)
         for name, sensor in self.illegal_contact_sensors.items():
             _, _, _, separation, contact_count_per_link, _ = sensor.contact_physx_view.get_contact_data(self.dt)

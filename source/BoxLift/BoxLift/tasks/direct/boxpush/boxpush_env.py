@@ -26,11 +26,8 @@ class BoxpushEnv(DirectRLEnv):
     cfg: BoxpushEnvCfg
 
     def __init__(self, cfg: BoxpushEnvCfg, render_mode: str | None = None, **kwargs):
-        # Re-run __post_init__ to pick up fields that were set by hydra CLI overrides
-        # after the cfg dataclass was originally constructed (e.g. enable_phase_slowdown,
-        # future_obs_steps, include_prev_actions). DirectRLEnv reads cfg.action_space /
-        # cfg.observation_space in super().__init__ to allocate buffers, so this must
-        # happen first.
+        # __post_init__ must run before super().__init__ so cfg.observation_space reflects
+        # any Hydra CLI overrides before DirectRLEnv allocates observation buffers.
         cfg.__post_init__()
         super().__init__(cfg, render_mode, **kwargs)
 
@@ -38,39 +35,23 @@ class BoxpushEnv(DirectRLEnv):
         self.flange_idx = self.ur5e.body_names.index("wrist_3_link")
         self.forearm_link_idx = self.ur5e.body_names.index("forearm_link")
 
-        # Continuous trajectory phase index (float). All trajectory lookups go through
-        # _interp/_nlerp using this. dphase is the per-step advance rate (1 = nominal);
-        # initialized to 0 so the first _get_observations after env init doesn't advance.
         self.phase = torch.zeros(self.num_envs, device=self.device)
         self.dphase = torch.zeros(self.num_envs, device=self.device)
-        # Starting phase of the current episode (set in _reset_idx). Used by the
-        # failure-aware resampler to credit every segment the episode traversed with the
-        # terminal outcome (RobotDancing-style stability score).
         self.episode_start_phase = torch.zeros(self.num_envs, device=self.device)
-        # Cumulative slowdown this episode: Σ (1 - dphase). Drives the quadratic pause penalty.
         self.cumulative_slowdown = torch.zeros(self.num_envs, device=self.device)
 
         self._action_scale = torch.tensor(self.cfg.action_scale, device=self.device, dtype=torch.float32)
 
-        # Failure-aware phase resampling state (allocated unconditionally so runtime toggles
-        # don't crash; only updated when enable_failure_resampling=True).
-        # Derive segment size (in trajectory steps) from configured duration and trajectory dt.
         T = self.obj_poses.shape[0]
         self._segment_size = max(1, int(round(self.cfg.phase_segment_s / self.dt)))
-        # Number of segments that fit in the valid start range [0, T-1). Last segment may be
-        # smaller than _segment_size if (T-1) isn't a multiple — _sample_phase_failure_weighted
-        # clamps within-segment offsets accordingly.
         self._num_segments = max(1, (T - 1 + self._segment_size - 1) // self._segment_size)
-        # Init at 0.5 (unknown): nothing is blocked from sampling on the first iter.
         self.segment_scores = torch.full(
             (self._num_segments,), 0.5, device=self.device, dtype=torch.float32
         )
 
     def _setup_scene(self):
-        # Load the trajectory file
         traj = np.load(self.cfg.trajectory_path)
 
-        # Store initial positions and joint states
         self.obj_poses          = torch.from_numpy(traj["obj_poses"]).float().to(self.device)
         self.obj_vel            = torch.from_numpy(traj["obj_vel"]).float().to(self.device)
         self.arm_pose           = torch.from_numpy(traj["arm_pose"]).float().to(self.device)
@@ -80,7 +61,6 @@ class BoxpushEnv(DirectRLEnv):
         self.EE_poses           = torch.from_numpy(traj["EE_poses"]).float().to(self.device)
         self.dt                 = float(traj["dt"])
 
-        # Set scene params from trajectory
         if "object_dims" in traj:
             self.cfg.object_dims = tuple(traj["object_dims"].tolist())
             self.cfg.cube_cfg.spawn.size = self.cfg.object_dims
@@ -88,10 +68,6 @@ class BoxpushEnv(DirectRLEnv):
             self.cfg.object_mass = float(traj["object_mass"])
             self.cfg.cube_cfg.spawn.mass_props.mass = self.cfg.object_mass
 
-        # TODO: Support last trajectory point
-        # max_episode_steps takes priority: it caps wall-clock at L sim steps regardless of
-        # slowdown. Otherwise, slowdown enabled → cap is a fixed multiple of nominal duration
-        # (lets dphase_min=0 without dividing by zero); slowdown disabled → cap = nominal duration.
         traj_duration = self.dt * (self.obj_poses.shape[0] - 1)
         if self.cfg.max_episode_steps > 0:
             self.cfg.episode_length_s = self.cfg.max_episode_steps * self.dt
@@ -103,14 +79,13 @@ class BoxpushEnv(DirectRLEnv):
         ur5e_cfg = get_ur5e_cfg(self.cfg.ur5e_prim_path, self.arm_pose, self.cfg)
         self.ur5e = Articulation(ur5e_cfg)
 
-        # Disable collision on base_link (ground is raised 1.8cm for the box pushing surface,
-        # but the robot base sits at the original level — only the area near the box is elevated)
+        # Ground is raised 1.8cm for the box surface; disable base_link collision to avoid
+        # the robot base clipping into the raised area near the box.
         modify_collision_properties(
             "/World/envs/env_0/ur5e/base_link",
             sim_utils.CollisionPropertiesCfg(collision_enabled=False),
         )
 
-        # add ground plane
         spawn_ground_plane(prim_path="/World/ground", cfg=GroundPlaneCfg(), translation=(0,0,-0.5))
 
         self.object = RigidObject(cfg=self.cfg.cube_cfg)
@@ -118,10 +93,7 @@ class BoxpushEnv(DirectRLEnv):
 
         self.illegal_contact_sensors = {name: ContactSensor(cfg) for name, cfg in self.cfg.illegal_contact_sensor_cfgs.items()}
 
-        # EE-box-relative reward gate: mark reference steps where the box is moving
-        # (contact/near-contact phases), then dilate by ±dilation_steps so the window also
-        # covers brief pre-contact approach and post-release follow-through. Precomputed
-        # once from the reference trajectory — looked up at runtime by phase.floor().
+        # Gate: which trajectory steps have active box motion (and dilated margins).
         obj_vel_mag = self.obj_vel[:, :3].norm(dim=-1) + self.obj_vel[:, 3:].norm(dim=-1)
         moving = (obj_vel_mag > self.cfg.eef_box_gate_obj_vel_eps).float()
         if self.cfg.eef_box_gate_dilation_steps > 0:
@@ -130,12 +102,8 @@ class BoxpushEnv(DirectRLEnv):
                 moving.view(1, 1, -1), kernel_size=k, stride=1,
                 padding=int(self.cfg.eef_box_gate_dilation_steps),
             ).view(-1)
-        self.eef_box_gate_mask = moving.bool()  # (T,)
+        self.eef_box_gate_mask = moving.bool()
 
-        # RSI contact-exclusion mask. Independent of the reward gate (which dilates by 1s
-        # of margin). Here we want to forbid resetting mid-contact; small or zero dilation
-        # is usually right. Stored as the precomputed list of valid integer start phases so
-        # _reset_idx can sample with one randint into that set.
         rsi_contact = (obj_vel_mag > self.cfg.eef_box_gate_obj_vel_eps).float()
         if self.cfg.rsi_contact_dilation_steps > 0:
             k = 2 * int(self.cfg.rsi_contact_dilation_steps) + 1
@@ -145,29 +113,16 @@ class BoxpushEnv(DirectRLEnv):
             ).view(-1)
         self.rsi_valid_phases = torch.nonzero(~rsi_contact.bool(), as_tuple=False).squeeze(-1)
 
-        # Regularization stuff
         self.prev_actions = torch.zeros((self.num_envs, 6), device=self.device)
         self.prev_joint_vel = torch.zeros((self.num_envs, 6), device=self.device)
         self._dr_obj_mass = torch.zeros((self.num_envs, 1), device=self.device)
         self._dr_obj_friction = torch.zeros((self.num_envs, 3), device=self.device)
 
-        # Observation history buffer: (num_envs, history_steps, per_step_feature_dim).
-        # per_step_feature_dim = 12 (rel_q + rel_qd) [+ 13 (obj_pos_rel + obj_quat_rel + obj_vel_rel) if include_object_obs]
-        #                        [+ same again (absolute versions) if include_absolute_obs].
-        # Index 0 = oldest, -1 = newest. Flattened in _get_observations.
         self.obs_history = torch.zeros(
             (self.num_envs, self.cfg.obs_history_steps, self.cfg.per_step_feature_dim),
             device=self.device,
         )
 
-        # Box tracker model (sim2real). Past clean poses (env-frame, pos+quat=7) and the
-        # phase at the time of each push, both length delay+1; index 0 = oldest = exactly
-        # delay env steps ago, index -1 = newest. obj_obs_counter increments each step;
-        # when it reaches obs_obj_update_period we "fire" a fresh tracker frame: read
-        # buffer[0], apply noise, compute rel against the *past* reference at the phase
-        # that was current when that pose was measured, store both abs and rel in last_*,
-        # reset counter. The policy always reads obj_obs_last_*, so between fires both
-        # the absolute and relative readings stay frozen at their last-fire values.
         self.obj_pose_delay_buf = torch.zeros(
             (self.num_envs, self.cfg.obs_obj_delay_steps + 1, 7),
             device=self.device,
@@ -178,27 +133,20 @@ class BoxpushEnv(DirectRLEnv):
         )
         self.obj_obs_counter = torch.zeros(self.num_envs, dtype=torch.long, device=self.device)
         self.obj_obs_last_pose = torch.zeros(self.num_envs, 7, device=self.device)
-        # Held relative pose (delayed_actual - reference_at_delayed_phase). pos (3) + quat (4).
         self.obj_obs_last_rel = torch.zeros(self.num_envs, 7, device=self.device)
 
-        # Perturbation state
         self.perturbation_counter = torch.zeros(self.num_envs, device=self.device, dtype=torch.long)
         self.perturbation_forces = torch.zeros(self.num_envs, 1, 3, device=self.device)
         self.perturbation_torques = torch.zeros(self.num_envs, 1, 3, device=self.device)
 
-        # clone and replicate
         self.scene.clone_environments(copy_from_source=False)
         if self.device == "cpu":
             self.scene.filter_collisions(global_prim_paths=[])
-        # add articulation to scene
         self.scene.articulations["ur5e"] = self.ur5e
-        # add object to the scene
         self.scene.rigid_objects["object"] = self.object
         self.scene.rigid_objects["table"] = self.table
-        # add sensors to the scene
         for name, sensor in self.illegal_contact_sensors.items():
             self.scene.sensors[f"illegal_contact_sensor_{name}"] = sensor
-        # add lights
         light_cfg = sim_utils.DomeLightCfg(intensity=2000.0, color=(0.75, 0.75, 0.75))
         light_cfg.func("/World/Light", light_cfg)
 
@@ -231,18 +179,14 @@ class BoxpushEnv(DirectRLEnv):
         self.cube_marker.set_visibility(True)
 
     def _apply_perturbations(self):
-        """Apply random external forces to the forearm to improve robustness."""
-        # Decrement active perturbation counters
         self.perturbation_counter = torch.clamp(self.perturbation_counter - 1, min=0)
 
-        # Start new perturbations with some probability
         new_perturbation = torch.rand(self.num_envs, device=self.device) < self.cfg.perturbation_probability
-        new_perturbation &= self.perturbation_counter == 0  # don't overlap
+        new_perturbation &= self.perturbation_counter == 0
         new_ids = new_perturbation.nonzero(as_tuple=False).squeeze(-1)
 
         if len(new_ids) > 0:
             self.perturbation_counter[new_ids] = self.cfg.perturbation_duration_steps
-            # Random force direction and magnitude on forearm
             self.perturbation_forces[new_ids, 0] = (
                 torch.randn(len(new_ids), 3, device=self.device)
                 * self.cfg.perturbation_force_std
@@ -252,12 +196,10 @@ class BoxpushEnv(DirectRLEnv):
                 * self.cfg.perturbation_torque_std
             )
 
-        # Clear expired perturbations
         expired = self.perturbation_counter == 0
         self.perturbation_forces[expired] = 0.0
         self.perturbation_torques[expired] = 0.0
 
-        # Apply to forearm link
         self.ur5e.set_external_force_and_torque(
             self.perturbation_forces,
             self.perturbation_torques,
@@ -266,11 +208,7 @@ class BoxpushEnv(DirectRLEnv):
         )
 
     def _interp(self, traj: torch.Tensor, phase: torch.Tensor | None = None) -> torch.Tensor:
-        """Linear interpolation along the trajectory time axis.
-
-        traj: (T, D) reference. phase: (num_envs,) float index, defaults to self.phase.
-        Returns (num_envs, D).
-        """
+        """Linear interpolation along trajectory time axis. traj: (T, D), returns (num_envs, D)."""
         if phase is None:
             phase = self.phase
         T = traj.shape[0]
@@ -299,17 +237,8 @@ class BoxpushEnv(DirectRLEnv):
     def _pre_physics_step(self, actions: torch.Tensor) -> None:
         self.actions = actions.clone()
 
-        # Set per-step phase advance rate. When the phase variable is enabled, the policy's
-        # 7th action controls it; otherwise we advance by 1 nominal step. The actual phase
-        # update happens in _get_observations (post-physics), so trajectory lookups in
-        # _apply_action below still see the current step's reference.
         if self.cfg.enable_phase_slowdown:
             raw = self.actions[:, 6]
-            # Slowdown-only: tanh(raw) ∈ [-1, 1] → dphase ∈ [2*dphase_min - 1, 1] before
-            # the clamp, then clamped to [dphase_min, 1]. Net mapping:
-            #   raw <= 0: dphase ∈ [dphase_min, 1] (smooth slowdown)
-            #   raw >  0: dphase = 1 (deadzone — no speedup possible)
-            # raw=0 is the neutral point (dphase=1, no slowdown).
             self.dphase = (1.0 + (1.0 - self.cfg.dphase_min) * torch.tanh(raw)).clamp(
                 min=self.cfg.dphase_min, max=1.0
             )
@@ -325,12 +254,8 @@ class BoxpushEnv(DirectRLEnv):
         obj_quat = self._nlerp(self.obj_poses[:, 3:])
         self.cube_marker.visualize(translations=obj_pos, orientations=obj_quat)
 
-        # Cache the joint target once per policy step. Modes C/D depend on q_current —
-        # without caching, _apply_action would recompute the target every substep and the
-        # target would drift with the joint inside the decimation window. Caching here
-        # makes the target a plain ZOH-from-q_at_policy_time, matching standard deployment
-        # (ZOH between policy updates + high-rate low-level PD chasing a fixed target).
-        # Modes A/B don't depend on q_current so caching is a no-op for them.
+        # Cache once per policy step so substeps in the decimation window all chase the
+        # same ZOH target (modes C/D depend on q_current; recomputing would cause drift).
         self._cached_joint_target = self.get_joint_targets().clamp(
             self.ur5e.data.joint_pos_limits[..., 0],
             self.ur5e.data.joint_pos_limits[..., 1],
@@ -350,11 +275,7 @@ class BoxpushEnv(DirectRLEnv):
         return self._get_joint_pos() + self._action_scale * self.actions[:, :6]
 
     def get_joint_targets_D(self):
-        """Residual on current position shifted by planner's intended PD error, blended
-        with a curriculum α ∈ [0, 1]:
-            q_target = q_curr + (1-α)·(ref_target - ref_pos) + (α + ε(1-α))·scale·a
-        At α=0 the command is pure planner PD feedforward with a small residual floor ε;
-        at α=1 it collapses to mode C (pure residual from current position)."""
+        """Blended residual: (1-α)·planner_feedforward + (α + ε(1-α))·scale·action from current q."""
         planner_pd_error = self._interp(self.joints_target) - self._interp(self.joints)
         alpha = self._curriculum_alpha()
         eps = float(self.cfg.action_alpha_floor)
@@ -382,40 +303,26 @@ class BoxpushEnv(DirectRLEnv):
         return self._interp(self.joints_target) - self._interp(self.joints)
 
     def _get_noisy_obj_obs(self):
-        """Simulated tracker reading of the box: pose-only, with fixed delay, sub-50Hz
-        update rate, and per-fire pose+orientation noise. Both relative (vs reference)
-        and absolute (env-frame) views are derived from the same held tracker pose, so
-        the policy sees mutually consistent readings. Reward path reads clean ground truth
-        via _get_obj_pos / _get_obj_quat / _get_obj_vel and is unaffected.
-        """
+        """Simulated tracker: fixed delay, sub-rate updates, per-fire noise."""
         obj_pos_now  = self.object.data.root_pos_w.clone() - self.scene.env_origins
         obj_quat_now = self.object.data.root_quat_w.clone()
 
-        # Push current clean pose AND current phase into the tracker buffers (newest-last).
-        # After this push, [:, 0] holds the pose / phase from exactly obs_obj_delay_steps
-        # env steps ago (the past phase is what `_interp` needs to evaluate the reference
-        # at the time the delayed measurement was taken).
         pose_now = torch.cat([obj_pos_now, obj_quat_now], dim=-1)
         self.obj_pose_delay_buf = torch.roll(self.obj_pose_delay_buf, shifts=-1, dims=1)
         self.obj_pose_delay_buf[:, -1] = pose_now
         self.obj_phase_delay_buf = torch.roll(self.obj_phase_delay_buf, shifts=-1, dims=1)
         self.obj_phase_delay_buf[:, -1] = self.phase
 
-        # Tick age; fire fresh tracker frame where counter has reached the period.
         self.obj_obs_counter += 1
         fires = self.obj_obs_counter >= self.cfg.obs_obj_update_period
         fires_idx = fires.nonzero(as_tuple=False).squeeze(-1)
 
-        # print(pose_now)
         if fires_idx.numel() > 0:
             n_f = fires_idx.numel()
-            # Fixed delay → always the oldest buffer entry, both pose and matching phase.
             sampled = self.obj_pose_delay_buf[fires_idx, 0]
             sampled_phase = self.obj_phase_delay_buf[fires_idx, 0]
             sampled_pos  = sampled[:, :3]
             sampled_quat = sampled[:, 3:]
-            # print(sampled)
-            # Per-fire noise: applied only on fresh samples so held readings don't re-jitter.
             sampled_pos += self.cfg.obs_obj_pos_noise * torch.randn(n_f, 3, device=self.device)
             if self.cfg.obs_obj_ori_noise > 0:
                 aa = self.cfg.obs_obj_ori_noise * torch.randn(n_f, 3, device=self.device)
@@ -423,7 +330,6 @@ class BoxpushEnv(DirectRLEnv):
                 delta_quat = delta_quat / delta_quat.norm(dim=-1, keepdim=True)
                 sampled_quat = quat_mul(delta_quat, sampled_quat)
             sampled_quat = sampled_quat / sampled_quat.norm(dim=-1, keepdim=True).clamp(min=1e-8)
-            # Reference evaluated at the past phase — temporally aligned with the measurement.
             past_ref_pos  = self._interp(self.obj_poses[:, :3], phase=sampled_phase)
             past_ref_quat = self._nlerp(self.obj_poses[:, 3:], phase=sampled_phase)
             rel_pos_fire  = sampled_pos - past_ref_pos
@@ -442,8 +348,6 @@ class BoxpushEnv(DirectRLEnv):
         return rel_pos, rel_quat, obj_pos, obj_quat
 
     def _get_observations(self) -> dict:
-        # Advance phase post-physics so obs/rewards reference the new step. For envs that
-        # were just reset, dphase=0 (set in _reset_idx) makes this a no-op.
         T = self.obj_poses.shape[0]
         self.phase = (self.phase + self.dphase).clamp(0.0, T - 1 - 1e-6)
 
@@ -462,17 +366,14 @@ class BoxpushEnv(DirectRLEnv):
             if need_obj:
                 feature_parts.extend([obj_abs_pos, obj_abs_quat])
 
-        current_features = torch.cat(feature_parts, dim=-1)  # (num_envs, per_step_feature_dim)
+        current_features = torch.cat(feature_parts, dim=-1)
 
-        # Shift history: oldest entry drops out, current becomes newest
         self.obs_history = torch.roll(self.obs_history, shifts=-1, dims=1)
         self.obs_history[:, -1] = current_features
 
         phase_obs = (self.phase / (T - 1)).unsqueeze(-1)
         obs_parts = [self.obs_history.flatten(start_dim=1), phase_obs]
 
-        # Future reference obj pose look-ahead: (future_ref - current_ref) for each configured offset,
-        # plus the absolute future ref pose if include_absolute_obs.
         if self.cfg.future_obs_steps:
             cur_pos = self._interp(self.obj_poses[:, :3])
             cur_quat = self._nlerp(self.obj_poses[:, 3:])
@@ -483,14 +384,12 @@ class BoxpushEnv(DirectRLEnv):
                 fut_pos = self._interp(self.obj_poses[:, :3], phase=fut_phase)
                 fut_quat = self._nlerp(self.obj_poses[:, 3:], phase=fut_phase)
                 futures.append(fut_pos - cur_pos)
-                # World-frame delta (matches _get_obj_quat's `desired * inv(actual)` convention).
                 futures.append(quat_mul(fut_quat, inv_cur_quat))
                 if self.cfg.include_absolute_obs:
                     futures.append(fut_pos)
                     futures.append(fut_quat)
             obs_parts.append(torch.cat(futures, dim=-1))
 
-        # Previous raw policy action (pre-scale).
         if self.cfg.include_prev_actions:
             obs_parts.append(self.prev_actions)
 
@@ -498,28 +397,17 @@ class BoxpushEnv(DirectRLEnv):
         return {"policy": obs, "privileged": self._get_privileged_obs()}
 
     def _get_privileged_obs(self) -> torch.Tensor:
-        """85-dim privileged critic obs. Layout:
-          13  clean obj state   (pos 3 + quat 4 + lin_vel 3 + ang_vel 3)
-          16  DR samples        (mass 1 + friction 3 + stiff 6 + damp 6)
-          44  reference @ phase (ref_obj 13 + ref_joints 6 + ref_jvel 6 + ref_jtgt 6 + planner_pd 6 + ref_EE 7)
-           6  force/contact     (EE force zeros 4 + illegal 1 + flange-forearm 1) [no ee_contact_sensor]
-           2  eef-box rel       (pos_err 1 + quat_err 1)
-           4  VOC/curriculum    (kp_pos 1 + kp_rot 1 + alpha 1 + phase_norm 1)
-        """
         T = self.obj_poses.shape[0]
 
-        # (1) clean obj state
         clean_pos = self.object.data.root_pos_w.clone() - self.scene.env_origins
         clean_quat = self.object.data.root_quat_w.clone()
         clean_vel = self.object.data.root_vel_w.clone()
-        obj_block = torch.cat([clean_pos, clean_quat, clean_vel], dim=-1)  # (N, 13)
+        obj_block = torch.cat([clean_pos, clean_quat, clean_vel], dim=-1)
 
-        # (2) DR samples
-        stiff = self.ur5e.data.joint_stiffness   # (N, 6)
-        damp  = self.ur5e.data.joint_damping     # (N, 6)
-        dr_block = torch.cat([self._dr_obj_mass, self._dr_obj_friction, stiff, damp], dim=-1)  # (N, 16)
+        stiff = self.ur5e.data.joint_stiffness
+        damp  = self.ur5e.data.joint_damping
+        dr_block = torch.cat([self._dr_obj_mass, self._dr_obj_friction, stiff, damp], dim=-1)
 
-        # (3) reference state at phase
         ref_obj_pos  = self._interp(self.obj_poses[:, :3])
         ref_obj_quat = self._nlerp(self.obj_poses[:, 3:])
         ref_obj_vel  = self._interp(self.obj_vel)
@@ -530,36 +418,28 @@ class BoxpushEnv(DirectRLEnv):
         ref_EE = torch.cat([self._interp(self.EE_poses[:, :3]), self._nlerp(self.EE_poses[:, 3:])], dim=-1)
         ref_block = torch.cat([ref_obj_pos, ref_obj_quat, ref_obj_vel,
                                 ref_joints, ref_joint_vel, ref_joints_tgt, planner_pd,
-                                ref_EE], dim=-1)  # (N, 44)
+                                ref_EE], dim=-1)
 
-        # (4) force/contact — no ee_contact_sensor, use zeros for EE dims
         ee_zeros = torch.zeros((self.num_envs, 4), device=self.device)
         illegal = torch.zeros((self.num_envs, 1), device=self.device)
         for sensor in self.illegal_contact_sensors.values():
             illegal[:, 0] += sensor.data.force_matrix_w.norm(dim=-1).sum(dim=-1).flatten()
         fl = self._get_flange_to_forearm_distance(self.ur5e).unsqueeze(-1)
-        force_block = torch.cat([ee_zeros, illegal, fl], dim=-1)             # (N, 6)
+        force_block = torch.cat([ee_zeros, illegal, fl], dim=-1)
 
-        # (5) eef-box rel
         pos_err, quat_err = self._compute_eef_box_rel_errors()
-        eef_block = torch.stack([pos_err, quat_err], dim=-1)                # (N, 2)
+        eef_block = torch.stack([pos_err, quat_err], dim=-1)
 
-        # (6) VOC/curriculum
         kp_pos_t = torch.full((self.num_envs, 1), self.voc_kp_pos, device=self.device)
         kp_rot_t = torch.full((self.num_envs, 1), self.voc_kp_rot, device=self.device)
         alpha_t  = torch.full((self.num_envs, 1), self._curriculum_alpha(), device=self.device)
         phase_norm = (self.phase / max(T - 1, 1)).unsqueeze(-1)
-        voc_block = torch.cat([kp_pos_t, kp_rot_t, alpha_t, phase_norm], dim=-1)  # (N, 4)
+        voc_block = torch.cat([kp_pos_t, kp_rot_t, alpha_t, phase_norm], dim=-1)
 
-        return torch.cat([obj_block, dr_block, ref_block, force_block, eef_block, voc_block], dim=-1)  # (N, 85)
+        return torch.cat([obj_block, dr_block, ref_block, force_block, eef_block, voc_block], dim=-1)
 
     def _get_dones(self) -> tuple[torch.Tensor, torch.Tensor]:
-        # Trajectory completion. episode_length_s is sized in _setup_scene so the wall-clock
-        # can't trigger before phase reaches T-1, even at sustained worst-case slowdown.
         time_out = self.phase >= (self.obj_poses.shape[0] - 1) - 1e-3
-        # Step cap (option-1 RSI): forces time_out after L sim steps regardless of phase.
-        # Paired with the matching cap on t0 sampling in _reset_idx, this equalizes state
-        # visitation across the trajectory.
         if self.cfg.max_episode_steps > 0:
             time_out = time_out | (self.episode_length_buf >= self.cfg.max_episode_steps - 1)
 
@@ -572,22 +452,16 @@ class BoxpushEnv(DirectRLEnv):
         return self.reset_terminated, time_out
 
     def _update_segment_scores(self, env_ids):
-        """EMA update of per-segment stability score using the episode's terminal outcome.
-        Every segment traversed from the start phase through the end phase is credited with
-        the same binary outcome: 1 if the episode failed (reset_terminated), 0 if it timed
-        out (reached trajectory end). Segments successfully passed accumulate success
-        signal every episode; the hard segment that breaks the episode accumulates failure
-        signal. Score → resampling weight via probs ∝ score^beta."""
-        f = self.reset_terminated[env_ids].float()                               # (N,) 1=fail, 0=timeout
+        """EMA update of per-segment failure rate. Credits all traversed segments with the terminal outcome."""
+        f = self.reset_terminated[env_ids].float()
         start_seg = (self.episode_start_phase[env_ids].long() // self._segment_size).clamp(max=self._num_segments - 1)
         end_seg   = (self.phase[env_ids].long()              // self._segment_size).clamp(max=self._num_segments - 1)
 
-        # Traversed mask: (N, S) True where seg_idx ∈ [start_seg, end_seg]
-        seg_idx = torch.arange(self._num_segments, device=self.device).unsqueeze(0)  # (1, S)
+        seg_idx = torch.arange(self._num_segments, device=self.device).unsqueeze(0)
         traversed = (seg_idx >= start_seg.unsqueeze(1)) & (seg_idx <= end_seg.unsqueeze(1))
 
-        count = traversed.float().sum(dim=0)                                     # (S,)
-        fails = (traversed.float() * f.unsqueeze(1)).sum(dim=0)                  # (S,)
+        count = traversed.float().sum(dim=0)
+        fails = (traversed.float() * f.unsqueeze(1)).sum(dim=0)
 
         fail_rate = fails / count.clamp(min=1)
         update_w = (count > 0).float() * self.cfg.phase_resample_alpha
@@ -596,10 +470,7 @@ class BoxpushEnv(DirectRLEnv):
         self.segment_scores.clamp_(lo, hi)
 
     def _max_start_phase(self, T: int) -> float:
-        """Inclusive-exclusive upper bound on starting phase. With max_episode_steps set,
-        leaves room for L steps at full speed (dphase=1) so the episode can complete L
-        steps without running off the end of the trajectory. Otherwise falls back to T-2
-        (the original behavior)."""
+        """Upper bound on RSI starting phase. Leaves room for max_episode_steps steps at full speed."""
         if self.cfg.max_episode_steps > 0:
             return float(max(1, T - 1 - self.cfg.max_episode_steps))
         return float(T - 2)
@@ -622,83 +493,56 @@ class BoxpushEnv(DirectRLEnv):
 
         T = self.obj_poses.shape[0]
 
-        # Failure-aware resampling: credit the failure segment (and partially the preceding
-        # segment, if failure was early in its segment) with this episode's outcome.
-        # Must run BEFORE we overwrite self.phase[env_ids] — that still holds the final phase.
+        # Must run before we overwrite self.phase[env_ids] — it still holds the final phase.
         if self.cfg.enable_failure_resampling and hasattr(self, "reset_terminated"):
             self._update_segment_scores(env_ids)
 
         if fixed_value is not None:
-            # Deterministic start (eval/play).
             self.phase[env_ids] = float(fixed_value) * torch.ones(len(env_ids), device=self.device)
         elif self.cfg.enable_failure_resampling:
-            # Sample segment from failure-weighted distribution, then uniform within segment.
-            # NB: this path doesn't currently apply the RSI contact exclusion — segments may
-            # contain in-contact phases. Disable failure_resampling if you need strict OOC.
             self.phase[env_ids] = self._sample_phase_failure_weighted(len(env_ids), T)
         else:
-            # Sample an integer phase from the precomputed out-of-contact set (rsi_valid_phases),
-            # filtered to those ≤ max_start_phase so an episode at full speed can complete L
-            # steps without falling off the trajectory. Add fractional jitter for slowdown mode.
             upper_float = self._max_start_phase(T)
             max_int = int(upper_float)
             valid = self.rsi_valid_phases[self.rsi_valid_phases <= max_int]
             if valid.numel() == 0:
-                # Pathological: every phase up to max_int is in contact. Fall back to allowing
-                # all phases up to max_int so we don't deadlock.
                 valid = torch.arange(0, max(1, max_int + 1), device=self.device)
             picks = valid[torch.randint(0, valid.numel(), (len(env_ids),), device=self.device)]
             base = picks.float()
             if self.cfg.enable_phase_slowdown:
                 base = (base + torch.rand(len(env_ids), device=self.device)).clamp(max=upper_float)
             self.phase[env_ids] = base
-        # Remember the start phase so the next _update_segment_scores can credit every
-        # segment traversed from start → end with the terminal outcome.
         self.episode_start_phase[env_ids] = self.phase[env_ids]
-        # Set dphase=0 so the immediately-following _get_observations advance is a no-op
-        # (the policy hasn't acted yet for this freshly-reset env). _pre_physics_step will
-        # overwrite dphase from the next action.
+        # dphase=0 so the post-reset _get_observations advance is a no-op.
         self.dphase[env_ids] = 0.0
 
-
-        # Floor phase for integer indexing into trajectory tensors (sim state writes don't
-        # need fractional precision; the env settles in a step).
         idx = self.phase[env_ids].floor().long().clamp(max=T - 1)
         initial_joint_pos = self.joints[idx].clone()
         initial_joint_vel = self.joint_vel[idx].clone()
-        # Per-joint or scalar noise std: tensor of shape (6,) or (), broadcasts against (n, 6).
         pos_noise_std = torch.as_tensor(self.cfg.reset_joint_pos_noise, device=self.device, dtype=torch.float32)
         vel_noise_std = torch.as_tensor(self.cfg.reset_joint_vel_noise, device=self.device, dtype=torch.float32)
         initial_joint_pos += pos_noise_std * torch.randn_like(initial_joint_pos)
         initial_joint_vel += vel_noise_std * torch.randn_like(initial_joint_vel)
         self.ur5e.write_joint_state_to_sim(initial_joint_pos, initial_joint_vel, env_ids=env_ids)
 
-        # Reset Object
         initial_object_pose = self.obj_poses[idx].clone()
         initial_object_pose[:, :3] += self.scene.env_origins[env_ids]
         initial_object_vel = self.obj_vel[idx].clone()
 
         n = len(env_ids)
-        # Position noise (xy only)
         initial_object_pose[:, 0:2] += self.cfg.reset_obj_pos_xy_noise * torch.randn(n, 2, device=self.device)
-        # Orientation noise: yaw-only (z-axis) so the box stays flat and doesn't intersect the ground.
+        # Yaw-only orientation noise keeps the box flat on the surface.
         yaw = self.cfg.reset_obj_ori_noise * torch.randn(n, device=self.device)
         half = 0.5 * yaw
         zeros = torch.zeros_like(half)
         delta_quat = torch.stack([torch.cos(half), zeros, zeros, torch.sin(half)], dim=-1)
         initial_object_pose[:, 3:7] = quat_mul(delta_quat, initial_object_pose[:, 3:7])
-        # Linear velocity noise (xy only) + angular velocity noise (z-axis only, consistent with yaw-only ori noise).
         initial_object_vel[:, 0:2] += self.cfg.reset_obj_lin_vel_xy_noise * torch.randn(n, 2, device=self.device)
         initial_object_vel[:, 5]   += self.cfg.reset_obj_ang_vel_noise * torch.randn(n, device=self.device)
 
         self.object.write_root_pose_to_sim(initial_object_pose, env_ids)
         self.object.write_root_velocity_to_sim(initial_object_vel, env_ids)
 
-        # Reset tracker state (sim2real). Warm both buffers (pose buffer with the freshly-
-        # reset pose, phase buffer with the start phase) so a delayed read after reset
-        # returns sensible values that are temporally consistent. Seed the held abs/rel
-        # readings; set counter == period so a fresh fire happens on the very first
-        # post-reset step (which then writes proper noisy values into last_*).
         init_pose_env = torch.cat([
             initial_object_pose[:, :3] - self.scene.env_origins[env_ids],
             initial_object_pose[:, 3:7],
@@ -706,27 +550,17 @@ class BoxpushEnv(DirectRLEnv):
         self.obj_pose_delay_buf[env_ids]  = init_pose_env.unsqueeze(1)
         self.obj_phase_delay_buf[env_ids] = self.phase[env_ids].unsqueeze(1)
         self.obj_obs_last_pose[env_ids]   = init_pose_env
-        # rel ≈ 0 at reset (actual = ref + small reset noise; ref(start_phase) = trajectory[start_phase]).
         self.obj_obs_last_rel[env_ids, :3] = 0.0
         self.obj_obs_last_rel[env_ids, 3:] = 0.0
-        self.obj_obs_last_rel[env_ids, 3]  = 1.0  # identity quat (wxyz)
+        self.obj_obs_last_rel[env_ids, 3]  = 1.0  # identity quat w
         self.obj_obs_counter[env_ids] = self.cfg.obs_obj_update_period
 
-        # Reset prev variables. prev_actions tracks the previous raw residual action
-        # (units: policy output, ≈ [-1, 1]), NOT joint positions — reset to 0 so the
-        # first-step action_rate penalty isn't a giant spike from the unit mismatch.
         self.prev_actions[env_ids] = 0.0
         self.prev_joint_vel[env_ids] = initial_joint_vel
-
-        # Reset observation history
         self.obs_history[env_ids] = 0.0
-
-        # Clear perturbations
         self.perturbation_counter[env_ids] = 0
         self.perturbation_forces[env_ids] = 0.0
         self.perturbation_torques[env_ids] = 0.0
-
-        # Reset cumulative slowdown for the new episode.
         self.cumulative_slowdown[env_ids] = 0.0
 
         try:
@@ -740,11 +574,7 @@ class BoxpushEnv(DirectRLEnv):
                 self._dr_readback_warned = True
 
     def _curriculum_alpha(self) -> float:
-        """α ∈ [0, 1] schedule used by the reward curriculum, the mode-D action blend, and
-        the policy-authored regularization scaling. alpha_warmup_steps=0 disables (α=1).
-        force_alpha in [0, 1] short-circuits the schedule (sentinel < 0 disables) — used
-        at eval time so a frozen policy runs at the same α it was trained at, regardless
-        of step counter."""
+        """α ∈ [0,1] curriculum schedule. force_alpha overrides for eval; 0 warmup steps → always 1."""
         if 0.0 <= self.cfg.force_alpha <= 1.0:
             return float(self.cfg.force_alpha)
         if self.cfg.alpha_warmup_steps > 0:
@@ -752,8 +582,6 @@ class BoxpushEnv(DirectRLEnv):
         return 1.0
 
     def _reward_track(self, error, sigma, tolerance=0.0):
-        # sigma can be a scalar or an iterable of scalars. With multiple sigmas the kernels
-        # are averaged so max reward stays in [0, 1].
         error = error * (error > tolerance)
         if isinstance(sigma, (tuple, list)):
             sigmas = torch.tensor(sigma, device=error.device, dtype=error.dtype)
@@ -762,16 +590,12 @@ class BoxpushEnv(DirectRLEnv):
         return torch.exp(-error / (sigma ** 2))
 
     def _get_rewards(self) -> torch.Tensor:
-        # Task Reward
         obj_pos_error = self._get_obj_pos_error()
         rew_obj_pos = self.cfg.w_obj_pos * self._reward_track(obj_pos_error ** 2, self.cfg.sigma_obj_pos, self.cfg.tol_obj_pos)
 
         obj_quat_error = self._get_obj_quat_error()
         rew_obj_quat = self.cfg.w_obj_quat * self._reward_track(obj_quat_error ** 2, self.cfg.sigma_obj_quat, self.cfg.tol_obj_quat)
 
-        # Object velocity tracking, split linear vs angular to keep kernel sigmas matched
-        # to each quantity's natural scale. Instantaneous signal that catches "policy
-        # stopped pushing" before obj_pos_error integrates up to termination threshold.
         obj_vel_rel = self._get_obj_vel(relative=True)
         obj_lin_vel_error = obj_vel_rel[:, :3].norm(dim=-1)
         obj_ang_vel_error = obj_vel_rel[:, 3:].norm(dim=-1)
@@ -781,9 +605,6 @@ class BoxpushEnv(DirectRLEnv):
             obj_ang_vel_error ** 2, self.cfg.sigma_obj_ang_vel, self.cfg.tol_obj_ang_vel)
         rew_obj_vel = rew_obj_lin_vel + rew_obj_ang_vel
 
-        # Curriculum α drives (1) the reward-weight ramp, (2) the mode-D action blend, and
-        # (3) the mode-D policy-regularization scaling. common_step_counter increments once
-        # per env step and is maintained by DirectRLEnv.
         alpha = self._curriculum_alpha()
         w_task_eff  = self.cfg.w_task_start  + (self.cfg.w_task  - self.cfg.w_task_start)  * alpha
         w_track_eff = self.cfg.w_track_start + (self.cfg.w_track - self.cfg.w_track_start) * alpha

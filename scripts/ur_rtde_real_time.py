@@ -41,16 +41,11 @@ class RTDEArm:
             except Exception:
                 pass
 
-# Make tag_pose_estimation importable regardless of pip-install state.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _TAG_POSE_DIR = _REPO_ROOT / "tag_pose_estimation"
 sys.path.insert(0, str(_TAG_POSE_DIR))
 from tag_pose_estimation.board_pose_listener import BoardPoseListener  # noqa: E402
 
-# ---------------------------
-# Pose-estimation streaming (hardcoded for now; promote to flag once we
-# support multiple objects).
-# ---------------------------
 ENABLE_POSE_ESTIMATION = True
 POSE_ESTIMATION_SCRIPT = _TAG_POSE_DIR / "scripts" / "run_pose_estimation.py"
 # Path is relative to _TAG_POSE_DIR (which we set as the subprocess cwd).
@@ -60,10 +55,6 @@ POSE_ESTIMATION_CONFIG = (
 POSE_ESTIMATION_PORT = 5555
 BOX_BOARD_ID = "0"
 POSE_FIRST_POSE_TIMEOUT_S = 5.0
-
-# ---------------------------
-# Argument parsing
-# ---------------------------
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--run_dir", type=str, required=True, help="Path to training run directory (e.g. logs/rsl_rl/boxpush/2026-04-08_14-42-08)")
@@ -90,7 +81,6 @@ parser.add_argument("--isaacsim", action="store_true",
                          "whether oscillation observed on URSim is caused by deployment-script bugs "
                          "(would persist in IsaacSim too) or URSim-specific behavior (would not). "
                          "Skips RTDE/pose-listener setup; runs single-threaded.")
-# Lazy import of AppLauncher only if we may need it — keeps the rtde-only path light.
 import sys as _sys
 if any(a == "--isaacsim" for a in _sys.argv):
     from isaaclab.app import AppLauncher
@@ -102,14 +92,12 @@ args = parser.parse_args()
 # state comes from sim, not a tracker).
 _isaacsim_app = None
 if args.isaacsim:
-    # Respect user's --headless choice (defaults to False so the viewer opens). Pass
-    # --headless explicitly for batch / headless runs.
     _isaacsim_app = AppLauncher(args).app
     ENABLE_POSE_ESTIMATION = False
     print(f"[INFO] --isaacsim: running policy against IsaacSim backend "
           f"(headless={getattr(args, 'headless', False)}, no RTDE, no tracker, single-threaded).")
 
-# Load training config
+
 with open(os.path.join(args.run_dir, "params", "env.yaml"), "r") as f:
     env_cfg = yaml.unsafe_load(f)
 
@@ -117,54 +105,33 @@ reference_trajectory_path = env_cfg["trajectory_path"]
 action_scale_cfg = args.action_scale if args.action_scale is not None else env_cfg["action_scale"]
 # action_scale can be a scalar or a per-joint list in newer configs.
 action_scale = np.asarray(action_scale_cfg, dtype=np.float32) if isinstance(action_scale_cfg, (list, tuple)) else float(action_scale_cfg)
-action_mode = env_cfg.get("action_mode", "A")  # default A for backward compat with older runs
+action_mode = env_cfg.get("action_mode", "A")
 obs_history_steps = int(env_cfg.get("obs_history_steps", 1))
-# New observation flags (defaults match legacy runs that predate these features).
 include_object_obs = bool(env_cfg.get("include_object_obs", False))
-# Tracker delay used during training (env steps). Box obs are computed against the trajectory
-# reference from this many steps ago, matching the temporal alignment the policy was trained
-# on. Default 13 ≈ 260ms at 20ms env step.
 obs_obj_delay_steps = int(env_cfg.get("obs_obj_delay_steps", 13))
 future_obs_steps = tuple(env_cfg.get("future_obs_steps", ()) or ())
 include_prev_actions = bool(env_cfg.get("include_prev_actions", False))
 include_absolute_obs = bool(env_cfg.get("include_absolute_obs", False))
-# Thresholded EE↔cube contact bool. Real-side: derive from getActualTCPForce() with a
-# baseline-offset model (the raw force has gripper-gravity bias that varies with pose
-# but is roughly constant at the trajectory start, so we capture a baseline once at
-# the rest pose and threshold ||delta|| each step). Sim-side (--isaacsim): read from
-# the env's ee_contact_sensor directly.
 include_contact_obs = bool(env_cfg.get("include_contact_obs", False))
 contact_threshold = float(env_cfg.get("contact_threshold", 0.5))
 contact_obs_delay_steps = int(env_cfg.get("contact_obs_delay_steps", 0))
-# Bit-flip noise from training — not applied at deployment (we want clean readings) but
-# kept here so the obs schema is identical. flip_prob is read but not used.
 contact_obs_flip_prob = float(env_cfg.get("contact_obs_flip_prob", 0.0))
 use_reference_obs = bool(env_cfg.get("use_reference_obs", True))
 enable_phase_slowdown = bool(env_cfg.get("enable_phase_slowdown", False))
-# Phase-slowdown / mode-D curriculum settings. Sentinel <0 on force_alpha disables the
-# override; 1.0 ≈ "training completed warmup" which is what we usually want at deploy.
 dphase_min = float(env_cfg.get("dphase_min", 0.5))
 action_alpha_floor = float(env_cfg.get("action_alpha_floor", 0.1))
 force_alpha = float(env_cfg.get("force_alpha", -1.0))
 eff_alpha = float(force_alpha) if 0.0 <= force_alpha <= 1.0 else 1.0
 
-# OOD protective guard thresholds. The training envelope (env's task-failure thresholds)
-# is the principled OOD boundary: the policy was never trained on box states beyond it,
-# so beyond it its output is meaningless. Default to the env.yaml values; the angle
-# threshold is often a disabled-in-training sentinel (e.g. 10000), which is not a useful
-# bound, so fall back to 1.0 rad in that case (a 180° box flip — the failure mode this
-# guards against — is ~π rad, well past 1.0).
 _env_guard_dist = float(env_cfg.get("max_obj_dist_from_traj", 0.2))
 _env_guard_angle = float(env_cfg.get("max_obj_angle_from_traj", 1.0))
-guard_max_obj_dist = (args.guard_max_obj_dist
-                      if args.guard_max_obj_dist is not None else _env_guard_dist)
+guard_max_obj_dist = args.guard_max_obj_dist if args.guard_max_obj_dist is not None else _env_guard_dist
 if args.guard_max_obj_angle is not None:
     guard_max_obj_angle = args.guard_max_obj_angle
 elif _env_guard_angle <= 10.0:
     guard_max_obj_angle = _env_guard_angle
 else:
     guard_max_obj_angle = 1.0
-# Guard is only meaningful when we actually have a measured box pose to check.
 guard_enabled = (not args.no_guard) and include_object_obs
 if guard_enabled:
     print(f"[INFO] OOD guard: |box_pos-ref| > {guard_max_obj_dist:.3f} m OR "
@@ -239,10 +206,7 @@ if args.use_ref:
         extra={"step": -1},
     )
 logger.info("Loading model", extra={"step": -1})
-# 'CUDAExecutionProvider' uses the GPU; 'CPUExecutionProvider' is the fallback
 session = ort.InferenceSession(onnx_model_path, providers=['CUDAExecutionProvider', 'CPUExecutionProvider'])
-
-# 2. Identify input and output names (Isaac Lab usually uses "obs" and "mu" or "action")
 input_name = session.get_inputs()[0].name
 output_name = session.get_outputs()[0].name
 
@@ -252,8 +216,6 @@ traj = np.load(reference_trajectory_path)
 vel_threshold = 0.05
 first_contact_i = np.where(np.linalg.norm(traj["obj_vel"], axis=1) > vel_threshold)[0][0]
 
-
-# Detect single vs dual arm trajectory
 dual_arm = "joints_l" in traj
 
 if dual_arm:
@@ -275,8 +237,6 @@ if dual_arm:
     joints_r += JOINT_OFFSET
     joints_target_r += JOINT_OFFSET
 
-# Reference object pose trajectory. Assumed to always be present and the same length as
-# `joints` (i.e. one entry per trajectory step).
 obj_poses_ref = traj["obj_poses"]
 
 
@@ -324,11 +284,7 @@ def nlerp_np(traj_quat: np.ndarray, phase: float) -> np.ndarray:
 
 IDENTITY_QUAT_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
-# Camera-world -> IsaacLab sim / UR-base frame is a 180° rotation about z (no
-# translation). Pose-estimation listener output is in camera-world; the policy was
-# trained against sim coordinates. Apply this to the pose before feeding it to the
-# policy and before logging, so saved obj poses are directly comparable to the
-# reference trajectory in `obj_poses`.
+# 180° rotation about z: camera-world → UR-base / sim frame.
 REAL_TO_SIM_R = np.array(
     [[-1.0, 0.0, 0.0],
      [ 0.0,-1.0, 0.0],
@@ -339,7 +295,6 @@ REAL_TO_SIM_R = np.array(
 #      [0.0, 1.0, 0.0],
 #      [0.0, 0.0, 1.0]], dtype=np.float32,
 # )
-# 180° about z in (w, x, y, z); used as q_R * q_in_world = q_in_sim.
 REAL_TO_SIM_Q_WXYZ = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
 # REAL_TO_SIM_Q_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
@@ -347,10 +302,7 @@ MEASURED_OFFSET = np.array([0.0, 0.0, 0])
 
 
 def real_to_sim_pose(pose):
-    """Map a 7-vec [pos, quat_wxyz] from camera-world to sim / UR-base frame.
-    Hemisphere-corrects the result to w >= 0 so the network sees the same sign
-    convention it was trained on. Returns None unchanged so call sites can stay
-    nan-safe."""
+    """Apply REAL_TO_SIM transform to a 7-vec [pos, quat_wxyz]; hemisphere-corrects w >= 0."""
     if pose is None:
         return None
     pose = np.asarray(pose, dtype=np.float32)
@@ -403,10 +355,6 @@ if ENABLE_POSE_ESTIMATION:
         pose_proc = None
         pose_listener = None
 
-
-# ---------------------------
-# Robot connection
-# ---------------------------
 
 import psutil
 os_used = sys.platform
@@ -464,53 +412,21 @@ if not args.isaacsim:
 
 np.set_printoptions(suppress=True, precision=8)
 
-# Per-timestep tracking data for analysis. Two parallel logs:
-#   - tracking_log: one entry per 500 Hz control tick (RTDE-side state, includes
-#     actual_q, actual_qd, target_q, box pose snapshot, tcp_force).
-#   - policy_log: one entry per 50 Hz policy iteration (obs vector fed to ONNX,
-#     raw policy output, dphase). Saved with `policy_` prefix so users don't
-#     confuse the two rates during analysis. Each list is appended from a single
-#     thread (control / policy respectively) so no extra lock is needed beyond
-#     CPython's GIL — same pattern save_tracking_npz already uses.
 tracking_log = []
 policy_log = []
 
-# Shared between the 50 Hz policy thread and the 500 Hz control thread. The policy
-# thread caches the latest box pose here so log() can reuse it instead of polling
-# the listener on every servoJ tick. NaN-filled until the first policy iteration.
 data_lock = threading.Lock()
 current_actual_obj_pos = np.full(3, np.nan, dtype=np.float32)
 current_actual_obj_quat = np.full(4, np.nan, dtype=np.float32)
 
 
-print("hieohfioeh")
-
 def save_tracking_npz():
-    """Snapshot tracking_log + policy_log and write the .npz. Safe to call multiple
-    times — the write is idempotent (overwrite). Used by both the normal-exit path
-    and the KeyboardInterrupt handler in main.
-
-    Schema (different first-dim lengths are fine in np.savez; the prefix tells the
-    consumer which rate the array is at):
-      - 500 Hz keys (no prefix): steps, phase, actual_q, actual_qd, expected_q,
-        target_q, actual_obj_pos, actual_obj_quat, tcp_force, target_moment,
-        current_as_torque.
-      - 50 Hz keys (`policy_` prefix): policy_iter, policy_phase, policy_obs,
-        policy_raw_output (6 or 7 dims), policy_dphase.
-      - Scalar metadata: src_dt, gain, lookahead_time, action_scale,
-        policy_decimation (so consumers can map iter → control-step index).
-    """
-    # Shallow snapshots — CPython list.append + list(...) are GIL-atomic, so we
-    # don't need the data_lock here.
     snapshot = list(tracking_log)
     policy_snapshot = list(policy_log)
     if not snapshot and not policy_snapshot:
         return
     tracking_npz_path = os.path.join(log_dir, f"{run_tag}.npz")
 
-    # Subtract the +π base-joint offset that was applied at load time so saved
-    # joint arrays are back in the planner/policy frame and can be visualized
-    # against the original arm_l_pose / arm_r_pose without modification.
     _n_joints = 12 if dual_arm else 6
     _log_joint_offset = np.tile(JOINT_OFFSET, _n_joints // 6)
 
@@ -527,14 +443,9 @@ def save_tracking_npz():
             target_q=np.array([d["target_q"] for d in snapshot]) - _log_joint_offset,
             actual_obj_pos=np.array([d["actual_obj_pos"] for d in snapshot]),
             actual_obj_quat=np.array([d["actual_obj_quat"] for d in snapshot]),
-            # External TCP wrench [Fx, Fy, Fz, Tx, Ty, Tz] in UR base frame.
-            # NaN-filled for ticks that didn't capture it (e.g. IsaacSim backend).
             tcp_force=np.array([
                 d.get("tcp_force", np.full(6, np.nan, dtype=np.float32)) for d in snapshot
             ]),
-            # Controller's commanded per-joint torque [Nm] and the motor-current-
-            # derived torque, both from the receive interface. NaN-filled when
-            # unavailable.
             target_moment=np.array([
                 d.get("target_moment", np.full(6, np.nan, dtype=np.float32)) for d in snapshot
             ]),
@@ -546,15 +457,11 @@ def save_tracking_npz():
         arrays.update(
             policy_iter=np.array([d["iter"] for d in policy_snapshot]),
             policy_phase=np.array([d["phase"] for d in policy_snapshot]),
-            # Stack obs vectors into a (N_policy, obs_dim) array; all rows share the
-            # same dim since obs construction is deterministic for a given env.yaml.
             policy_obs=np.stack([d["obs"] for d in policy_snapshot]),
             policy_raw_output=np.stack([d["raw_output"] for d in policy_snapshot]),
             policy_dphase=np.array([d["dphase"] for d in policy_snapshot]),
         )
 
-    # Arm base poses from the reference trajectory — required by visualize_traj.py to
-    # place the robot bases in IsaacSim. Save whichever keys exist in the traj file.
     arm_pose_arrays = {}
     if "arm_l_pose" in traj:
         arm_pose_arrays["arm_l_pose"] = np.asarray(traj["arm_l_pose"])
@@ -581,7 +488,6 @@ def save_tracking_npz():
     )
 
 def log(i, target_q, phase):
-    # Concatenate state from all arms (6 dims each → 6 or 12 dims total).
     actual_q  = np.concatenate([arm.get_q()  for arm in arms])
     actual_qd = np.concatenate([arm.get_qd() for arm in arms])
 
@@ -598,7 +504,6 @@ def log(i, target_q, phase):
     except Exception:
         current_as_torque = np.full(len(arms) * 6, np.nan, dtype=np.float32)
 
-    # Reference trajectory at the current phase (concatenated across arms).
     expected_q = np.concatenate([interp_np(arm.joints_ref, phase) for arm in arms])
 
     with data_lock:
@@ -654,35 +559,20 @@ def log(i, target_q, phase):
         raise RuntimeError("Joint velocity too high")
 
 
-# ---------------------------
-# Control parameters
-# ---------------------------
-
-velocity = 0.5 # Not Used
-acceleration = 0.5 # Not Used
+velocity = 0.5
+acceleration = 0.5
 lookahead_time = _lookahead
 gain = _gain
 
-# ---------------------------
-# Safety limits
-# ---------------------------
-
-# Max allowed tracking error before stopping (rad)
 max_tracking_error = 10.0
-# Max allowed joint velocity before stopping (rad/s)
 max_joint_velocity = 10000
-# UR5e joint limits (rad) [shoulder_pan, shoulder_lift, elbow, wrist_1, wrist_2, wrist_3]
 joint_limits_lower = np.array([-2*np.pi, -2*np.pi, -np.pi, -2*np.pi, -2*np.pi, -2*np.pi])
 joint_limits_upper = np.array([ 2*np.pi,  2*np.pi,  np.pi,  2*np.pi,  2*np.pi,  2*np.pi])
 
-# ---------------------------
-# Move To Start (RTDE-only; IsaacSim mode starts at phase 0 via env reset)
-# ---------------------------
 if not args.isaacsim:
     try:
         for arm in arms:
             logger.info(f"[{arm.name}] moveJ to initial position {arm.joints_ref[0]}", extra={"step": -1})
-        # Command all arms to start simultaneously (non-blocking async=True), then wait.
         for arm in arms:
             last_t = time.perf_counter()
             success = arm.rtde_c.moveJ(arm.joints_ref[0], 0.5, 1.0, True)
@@ -692,7 +582,6 @@ if not args.isaacsim:
                 success = arm.rtde_c.moveJ(arm.joints_ref[0], 0.5, 1.0, True)
                 time.sleep(dt)
 
-        # Wait until all arms are steady.
         while any(not arm.rtde_c.isSteady() for arm in arms):
             log(-1, np.concatenate([arm.joints_ref[0] for arm in arms]), 0.0)
             time.sleep(dt)
@@ -713,12 +602,7 @@ else:
     current_target_q = np.asarray(joints[0], dtype=np.float64)
 previous_target_q = np.copy(current_target_q)
 
-# Capture a baseline TCP wrench while the robot is at rest at the trajectory start
-# pose. The raw getActualTCPForce() has a static gripper-gravity bias that varies with
-# arm pose but is roughly constant at this initial pose; subtracting this baseline
-# leaves ||delta|| as a usable proxy for external contact force.
-# Only meaningful when include_contact_obs is set and RTDE is connected.
-# Per-arm TCP force baselines (6-dim each). Indexed as tcp_force_baselines[arm_idx].
+# Baseline TCP wrench at rest pose; subtracting it gives a proxy for external contact force.
 tcp_force_baselines = [np.zeros(6, dtype=np.float64) for _ in arms]
 if include_contact_obs and not args.isaacsim and arms:
     for idx, arm in enumerate(arms):
@@ -731,24 +615,13 @@ if include_contact_obs and not args.isaacsim and arms:
         )
 # Single-arm legacy alias.
 tcp_force_baseline = tcp_force_baselines[0] if tcp_force_baselines else np.zeros(6, dtype=np.float64)
-# Float trajectory phase (matches the policy thread's `phase` variable). Updated under
-# data_lock by the policy thread; the control thread blends previous→current the same
-# way as target_q so we can compute the exact expected reference at any servo tick.
 current_phase = 0.0
 previous_phase = 0.0
-run_policy_event = threading.Event()  # Trigger for the policy
+run_policy_event = threading.Event()
 new_data_event = threading.Event()
-# OOD protective guard: the policy thread sets ood_reason then ood_event when the
-# measured box pose leaves the training envelope. The control thread checks the event
-# each tick and raises, so its except/finally (servoStop + stopScript) and the main
-# teardown (stopJ) run — a controlled halt with no further policy commands.
 ood_event = threading.Event()
 ood_reason = ""
 
-# Wait for the first box pose to arrive before starting threads. With
-# include_object_obs the tracker is a hard requirement (the policy consumes it),
-# so missing/timed-out poses abort. Without it we still want box poses for the
-# npz log but can keep going if the tracker is dead — log() will NaN-fill.
 if pose_listener is not None:
     logger.info(
         f"Waiting up to {POSE_FIRST_POSE_TIMEOUT_S:.0f}s for first box pose...",
@@ -845,8 +718,7 @@ def policy_thread():
 
     phase = 0.0
 
-    # Compute per-step obs dim to match the env's __post_init__ logic.
-    base_pose = 7  # 3 pos + 4 quat
+    base_pose = 7
     n_joints = len(arms) * 6  # 6 or 12
     if dual_arm:
         if use_reference_obs:
@@ -873,7 +745,6 @@ def policy_thread():
         run_policy_event.wait()
         run_policy_event.clear()
 
-        # Read all arm states simultaneously (serial reads are fast local RTDE packet reads).
         qs  = [arm.get_q()  for arm in arms]
         qds = [arm.get_qd() for arm in arms]
 
@@ -898,12 +769,10 @@ def policy_thread():
         obj_pos_at_delayed = interp_np(obj_poses_ref[:, :3], delayed_phase)
         obj_quat_at_delayed = nlerp_np(obj_poses_ref[:, 3:], delayed_phase)
 
-        # Per-arm reference interpolations.
         ref_q      = [interp_np(arm.joints_ref,    phase) for arm in arms]
         ref_target = [interp_np(arm.joints_target, phase) for arm in arms]
         ref_qd     = [interp_np(arm.joint_vel_ref, phase) for arm in arms]
 
-        # Build object obs (shared across single/dual arm).
         use_actual_obj = actual_obj_pos is not None
         if use_actual_obj:
             rel_obj_pos  = actual_obj_pos - obj_pos_at_delayed
@@ -931,7 +800,6 @@ def policy_thread():
             abs_obj_quat = obj_quat_at_phase
 
         if dual_arm:
-            # Contact bools: one per arm (2 total).
             contact_dims = []
             if include_contact_obs:
                 for idx, arm in enumerate(arms):
@@ -942,8 +810,6 @@ def policy_thread():
                 contact_dims = [0.0, 0.0]
             contact_arr = np.array(contact_dims, dtype=np.float32)
 
-            # Subtract the base-joint offset so abs_q is in the planner/policy frame,
-            # matching what the sim saw during training. rel_q is unaffected (offset cancels).
             abs_q  = np.concatenate([(q - JOINT_OFFSET).astype(np.float32) for q in qs])
             abs_qd = np.concatenate([qd.astype(np.float32) for qd in qds])
             rel_q  = np.concatenate([(qs[i]  - ref_q[i]).astype(np.float32)  for i in range(len(arms))])
@@ -963,8 +829,6 @@ def policy_thread():
         else:
             actual_q  = qs[0]
             actual_qd = qds[0]
-            # ref_q[0] is in offset frame (joints += JOINT_OFFSET at load); physical reading
-            # is also in offset frame, so the offset cancels and rel_q is correct as-is.
             relative_q  = (actual_q  - ref_q[0]).astype(np.float32)
             relative_qd = (actual_qd - ref_qd[0]).astype(np.float32)
             feature_parts = [relative_q, relative_qd]
@@ -972,7 +836,6 @@ def policy_thread():
                 feature_parts.append(rel_obj_pos.astype(np.float32))
                 feature_parts.append(rel_obj_quat.astype(np.float32))
             if include_absolute_obs:
-                # De-offset so abs_q is in the planner/policy frame, matching training.
                 feature_parts.append((actual_q - JOINT_OFFSET).astype(np.float32))
                 feature_parts.append(actual_qd.astype(np.float32))
                 if include_object_obs:
@@ -994,7 +857,6 @@ def policy_thread():
         obs_history = np.roll(obs_history, shift=-1, axis=0)
         obs_history[-1] = current_features
 
-        # Phase dim present only in reference mode (matches env's __post_init__ logic).
         obs_parts = [obs_history.flatten().astype(np.float32)]
         if use_reference_obs or not dual_arm:
             obs_parts.append(phase_obs.astype(np.float32))
@@ -1021,7 +883,7 @@ def policy_thread():
         obs    = np.concatenate(obs_parts)[None, ...].astype(np.float32)
         output = session.run([output_name], {input_name: obs})[0][0]
 
-        raw_action = np.clip(output[:n_joints], -2.0, 2.0).astype(np.float32)  # clamp before applying; prevents runaway via prev_action feedback
+        raw_action = np.clip(output[:n_joints], -2.0, 2.0).astype(np.float32)
 
         if args.use_ref:
             dphase = 1.0
@@ -1031,7 +893,6 @@ def policy_thread():
         else:
             dphase = 1.0
 
-        # Build per-arm targets and concatenate into a single (n_joints,) vector.
         new_joint_targets_list = []
         for i, arm in enumerate(arms):
             a_slice = slice(i * 6, (i + 1) * 6)
@@ -1051,9 +912,6 @@ def policy_thread():
                 pd   = ref_target[i] - ref_q[i]
                 t_i  = q_i + (1.0 - eff_alpha) * pd + gain * action_scale * arm_action
             elif action_mode == "BC":
-                # B→C curriculum blend: (1-α)·q_ref + α·q_curr + scale·a
-                # At α=0 → mode B (residual on reference), at α=1 → mode C (residual on current).
-                # eff_alpha=1.0 when force_alpha<0 (training converged), collapsing to mode C.
                 t_i = (1.0 - eff_alpha) * ref_q[i] + eff_alpha * q_i + action_scale * arm_action
             else:
                 raise ValueError(f"Unknown action_mode: {action_mode!r}")
@@ -1089,7 +947,6 @@ def policy_thread():
 def control_thread():
     step_counter = 0
     try:
-        # Wait for first target
         run_policy_event.set()
         while not new_data_event.is_set():
             pass
@@ -1099,9 +956,6 @@ def control_thread():
             t_start = rtde_c.initPeriod()
             t1 = time.perf_counter()
 
-            # OOD guard tripped by the policy thread — raise before sending any further
-            # command. except→raise runs this thread's finally (servoStop, stopScript);
-            # the thread dying drops the main keep-alive loop, whose finally runs stopJ.
             if ood_event.is_set():
                 raise RuntimeError(f"OOD guard breached: {ood_reason}")
 
@@ -1130,7 +984,6 @@ def control_thread():
             if step_counter > max_wallclock_steps:
                 break
 
-            # Should be at the end to ensure correct timing
             t2 = time.perf_counter()
             # if (t2 - t1) > (1 / rtde_frequency) * 2:
             #     raise Exception(f"too slow: {t2-t1}")
@@ -1153,10 +1006,6 @@ def control_thread():
 
 
 if args.isaacsim:
-    # =====================================================================
-    # IsaacSim backend: single-threaded loop that reuses the same obs
-    # construction logic as policy_thread but reads/writes IsaacSim state.
-    # =====================================================================
     import gymnasium as gym
     import torch
     import BoxLift.tasks  # noqa: F401, registers env
@@ -1165,12 +1014,10 @@ if args.isaacsim:
     kp_override = 30.0
     kd_override = None
 
-    # Build env cfg using the same saved env.yaml fields that play.py / record.py restore.
     isaac_cfg = BoxhingeEnvCfg()
     isaac_cfg.scene.num_envs = 1
-    isaac_cfg.episode_length_s = 1e6  # let us run as long as we want
+    isaac_cfg.episode_length_s = 1e6
     isaac_cfg.trajectory_path = env_cfg["trajectory_path"]
-    # Restore obs/action layout
     for _f in ("obs_history_steps", "action_mode", "action_scale", "include_object_obs",
                "include_absolute_obs", "future_obs_steps", "include_prev_actions",
                "enable_phase_slowdown", "dphase_min", "dphase_max", "phase_mapping",
@@ -1178,10 +1025,6 @@ if args.isaacsim:
                "actuator_type"):
         if _f in env_cfg and hasattr(isaac_cfg, _f):
             setattr(isaac_cfg, _f, env_cfg[_f])
-    # Physics at 500Hz (matching URSim/real RTDE rate). Target is computed once per
-    # policy step (before the substep loop) — matching the env's new behavior where
-    # _pre_physics_step caches the target and _apply_action just re-sends it. Same
-    # target held across all 10 substeps, low-level PD chases it.
     isaac_cfg.physics_dt = dt
     isaac_cfg.decimation = policy_decimation
     
@@ -1190,7 +1033,6 @@ if args.isaacsim:
     if kd_override is not None:
         setattr(isaac_cfg, "kd", kd_override)
 
-    # Clean test: disable all noise / DR / perturbations / VOC / reset noise.
     isaac_cfg.obs_obj_pos_noise = 0.0
     isaac_cfg.obs_obj_ori_noise = 0.0
     isaac_cfg.obs_obj_pos_bias_std = 0.0
@@ -1219,31 +1061,22 @@ if args.isaacsim:
     ur5e_art = _direct_env.ur5e
     isaac_sim = _direct_env.sim
     isaac_device = _direct_env.device
-    # Force VOC off (matches play.py default)
     if hasattr(_direct_env, "voc_kp_pos"):
         _direct_env.voc_kp_pos = 0.0
         _direct_env.voc_kp_rot = 0.0
         _direct_env.voc_kv_pos = 0.0
         _direct_env.voc_kv_rot = 0.0
-    # Hide visualization markers (cube_marker, ee_markers). They're normally driven by
-    # _pre_physics_step which we bypass — so they'd sit at their default origin pose
-    # (visible as a phantom "white box" inside the robot). The actual physics cube is
-    # still drawn correctly.
     if hasattr(_direct_env, "cube_marker"):
         _direct_env.cube_marker.set_visibility(False)
     if hasattr(_direct_env, "ee_markers"):
         _direct_env.ee_markers.set_visibility(False)
-    # Force start at phase 0. Match play.py / record.py: just call _reset_idx — calling
-    # env.reset() after this would re-randomize and undo the phase=0 override.
     _direct_env._reset_idx(None, 0)
 
-    # State for the loop (mirrors policy_thread's locals)
     isaac_phase = 0.0
     isaac_prev_action = np.zeros(6, dtype=np.float32)
     isaac_contact_history = np.zeros(contact_obs_delay_steps + 1, dtype=np.float32)
     isaac_obs_history = np.zeros((obs_history_steps, per_step_features), dtype=np.float32) \
         if "per_step_features" in globals() else None
-    # If per_step_features wasn't set yet (it's defined inside policy_thread), compute here.
     if isaac_obs_history is None:
         _psf = 12 + (7 if include_object_obs else 0)
         if include_absolute_obs:
@@ -1274,11 +1107,6 @@ if args.isaacsim:
             relative_qd_l = (actual_qd - joint_vel_at_phase_l).astype(np.float32)
             feature_parts_l = [relative_q_l, relative_qd_l]
 
-            # Match URSim mode's no-tracker fallback: feed the policy "perfect tracking"
-            # obs (rel = zeros/identity, abs = reference pose at current phase). Identical
-            # obs construction to URSim mode, so this is a pure dynamics-only swap. Reading
-            # the live cube pose here would be OOD — training used a delayed/noisy obj obs
-            # path, not a clean instantaneous one.
             if include_object_obs:
                 feature_parts_l.append(np.zeros(3, dtype=np.float32))
                 feature_parts_l.append(IDENTITY_QUAT_WXYZ)
@@ -1291,9 +1119,6 @@ if args.isaacsim:
                     feature_parts_l.append(obj_quat_at_phase_l.astype(np.float32))
 
             if include_contact_obs:
-                # Read the env's ee_contact_sensor directly — same code path as the env
-                # uses in _get_observations. force_matrix_w shape (1, n_bodies, n_filt, 3);
-                # sum magnitudes across body/filter pairs to get total contact force.
                 if hasattr(_direct_env, "ee_contact_sensor"):
                     fmw = _direct_env.ee_contact_sensor.data.force_matrix_w
                     isaac_force_mag = float(fmw.norm(dim=-1).sum().item())
@@ -1341,9 +1166,6 @@ if args.isaacsim:
             else:
                 dphase_l = 1.0
 
-            # Compute the target once per policy step using q at the start of the step,
-            # matching the env's _pre_physics_step caching behavior. Held fixed for all
-            # decimation substeps.
             if args.use_ref:
                 policy_target = joints_target_at_phase_l
             elif action_mode == "A":
@@ -1376,7 +1198,6 @@ if args.isaacsim:
                 ur5e_art.update(isaac_cfg.physics_dt)
                 if hasattr(_direct_env, "object"):
                     _direct_env.object.update(isaac_cfg.physics_dt)
-                # Read fresh state AFTER the physics step for logging.
                 substep_actual_q = ur5e_art.data.joint_pos[0].detach().cpu().numpy().astype(np.float64)
                 substep_actual_obj_pos = (
                     _direct_env.object.data.root_pos_w[0] - _direct_env.scene.env_origins[0]
@@ -1391,7 +1212,6 @@ if args.isaacsim:
                     "target_q": policy_target.copy(),
                     "actual_obj_pos": substep_actual_obj_pos,
                     "actual_obj_quat": substep_actual_obj_quat,
-                    # No equivalent of getActualTCPForce in this IsaacSim path.
                     "tcp_force": np.full(6, np.nan, dtype=np.float32),
                 })
 
@@ -1419,15 +1239,12 @@ t1.start()
 t2.start()
 
 try:
-    # Keep main thread alive and when either thread dies we stop and exit
     while t1.is_alive() and t2.is_alive():
         time.sleep(0.02)
 except KeyboardInterrupt:
     logger.warning("KeyboardInterrupt — stopping robot and saving tracking data",
                    extra={"step": -1})
 finally:
-    # Stop the robot first (safety priority), then save, then tear down pose streaming.
-    # Each step is wrapped so a failure in one doesn't prevent the others.
     for arm in arms:
         try:
             arm.stop()

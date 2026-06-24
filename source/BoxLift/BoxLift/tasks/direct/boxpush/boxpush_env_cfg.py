@@ -113,91 +113,43 @@ class EventCfg:
 
 @configclass
 class BoxpushEnvCfg(DirectRLEnvCfg):
-    # Trajectory file path
     trajectory_path = ""
-    # env
-    # physics_dt * decimations needs to match dt from planner/IK
+    # physics_dt * decimation must match dt from the reference trajectory planner/IK
     physics_dt = 1.0 / 100.0
     decimation = 2
     episode_length_s = 3.0
-    # - spaces definition (single arm: 6 actions, reduced obs)
-    # action_space is recomputed in __post_init__: 6 residual + 1 phase if enable_phase_slowdown.
+    # action_space is recomputed in __post_init__: 6 residual + 1 phase if enable_phase_slowdown
     action_space = 6
-    # obs = stacked per-step features * obs_history_steps + phase (1)
-    #       [+ (7 or 14) * len(future_obs_steps)  future ref obj pose deltas (+ absolute fut ref if include_absolute_obs)]
-    #       [+ 6                                  previous raw action]
-    # per-step features = relative_q (6) + relative_qd (6)  [+ relative_obj_pos (3) + relative_obj_quat (4) if include_object_obs]
-    #                     [+ absolute_q (6) + absolute_qd (6)  [+ absolute_obj_pos (3) + absolute_obj_quat (4) if include_object_obs] if include_absolute_obs]
     obs_history_steps = 3
-    # Toggle object (box) state (pose only — pos 3 + quat 4 = 7 dims) in the observation
-    # history. The policy is expected to recover implicit velocity from the pose history;
-    # there is no longer a velocity-observation option (only the tracker exposes pose on
-    # the real robot). Reward path uses ground-truth velocity via _get_obj_vel and is
-    # unaffected.
     include_object_obs = True
-    # Include absolute (world/env-frame) state alongside the relative (error) obs. Doubles the
-    # per-step feature dim and adds (pos (3) + quat (4)) per future_obs_steps entry for the
-    # absolute future reference obj pose.
     include_absolute_obs = True
-    # Future reference obj pose look-ahead: list of phase offsets (in env steps) to include
-    # as (pos_delta (3) + quat_delta (4)) relative to the reference at the current phase.
-    # If include_absolute_obs, also appends absolute (pos (3) + quat (4)) per offset.
-    # Empty tuple = disabled.
     future_obs_steps = (1,2,3,4,5)
-    # Include previous raw residual action (6 dims) in the observation.
     include_prev_actions = True
     observation_space = {"policy": 13, "privileged": 85}  # recomputed in __post_init__
     state_space = 0
 
-    # Continuous phase variable with slowdown-only semantics. When True, action[6] controls
-    # the per-step trajectory advance rate dphase ∈ [dphase_min, 1.0] (the policy can slow
-    # down but never speed up); reference values are interpolated at fractional phase indices.
-    # When False, the env behaves as before: integer indexing, dphase=1.
-    #
-    # Reward accounting: task/track rewards are NOT scaled by dphase. Instead, sustained
-    # pauses are discouraged by a cumulative-quadratic penalty — `w_total_slowdown` times
-    # the running sum of (1 - dphase), gated by (1 - dphase) so running (dphase=1) is free.
-    # Total episode pause cost ≈ w_total_slowdown · (total_slowdown)².
     enable_phase_slowdown = True
-    # Lower bound on dphase. dphase = (1 + (1 - dphase_min) * tanh(action[6])).clamp(dphase_min, 1).
-    # raw=0 → dphase=1 (no slowdown, neutral); raw<0 → progressive slowdown to dphase_min;
-    # raw>0 → clamped at 1 (deadzone). dphase_min=0.0 is allowed (full pause).
     dphase_min = 0.0
-    # Wall-clock cap as multiple of nominal trajectory duration (replaces the old
-    # traj_duration / dphase_min formula, which divides by zero at dphase_min=0).
     max_slowdown_multiplier = 3.0
 
-    # Hard cap on per-episode wall-clock length, in simulator steps. When set (>0), the
-    # episode terminates by time_out after this many steps regardless of phase progress,
-    # AND t0 sampling in _reset_idx is restricted to [0, T-1-L] so an episode at full
-    # speed can run for L steps without falling off the trajectory. The combination gives
-    # roughly uniform state visitation across the trajectory (each state t is visited
-    # with probability ~ min(L, t+1) / (T-L+1) instead of (t+1)/(T-1) under the default).
-    # -1 disables the cap (use full trajectory length, the behavior before this flag).
+    # Hard cap on per-episode steps; t0 sampling is restricted to [0, T-1-L] so episodes can
+    # always complete. -1 disables.
     max_episode_steps: int = -1
 
-    # Failure-aware phase resampling: biases episode start phases toward segments with
-    # high historical failure rate. Credits are assigned to the segment each episode
-    # STARTED in (not where it failed), which matches the RSI lever we actually control.
     enable_failure_resampling = False
-    phase_segment_s = 1.0                    # segment duration in seconds; num segments = ceil((T-1)*dt / phase_segment_s)
-    phase_resample_alpha = 0.05              # per-event EMA weight
-    phase_resample_beta = 1.0                # temperature: p_s ∝ r_s^beta
-    phase_resample_clamp = (0.1, 0.9)        # (low, high) bounds on each r_s
+    phase_segment_s = 1.0
+    phase_resample_alpha = 0.05
+    phase_resample_beta = 1.0
+    phase_resample_clamp = (0.1, 0.9)
 
     @property
     def per_step_feature_dim(self) -> int:
-        # 12: relative joint pos (6) + relative joint vel (6) — always present.
-        # If include_object_obs: + 7 (obj pos 3 + obj quat 4).
-        # If include_absolute_obs: doubles the whole thing (joint and obj parts mirrored).
         dim = 12 + (7 if self.include_object_obs else 0)
         if self.include_absolute_obs:
             dim *= 2
         return dim
 
     def __post_init__(self):
-        # Idempotent: always reset action_space/observation_space to base before recomputing.
-        # Must be safe to call more than once (e.g. after hydra overrides).
         self.action_space = 7 if self.enable_phase_slowdown else 6
         actor_dim = self.per_step_feature_dim * self.obs_history_steps + 1
         future_dim = 14 if self.include_absolute_obs else 7
@@ -206,26 +158,14 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
             actor_dim += 6
         self.observation_space = {"policy": actor_dim, "privileged": 85}
 
-    # simulation
     sim: SimulationCfg = SimulationCfg(dt=physics_dt, render_interval=decimation, gravity=(0,0,-9.8))
 
-    # Domain Randomization
     events: EventCfg = EventCfg()
 
     ur5e_prim_path = f"{ENV_REGEX}/ur5e"
 
-    # Arm Actuator parameters
     kp = 300.0
     kd = 50
-    # kp = {
-    #     "shoulder_pan_joint": 800.0,
-    #     "shoulder_lift_joint": 600.0,
-    #     "elbow_joint": 300.0,
-    #     "wrist_1_joint": 200.0,
-    #     "wrist_2_joint": 100.0,
-    #     "wrist_3_joint": 100.0,
-    # }
-    # kd = {joint_name: joint_kp * 0.15 for joint_name, joint_kp in kp.items()}
     actuator_type = "Implicit"  # or "IdealPD"
     velocity_limit = 3.14
     effort_limit = {
@@ -237,125 +177,67 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
         "wrist_3_joint": 28.0,
     }
 
-    # Action scale
     action_scale: float | list = 0.1
 
-    # Action formulation. One of:
-    #   "A" — joints_target[t] + action_scale * action
-    #         Residual on the planner's absolute target.
-    #   "B" — joints[t] + action_scale * action
-    #         Residual on the planner's trajectory position (planner feedforward not applied).
-    #   "C" — curr_joints + action_scale * action
-    #         Residual on the robot's current joint position (no planner info).
-    #   "D" — curr_joints + (joints_target[t] - joints[t]) + action_scale * action
-    #         Planner's intended PD error (force direction) applied from current position,
-    #         plus learned residual. Effective PD error is independent of tracking state.
+    # A: residual on planner target; B: residual on traj position; C: residual on current joints;
+    # D: planner PD error from current position + residual
     action_mode = "D"
 
-    # object (cube)
     cube_cfg = CUBE_CFG
-
-    # table
     table_cfg = TABLE_CFG
 
-    # scene
     replicate_physics = bool(np.all([event["mode"] != "prestartup" and event["mode"] != "startup" for event in events.to_dict().values()])) # type: ignore
     scene: InteractiveSceneCfg = InteractiveSceneCfg(num_envs=1024, env_spacing=4.0, replicate_physics=replicate_physics)
 
-    # Reset noise (for sim-to-real robustness). Per-joint (length 6, ordered shoulder_pan,
-    # shoulder_lift, elbow, wrist_1, wrist_2, wrist_3). Wrist joints have small Jacobians on
-    # EE position, so they can absorb more noise without dragging the EE far from the
-    # trajectory. Scalar still works (broadcasts across all 6 joints).
-    reset_joint_pos_noise = [0.1, 0.1, 0.1, 0.2, 0.2, 0.2]  # rad, per-joint std on reset
-    reset_joint_vel_noise = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]  # rad/s, per-joint std on reset
+    reset_joint_pos_noise = [0.1, 0.1, 0.1, 0.2, 0.2, 0.2]
+    reset_joint_vel_noise = [0.1, 0.1, 0.1, 0.1, 0.1, 0.1]
 
-    # Box reset noise: xy-plane for translation / linear vel; small 3-axis rotation + ang vel.
     reset_obj_pos_xy_noise = 0.02        # m, std on box x,y position (z unchanged)
     reset_obj_lin_vel_xy_noise = 0.05    # m/s, std on box linear x,y velocity (z unchanged)
     reset_obj_ori_noise = 0.1            # rad, axis-angle std for small orientation perturbation
     reset_obj_ang_vel_noise = 0.1        # rad/s, std on box angular velocity (z axis)
 
-    # Box observation noise (sim2real). Sampled fresh each step, applied ONLY to the
-    # observation path — rewards still see the clean ground-truth box state. Same noise
-    # tensor is used for both the relative and absolute obj views in a given step so the
-    # policy sees mutually consistent readings (a single noisy "sensor" produced both).
-    obs_obj_pos_noise = 0.01             # m, per-FRESH-SAMPLE Gaussian noise on box position
-    obs_obj_ori_noise = 0.02             # rad, axis-angle per-FRESH-SAMPLE noise on box orientation
+    # obs noise applied only to observation path; rewards see clean ground truth
+    obs_obj_pos_noise = 0.01             # m
+    obs_obj_ori_noise = 0.02             # rad
 
-    # Box pose tracker model (sim2real). Approximates the UR5e vision tracker:
-    #   - Fixed latency: every fresh sample reads exactly `obs_obj_delay_steps` env steps
-    #     into the past. At env_dt = 20ms, 13 steps = 260ms (covers the typical ~250ms lag).
-    #     Fixed (not random) so consecutive measurements are time-ordered: a fire at step t
-    #     observes physical time (t-delay)*dt, the next fire at t+period observes
-    #     (t+period-delay)*dt — strictly increasing.
-    #   - Sub-50Hz update rate: a fresh tracker frame fires every `obs_obj_update_period`
-    #     env steps. Default 2 → 25Hz. Between fires the policy reuses the last sample
-    #     (real trackers hold the previous frame until a new one arrives).
-    # Per-fire noise (obs_obj_pos_noise / obs_obj_ori_noise) is applied only when a fresh
-    # sample fires; held samples don't re-jitter.
-    # Reference path (planner trajectory) is NOT affected. Reward path reads clean ground
-    # truth via _get_obj_pos / _get_obj_quat. To disable: set obs_obj_delay_steps=0 and
-    # obs_obj_update_period=1.
+    # tracker delay/rate model: fixed latency + sub-50Hz update; between fires policy reuses last sample
     obs_obj_delay_steps = 5              # 100ms at 20ms env step
     obs_obj_update_period = 2            # 25Hz
 
-    # Perturbation forces (for sim-to-real robustness)
-    perturbation_force_std = 10.0       # N, std of per-axis Gaussian force
-    perturbation_torque_std = 2.0       # Nm, std of per-axis Gaussian torque
-    perturbation_probability = 0.0      # probability of applying a perturbation each step
-    perturbation_duration_steps = 5     # how many steps the perturbation lasts
+    perturbation_force_std = 10.0       # N
+    perturbation_torque_std = 2.0       # Nm
+    perturbation_probability = 0.0
+    perturbation_duration_steps = 5
 
-    # Reward parameteres. Final (end-of-curriculum) values.
     w_task = 0.5
     w_track = 1 - w_task
     w_regularization = 0.1
 
-    # Curriculum ("α schedule"). α ramps linearly from 0 to 1 over alpha_warmup_steps env
-    # steps; 0 disables the curriculum (α=1 always). Drives three coupled shifts:
-    #   1) (w_task, w_track) interpolate (w_task_start, w_track_start) → (w_task, w_track).
-    #   2) In action_mode == "D" only: the action command blends
-    #        q_curr + (1-α)·(ref_target - ref_pos) + (α + ε(1-α))·scale·a
-    #      where ε = action_alpha_floor keeps a minimum action authority at α=0.
-    #   3) In action_mode == "D" only: the policy-authored regularization terms
-    #      (action_rate, action_norm) are scaled by (α + ε(1-α)) so the penalty
-    #      tracks the action's actual effect on the env. Safety penalties (joint_limit,
-    #      illegal_contact, flange_forearm, proximity, joint_acc, torque) stay unscaled.
+    # α ramps 0→1 over alpha_warmup_steps, interpolating reward weights and (mode D) action blend
     alpha_warmup_steps = 24 * 750
     w_task_start = 0.2
     w_track_start = 0.8
     action_alpha_floor = 0.1
-    # Optional fixed-α override. When set (≥ 0), bypasses the schedule and uses this value
-    # everywhere _curriculum_alpha() is consulted. Intended for eval: play.py / record.py
-    # compute the training-final α from the checkpoint and pin it so the frozen policy runs
-    # in the same regime it was trained at (critical for mode D, where α controls the
-    # action blend between planner feedforward and learned residual).
+    # pin α for eval (play.py/record.py set this from checkpoint); -1 = use schedule
     force_alpha: float = -1
 
-    # Task reward parameteresr
     w_obj_pos = 0.2
     sigma_obj_pos = 0.05
     tol_obj_pos = 0.0
 
     w_obj_quat = 0.7
-    # Multi-sigma: wide kernel (0.2) keeps gradient alive at moderate errors,
-    # narrow kernel (0.05) pulls precision in close. Kernels are averaged in _reward_track.
     sigma_obj_quat = (0.05, 0.15)
     tol_obj_quat = 0.0
 
-    # Object velocity tracking — split into linear (m/s) and angular (rad/s) to avoid
-    # unit-mixing in the norm. The rotation task has reference ang-vel up to ~1.2 rad/s
-    # vs linear up to ~0.15 m/s, so the kernels have very different scales.
-    # Instantaneous signal that catches "policy stopped pushing" before obj_pos_error
-    # integrates up to the termination threshold.
     w_obj_lin_vel = 0.05
-    sigma_obj_lin_vel = 0.08      # m/s — covers reference vel range with decent gradient
+    sigma_obj_lin_vel = 0.08
     tol_obj_lin_vel = 0.0
 
     w_obj_ang_vel = 0.05
-    sigma_obj_ang_vel = 0.2       # rad/s
+    sigma_obj_ang_vel = 0.2
     tol_obj_ang_vel = 0.0
 
-    # Track reward parameters
     w_eef_pos = 1.0
     sigma_eef_pos = 0.1
     tol_eef_pos = 0.0
@@ -365,19 +247,10 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     tol_eef_quat = 0.1
 
     w_joint_pos = 0.0
-    # Tuned for the per-joint averaged kernel (r_bc form). At σ=0.1, a single joint with
-    # 0.1 rad error gives kernel = exp(-0.01/0.01) ≈ 0.37; 0.2 rad gives ≈ 0.018. Was 0.2
-    # under the old sum-then-kernel form; not equivalent — this is the per-joint scale.
     sigma_joint_pos = 0.1
     tol_joint_pos = 0.0
 
-    # Relative EE-box tracking: rewards matching the reference's EE-position-in-box-frame
-    # (and optionally quat). Only active during reference-trajectory segments where the
-    # planner expects the box to be moving (contact/near-contact phases), since enforcing
-    # a specific EE-in-box-frame offset during regrasp/approach is brittle and
-    # unachievable if the box is flipped from the reference. The gate is a precomputed
-    # boolean mask derived from |obj_vel_ref| > eps, dilated by ±dilation_steps so it
-    # captures brief pre-contact approach and post-release follow-through.
+    # EE-in-box-frame tracking, active only when reference box is moving (gated by obj_vel_ref)
     w_eef_box_rel_pos = 0.7
     sigma_eef_box_rel_pos = 0.05
     tol_eef_box_rel_pos = 0.0
@@ -386,22 +259,12 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     sigma_eef_box_rel_quat = 0.5
     tol_eef_box_rel_quat = 0.0
 
-    # Gate parameters: a reference step is "active" if ||obj_vel_lin|| + ||obj_vel_ang||
-    # > eps, then dilated by ±dilation_steps (in policy steps).
     eef_box_gate_obj_vel_eps = 1e-3
-    eef_box_gate_dilation_steps = 1e7 # everything
+    eef_box_gate_dilation_steps = 1e7
 
-    # RSI (random start init) contact exclusion. The set of trajectory phases that count
-    # as "in contact" for RSI sampling is the raw |obj_vel_ref| > eef_box_gate_obj_vel_eps
-    # mask, dilated by this many integer steps in each direction. INDEPENDENT of
-    # eef_box_gate_dilation_steps — that one controls reward shaping, this one controls
-    # which start phases the env will reset to.
-    #
-    # Resetting mid-contact tends to put the EE inside the box (after joint reset noise)
-    # and snap-resolves into weird states, so we forbid it. 0 = use the raw boolean mask.
+    # RSI excludes mid-contact resets (EE snaps into box after joint noise); independent of gate dilation
     rsi_contact_dilation_steps = 5
 
-    # Regularization reward parameters
     w_joint_acc = 1e-3
     tol_joint_acc = 0.0
 
@@ -414,21 +277,8 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     w_action_norm = 0.0
     tol_action_norm = 0.0
 
-    # Cumulative-quadratic pause penalty for enable_phase_slowdown=True.
-    # Per-step: w_total_slowdown · cumulative_slowdown · (1 - dphase), which is zero
-    # while running (dphase=1) and grows with accumulated pause time while paused.
-    # Episode-total: w_total_slowdown · (Σ(1-dphase))². Trades off "pause to recover from a
-    # miss" against "don't pause forever": short pauses are cheap, sustained pauses scale
-    # quadratically and eventually dominate any per-step reward gain.
     w_total_slowdown = 0.025
 
-    # Completion bonus — one-shot terminal reward when the episode times out (reached the
-    # end of the trajectory without reset_terminated). Counters stall-dominance in the
-    # value function: without it, V(stall-until-pos_error-threshold) can exceed V(attempt-
-    # and-fail) because both end in termination and stalling simply survives longer. With
-    # this bonus, completing the trajectory is a dedicated positive terminal state.
-    # TODO (follow-up): scale by final obj_pos/quat reward so quality of completion matters.
-    # TODO: is this even good to have?
     w_completion = 0.0
 
     w_joint_limit = 1e3
@@ -444,7 +294,6 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     w_flange_forearm_dist = 1.0
     max_flange_forearm_distance = 0.028 + 0.0375
 
-    # Contact Sensors
     non_ee_link_names = [
         "base_link",
         "shoulder_link",
@@ -461,15 +310,6 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
     table_contact_filter.append(f"{ur5e_prim_path}/wrist_3_link/")
 
     illegal_contact_sensor_cfgs = {
-        # "cube": ContactSensorCfg(
-        #     prim_path=cube_cfg.prim_path,
-        #     update_period=0.0,
-        #     history_length=0,
-        #     debug_vis=True,
-        #     force_threshold=min_contact_force,
-        #     max_contact_data_count_per_prim=16,
-        #     filter_prim_paths_expr=cube_contact_filter
-        # ),
         "table": ContactSensorCfg(
             prim_path=table_cfg.prim_path,
             update_period=0.0,
@@ -481,7 +321,6 @@ class BoxpushEnvCfg(DirectRLEnvCfg):
         ),
     }
 
-    # - reset conditions
     max_obj_dist_from_traj = 0.1
     max_obj_angle_from_traj = 1.0
 

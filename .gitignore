@@ -13,6 +13,8 @@
 **/*.usda
 **/*.usdc
 **/*.usdz
+# ...except the robot model files
+!robots/*.usd
 
 # Python
 .DS_Store
@@ -78,3 +80,11 @@ CLAUDE.md
 
 # Experiment results
 experiments/comparison_results/
+
+# Reference trajectories (data files, not tracked)
+reference_trajectories/
+
+# Generated plots / data at repo root
+*.npz
+*.png
+*.pdf
