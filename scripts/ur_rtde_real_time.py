@@ -268,7 +268,7 @@ else:
     joint_vel_ref = traj["joint_vel"]
     joints_target = traj["joints_target"]
 
-JOINT_OFFSET = np.array([np.pi, 0, 0, 0, 0, 0])
+JOINT_OFFSET = np.array([0, 0, 0, 0, 0, 0])
 joints += JOINT_OFFSET
 joints_target += JOINT_OFFSET
 if dual_arm:
@@ -329,21 +329,21 @@ IDENTITY_QUAT_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 # trained against sim coordinates. Apply this to the pose before feeding it to the
 # policy and before logging, so saved obj poses are directly comparable to the
 # reference trajectory in `obj_poses`.
-# REAL_TO_SIM_R = np.array(
-#     [[-1.0, 0.0, 0.0],
-#      [ 0.0,-1.0, 0.0],
-#      [ 0.0, 0.0, 1.0]], dtype=np.float32,
-# )
 REAL_TO_SIM_R = np.array(
-    [[1.0, 0.0, 0.0],
-     [0.0, 1.0, 0.0],
-     [0.0, 0.0, 1.0]], dtype=np.float32,
+    [[-1.0, 0.0, 0.0],
+     [ 0.0,-1.0, 0.0],
+     [ 0.0, 0.0, 1.0]], dtype=np.float32,
 )
+# REAL_TO_SIM_R = np.array(
+#     [[1.0, 0.0, 0.0],
+#      [0.0, 1.0, 0.0],
+#      [0.0, 0.0, 1.0]], dtype=np.float32,
+# )
 # 180° about z in (w, x, y, z); used as q_R * q_in_world = q_in_sim.
-# REAL_TO_SIM_Q_WXYZ = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
-REAL_TO_SIM_Q_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+REAL_TO_SIM_Q_WXYZ = np.array([0.0, 0.0, 0.0, 1.0], dtype=np.float32)
+# REAL_TO_SIM_Q_WXYZ = np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
 
-MEASURED_OFFSET = np.array([0.04, -0.073, 0])
+MEASURED_OFFSET = np.array([0.0, 0.0, 0])
 
 
 def real_to_sim_pose(pose):
@@ -884,6 +884,7 @@ def policy_thread():
         actual_obj_quat = None
         if pose_listener is not None:
             box_pose = real_to_sim_pose(pose_listener.get_pose(BOX_BOARD_ID))
+            print(box_pose)
             if box_pose is not None:
                 actual_obj_pos  = box_pose[:3].astype(np.float32)
                 actual_obj_quat = box_pose[3:].astype(np.float32)
